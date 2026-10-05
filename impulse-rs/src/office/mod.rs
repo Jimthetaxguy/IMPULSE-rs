@@ -314,6 +314,38 @@ mod tests {
             );
         }
 
+        /// With overflow checks on, as in tests, calamine panics on an
+        /// inverted `<dimension>` and on a cell reference whose row
+        /// overflows `u32`. The office CLI and context provider call the
+        /// reader synchronously, so the panic must fail the one document
+        /// rather than unwind the caller.
+        #[test]
+        fn test_parse_document_contains_a_parser_panic() {
+            let dir = tempfile::tempdir().unwrap();
+            let inverted = write_workbook_with_edited_sheet(dir.path(), "inverted", |xml| {
+                let start = xml.find("<dimension ref=\"").unwrap() + "<dimension ref=\"".len();
+                let end = start + xml[start..].find('"').unwrap();
+                format!("{}B2:A1{}", &xml[..start], &xml[end..])
+            });
+            let long_row = write_workbook_with_edited_sheet(dir.path(), "long_row", |xml| {
+                assert!(xml.contains("<c r=\"A1\""), "{xml}");
+                xml.replacen("<c r=\"A1\"", "<c r=\"A99999999999\"", 1)
+            });
+            for path in [&inverted, &long_row] {
+                // Getting a result at all means no panic escaped.
+                let result = parse_document(path);
+                if cfg!(debug_assertions) {
+                    let err = result.unwrap_err();
+                    assert!(err.contains("the parser panicked"), "{err}");
+                }
+            }
+            let result = excel::get_sheet_info(&inverted);
+            if cfg!(debug_assertions) {
+                let err = result.unwrap_err();
+                assert!(err.contains("the parser panicked"), "{err}");
+            }
+        }
+
         /// Each chunk is the span of `content` one section covers, so a Word
         /// document's chunks tile its text, ten lines to a chunk.
         #[test]

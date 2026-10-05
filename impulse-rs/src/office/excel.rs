@@ -28,7 +28,9 @@ pub fn parse_excel(_path: &std::path::Path) -> Result<ExtractionResult, String> 
 /// hold no cells and are listed with no rows or columns.
 #[cfg(feature = "office-support")]
 pub fn get_sheet_info(path: &std::path::Path) -> Result<Vec<SheetInfo>, String> {
-    sheet_info(path, &bounded::path_label(path), bounded::MAX_CELLS).map_err(|e| format!("{e:#}"))
+    let label = bounded::path_label(path);
+    bounded::contain_panics(&label, || sheet_info(path, &label, bounded::MAX_CELLS))
+        .map_err(|e| format!("{e:#}"))
 }
 
 /// [`get_sheet_info`] with an explicit cell cap; the test seam.

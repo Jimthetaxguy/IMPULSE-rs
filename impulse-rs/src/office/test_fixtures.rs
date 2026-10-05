@@ -55,6 +55,40 @@ pub fn write_far_apart_workbook(dir: &Path) -> PathBuf {
     path
 }
 
+/// Writes a one-cell workbook named `<name>.xlsx`, with its first sheet's
+/// XML passed through `edit`, for malformed-input tests.
+pub fn write_workbook_with_edited_sheet(
+    dir: &Path,
+    name: &str,
+    edit: impl Fn(&str) -> String,
+) -> PathBuf {
+    let original = dir.join(format!("{name}.original.xlsx"));
+    let mut workbook = rust_xlsxwriter::Workbook::new(original.to_str().unwrap());
+    workbook
+        .add_worksheet()
+        .write_string_only(0, 0, "x")
+        .unwrap();
+    workbook.close().unwrap();
+
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(&original).unwrap()).unwrap();
+    let path = dir.join(format!("{name}.xlsx"));
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        let entry_name = entry.name().to_string();
+        let mut data = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
+        if entry_name == "xl/worksheets/sheet1.xml" {
+            data = edit(std::str::from_utf8(&data).unwrap()).into_bytes();
+        }
+        zip.start_file(entry_name, zip::write::FileOptions::default())
+            .unwrap();
+        zip.write_all(&data).unwrap();
+    }
+    zip.finish().unwrap();
+    path
+}
+
 /// Writes a `.docx` that is a few kilobytes on disk but whose entries
 /// inflate to just past `max_inflated` bytes: one mebibyte of zeros is
 /// compressed once and copied raw under new names. Only `word/document.xml`

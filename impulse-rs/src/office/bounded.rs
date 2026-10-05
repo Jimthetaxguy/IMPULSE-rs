@@ -268,14 +268,37 @@ pub fn extract_csv(path: &Path, label: &str, budget: ExtractBudget) -> Result<Pa
 /// `document_read` applies the same steps itself, around its own path
 /// sandbox.
 pub fn read_document(path: &Path, label: &str, budget: ExtractBudget) -> Result<ParsedDocument> {
-    let ext = check_extension(path, label, &["xlsx", "docx", "csv"])?;
-    check_source_file(path, label, MAX_DOCUMENT_BYTES)?;
-    preflight_container(path, label)?;
-    match ext.as_str() {
-        "xlsx" => extract_workbook(path, label, budget),
-        "docx" => extract_word(path, label, budget),
-        _ => extract_csv(path, label, budget),
-    }
+    contain_panics(label, || {
+        let ext = check_extension(path, label, &["xlsx", "docx", "csv"])?;
+        check_source_file(path, label, MAX_DOCUMENT_BYTES)?;
+        preflight_container(path, label)?;
+        match ext.as_str() {
+            "xlsx" => extract_workbook(path, label, budget),
+            "docx" => extract_word(path, label, budget),
+            _ => extract_csv(path, label, budget),
+        }
+    })
+}
+
+/// Runs `read`, turning a panic inside a parser into an error for this one
+/// document. With overflow checks on, as in debug and test builds, calamine
+/// panics on some malformed workbooks: an inverted `<dimension
+/// ref="B2:A1">`, or a cell reference whose row or column overflows `u32`.
+/// The office CLI and context provider call the readers synchronously,
+/// where that panic would unwind the caller; async callers already contain
+/// it through `spawn_blocking`. The default panic hook still prints the
+/// panic message.
+pub fn contain_panics<T>(label: &str, read: impl FnOnce() -> Result<T>) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(read)).unwrap_or_else(|payload| {
+        let detail = payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "no message".to_string());
+        Err(anyhow::anyhow!(
+            "{label} could not be parsed: the parser panicked ({detail})"
+        ))
+    })
 }
 
 /// Streams a workbook through calamine's cell reader into this module's own
@@ -304,6 +327,11 @@ pub fn extract_workbook(path: &Path, label: &str, budget: ExtractBudget) -> Resu
             Err(calamine::XlsxError::NotAWorksheet(_)) => continue,
             Err(e) => bail!("{label} could not be parsed: sheet '{name}': {e}"),
         };
+        // A non-empty sheet adds its header and a closing blank line as
+        // well as its body. All three count against the budget, so a long
+        // sheet name cannot carry the text past it.
+        let header = format!("{SHEET_HEADER_PREFIX}{name}{SHEET_HEADER_SUFFIX}\n");
+        let header_chars = header.chars().count();
         let mut body = SheetBodyBuilder::default();
         while let Some(cell) = reader
             .next_cell()
@@ -329,7 +357,7 @@ pub fn extract_workbook(path: &Path, label: &str, budget: ExtractBudget) -> Resu
             }
             let (row, col) = cell.get_position();
             body.push(row, col, &value);
-            if cursor + body.chars > budget.max_chars {
+            if cursor + header_chars + body.chars + 2 > budget.max_chars {
                 bail!(
                     "{label} extracted to more than {} characters, over the limit",
                     budget.max_chars
@@ -340,8 +368,7 @@ pub fn extract_workbook(path: &Path, label: &str, budget: ExtractBudget) -> Resu
         if body_text.is_empty() {
             continue;
         }
-        let header = format!("{SHEET_HEADER_PREFIX}{name}{SHEET_HEADER_SUFFIX}\n");
-        cursor += header.chars().count();
+        cursor += header_chars;
         sections.push(DocumentSection {
             index,
             kind: "sheet".to_string(),
@@ -1016,6 +1043,47 @@ mod tests {
         // Exactly two lines, so the section span still tiles the text.
         assert_eq!(text.matches('\n').count(), 2);
         assert_eq!(sections[0].chars, text.chars().count());
+    }
+
+    #[test]
+    fn test_contain_panics_turns_a_panic_into_an_error() {
+        let err = contain_panics("'x'", || -> Result<()> { panic!("boom") }).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "'x' could not be parsed: the parser panicked (boom)"
+        );
+        let err = contain_panics("'x'", || -> Result<()> {
+            panic!("{}", String::from("formatted"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().ends_with("(formatted)"), "{err}");
+        assert_eq!(contain_panics("'x'", || Ok(7)).unwrap(), 7);
+    }
+
+    /// Each sheet's header and closing blank line count against the budget
+    /// with its body, so a long sheet name cannot carry the text past it.
+    #[test]
+    fn test_extract_workbook_counts_sheet_headers_against_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.xlsx");
+        let mut workbook = rust_xlsxwriter::Workbook::new(path.to_str().unwrap());
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("Data").unwrap();
+        sheet.write_string_only(0, 0, "x").unwrap();
+        workbook.close().unwrap();
+
+        // "=== Sheet: Data ===\n", "x" and "\n\n" make 23 characters.
+        let budget = |max_chars| ExtractBudget {
+            max_chars,
+            max_cells: MAX_CELLS,
+        };
+        let parsed = extract_workbook(&path, "'one'", budget(23)).unwrap();
+        assert_eq!(parsed.text, "=== Sheet: Data ===\nx\n\n");
+        let err = extract_workbook(&path, "'one'", budget(22)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "'one' extracted to more than 22 characters, over the limit"
+        );
     }
 
     #[test]
