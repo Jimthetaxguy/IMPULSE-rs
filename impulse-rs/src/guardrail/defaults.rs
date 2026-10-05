@@ -28,7 +28,7 @@ use super::types::{GuardAction, GuardRule, GuardTarget};
 /// marked as builtin.
 /// One shell word, which may hold quoted parts and escaped spaces:
 /// `"my repo"`, `user.name="Jane Doe"`, `~/My\ Repo`.
-const SHELL_WORD: &str = r#"(?:"[^"]*"|'[^']*'|\\.|[^\s\\"'])+"#;
+const SHELL_WORD: &str = r#"(?:"(?:[^"\\]|\\.)*"|'[^']*'|\\.|[^\s\\"'])+"#;
 
 /// A git invocation whose subcommand is `subcommand`. Global options such as
 /// `-C dir`, `-c k=v`, `--git-dir=x`, or `--config-env name=var` may come
@@ -468,6 +468,7 @@ mod tests {
             "git -c http.extraheader=\"Authorization: basic abc\" push -f origin main",
             "git -C ~/My\\ Repo push -f origin main",
             "git --config-env http.extraheader=TOKEN push -f origin main",
+            "git -c \"user.name=Jane \\\"JD\\\" Doe\" push -f origin main",
             "git -C \"my repo\" add .",
             "git push origin main -f;git status",
             "`git push origin main -f`",

@@ -109,22 +109,28 @@ impl DynamicTool for BenchmarkerTool {
             )));
         }
 
-        // Use the existing benchmark module to time Python execution. The
-        // first iteration that fails is kept, so a program that fails only
-        // some of the time is not reported as timed either.
-        let mut first_failure: Option<String> = None;
-        let result = crate::tools::benchmark::run_benchmark("python_benchmark", iterations, || {
-            let failure = match crate::tools::python::execute_python(&code) {
+        // The estimate trusts one run; a program slower after its first run
+        // would still outlast the limit, so the loop also stops at it.
+        let deadline = std::time::Instant::now() + limit.saturating_sub(one_run);
+        let runs = time_runs(
+            iterations,
+            deadline,
+            || match crate::tools::python::execute_python(&code) {
                 Ok(run) => benchmark_refusal(&run),
                 Err(e) => Some(format!("sandbox failed: {e}")),
-            };
-            if first_failure.is_none() {
-                first_failure = failure;
-            }
-        });
-        if let Some(reason) = first_failure {
+            },
+        );
+        if let Some(reason) = runs.first_failure {
             return Err(ToolError::ExecutionFailed(reason));
         }
+        if runs.past_deadline {
+            return Err(ToolError::ExecutionFailed(format!(
+                "stopped at this session's {} s tool time limit before {iterations} iterations \
+                 finished; the program ran slower than its first run",
+                limit.as_secs()
+            )));
+        }
+        let result = runs.result;
 
         Ok(ToolResult::json(serde_json::json!({
             "name": result.name,
@@ -139,6 +145,44 @@ impl DynamicTool for BenchmarkerTool {
 
     fn required_capabilities(&self) -> Vec<Capability> {
         vec![Capability::PythonExec]
+    }
+}
+
+/// How [`time_runs`] ended.
+struct TimedRuns {
+    result: crate::tools::benchmark::BenchmarkResult,
+    /// The first iteration that could not be timed, so a program that fails
+    /// only some of the time is not reported as timed either.
+    first_failure: Option<String>,
+    /// Whether `deadline` passed before every iteration ran.
+    past_deadline: bool,
+}
+
+/// Times `iterations` calls of `run_once`, which returns why its run cannot
+/// be timed, or `None`. The loop has no await, so the executor's timeout
+/// cannot stop it; once `deadline` passes the remaining iterations do
+/// nothing instead.
+fn time_runs(
+    iterations: u32,
+    deadline: std::time::Instant,
+    mut run_once: impl FnMut() -> Option<String>,
+) -> TimedRuns {
+    let mut first_failure: Option<String> = None;
+    let mut past_deadline = false;
+    let result = crate::tools::benchmark::run_benchmark("python_benchmark", iterations, || {
+        if past_deadline || std::time::Instant::now() >= deadline {
+            past_deadline = true;
+            return;
+        }
+        let failure = run_once();
+        if first_failure.is_none() {
+            first_failure = failure;
+        }
+    });
+    TimedRuns {
+        result,
+        first_failure,
+        past_deadline,
     }
 }
 
@@ -173,6 +217,42 @@ mod tests {
             exit_code,
             fault,
         }
+    }
+
+    /// Verification round on af63095: the time estimate trusted the first
+    /// run, and a program slower afterwards kept the loop going past the
+    /// session's limit.
+    #[test]
+    fn test_time_runs_stops_at_the_deadline() {
+        let mut calls = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        let runs = time_runs(1_000, deadline, || {
+            calls += 1;
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            None
+        });
+        assert!(runs.past_deadline);
+        // Each call takes at least 10 ms, so at most five start before 50 ms.
+        assert!(calls <= 5, "ran {calls} times past a 50 ms deadline");
+        assert_eq!(runs.first_failure, None);
+    }
+
+    #[test]
+    fn test_time_runs_keeps_the_first_failure_and_runs_every_iteration() {
+        let mut calls = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let runs = time_runs(5, deadline, || {
+            calls += 1;
+            match calls {
+                2 => Some("second run failed".to_string()),
+                3 => Some("third run failed".to_string()),
+                _ => None,
+            }
+        });
+        assert!(!runs.past_deadline);
+        assert_eq!(calls, 5);
+        assert_eq!(runs.result.iterations, 5);
+        assert_eq!(runs.first_failure.as_deref(), Some("second run failed"));
     }
 
     #[test]

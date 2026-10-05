@@ -137,9 +137,16 @@ pub async fn handle_tooling_run(
     // Tools run in their own process group, which the terminal's Ctrl-C
     // does not reach; cancelling the call here drops it, and that kills
     // the tool's whole group.
+    // If the handler cannot be installed, Ctrl-C simply never fires here; an
+    // error must not read as an interruption and stop every call.
+    let interrupted = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
     let outcome = tokio::select! {
         outcome = registry.execute(&tool_id, params_value, &ctx) => outcome,
-        _ = tokio::signal::ctrl_c() => anyhow::bail!("Interrupted; {tool_id} was stopped"),
+        () = interrupted => anyhow::bail!("Interrupted; {tool_id} was stopped"),
     };
     match outcome {
         Ok(result) => {
