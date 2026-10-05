@@ -505,39 +505,65 @@ async fn handle_http_connection(
         .await;
     }
 
-    let content_length = header_text
-        .lines()
-        .find_map(|l| {
-            let lower = l.to_ascii_lowercase();
-            lower
-                .strip_prefix("content-length:")
-                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-        })
-        .unwrap_or(body.len());
-    // Refuse before allocating: a caller-chosen length is never trusted.
-    if content_length > MAX_REQUEST_SIZE {
-        return reply_and_close(
-            &mut stream,
-            413,
-            "application/json",
-            br#"{"error":"request body too large"}"#,
-        )
-        .await;
-    }
-
     // A health check needs no body, and it is unauthenticated, so reading
     // a declared one let any client make the server buffer up to the limit.
-    let content_length = if is_health { 0 } else { content_length };
-    let mut body_owned = body.to_vec();
-    let mut chunk = vec![0u8; 8 * 1024];
-    while body_owned.len() < content_length {
-        let m = stream.read(&mut chunk).await?;
-        if m == 0 {
-            break;
+    let body_owned = if is_health {
+        Vec::new()
+    } else if is_chunked(header_text) {
+        // Transfer-Encoding overrides any Content-Length (RFC 9112, 6.3).
+        match read_chunked_body(&mut stream, body).await? {
+            ChunkedBody::Complete(decoded) => decoded,
+            ChunkedBody::TooLarge => {
+                return reply_and_close(
+                    &mut stream,
+                    413,
+                    "application/json",
+                    br#"{"error":"request body too large"}"#,
+                )
+                .await
+            }
+            ChunkedBody::Malformed => {
+                return reply_and_close(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    br#"{"error":"malformed chunked request body"}"#,
+                )
+                .await
+            }
         }
-        body_owned.extend_from_slice(&chunk[..m]);
-    }
-    body_owned.truncate(content_length);
+    } else {
+        let content_length = header_text
+            .lines()
+            .find_map(|l| {
+                let lower = l.to_ascii_lowercase();
+                lower
+                    .strip_prefix("content-length:")
+                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+            })
+            .unwrap_or(body.len());
+        // Refuse before allocating: a caller-chosen length is never trusted.
+        if content_length > MAX_REQUEST_SIZE {
+            return reply_and_close(
+                &mut stream,
+                413,
+                "application/json",
+                br#"{"error":"request body too large"}"#,
+            )
+            .await;
+        }
+        let mut body_owned = body.to_vec();
+        let mut chunk = vec![0u8; 8 * 1024];
+        while body_owned.len() < content_length {
+            let m = stream.read(&mut chunk).await?;
+            if m == 0 {
+                break;
+            }
+            body_owned.extend_from_slice(&chunk[..m]);
+        }
+        body_owned.truncate(content_length);
+        body_owned
+    };
 
     let (status, content_type, payload) = match (method, path) {
         ("GET", "/healthz") | ("GET", "/health") => (200, "text/plain", b"ok".to_vec()),
@@ -575,6 +601,105 @@ async fn handle_http_connection(
     };
 
     reply_and_close(&mut stream, status, content_type, &payload).await
+}
+
+/// The longest chunk-size or trailer line read, extensions included.
+const MAX_CHUNK_LINE: usize = 4 * 1024;
+
+/// Encoded bytes a chunked body may take, framing included: twice the body
+/// limit, so many tiny chunks cannot make the server read without bound.
+const MAX_CHUNKED_READ: usize = 2 * MAX_REQUEST_SIZE;
+
+/// What reading a chunked request body came to.
+enum ChunkedBody {
+    Complete(Vec<u8>),
+    /// The decoded body passed `MAX_REQUEST_SIZE`, or its encoding passed
+    /// `MAX_CHUNKED_READ`.
+    TooLarge,
+    /// Not valid chunked encoding, or the peer closed before the end.
+    Malformed,
+}
+
+/// Whether the headers declare `Transfer-Encoding: chunked`.
+fn is_chunked(header_text: &str) -> bool {
+    header_text.lines().any(|line| {
+        line.to_ascii_lowercase()
+            .strip_prefix("transfer-encoding:")
+            .is_some_and(|codings| codings.split(',').any(|coding| coding.trim() == "chunked"))
+    })
+}
+
+/// Reads a chunked request body (RFC 9112, section 7.1). `buffered` is what
+/// arrived with the headers; chunk extensions and trailer fields are read
+/// and dropped. Without this, a chunked request, which carries no
+/// `Content-Length`, was parsed from its raw framing and answered 400.
+async fn read_chunked_body(stream: &mut TcpStream, buffered: &[u8]) -> Result<ChunkedBody> {
+    let mut raw = buffered.to_vec();
+    let mut read = raw.len();
+    let mut body = Vec::new();
+    let mut scratch = vec![0u8; 8 * 1024];
+    let mut in_trailers = false;
+    loop {
+        // The next line: a chunk size, or a trailer field after the last chunk.
+        let line_end = loop {
+            if let Some(at) = raw.windows(2).position(|pair| pair == b"\r\n") {
+                break at;
+            }
+            if raw.len() > MAX_CHUNK_LINE {
+                return Ok(ChunkedBody::Malformed);
+            }
+            let n = stream.read(&mut scratch).await?;
+            if n == 0 {
+                return Ok(ChunkedBody::Malformed);
+            }
+            read += n;
+            if read > MAX_CHUNKED_READ {
+                return Ok(ChunkedBody::TooLarge);
+            }
+            raw.extend_from_slice(&scratch[..n]);
+        };
+        if line_end > MAX_CHUNK_LINE {
+            return Ok(ChunkedBody::Malformed);
+        }
+        let line = String::from_utf8_lossy(&raw[..line_end]).into_owned();
+        raw.drain(..line_end + 2);
+        if in_trailers {
+            if line.is_empty() {
+                return Ok(ChunkedBody::Complete(body));
+            }
+            continue;
+        }
+        let size_text = line.split(';').next().unwrap_or("").trim();
+        if size_text.is_empty() || !size_text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Ok(ChunkedBody::Malformed);
+        }
+        let Ok(size) = usize::from_str_radix(size_text, 16) else {
+            return Ok(ChunkedBody::TooLarge);
+        };
+        if size == 0 {
+            in_trailers = true;
+            continue;
+        }
+        if size > MAX_REQUEST_SIZE - body.len() {
+            return Ok(ChunkedBody::TooLarge);
+        }
+        while raw.len() < size + 2 {
+            let n = stream.read(&mut scratch).await?;
+            if n == 0 {
+                return Ok(ChunkedBody::Malformed);
+            }
+            read += n;
+            if read > MAX_CHUNKED_READ {
+                return Ok(ChunkedBody::TooLarge);
+            }
+            raw.extend_from_slice(&scratch[..n]);
+        }
+        if &raw[size..size + 2] != b"\r\n" {
+            return Ok(ChunkedBody::Malformed);
+        }
+        body.extend_from_slice(&raw[..size]);
+        raw.drain(..size + 2);
+    }
 }
 
 /// How long a closing connection may keep sending, and how much of it is
@@ -843,6 +968,41 @@ mod tests {
         // The slot is free again for the next client.
         let served = send_raw(addr, &[b"GET /healthz HTTP/1.1\r\n\r\n"]).await;
         assert!(served.starts_with("HTTP/1.1 200"), "{served}");
+    }
+
+    /// Recorded review item: a chunked body, which carries no
+    /// Content-Length, was parsed from its raw framing and answered 400.
+    #[tokio::test]
+    async fn webhook_reads_a_chunked_body() {
+        let addr = spawn_webhook(WebhookAuth::Unauthenticated).await;
+        let body = r#"{"tool_name":"system_info","parameters":{"include_env":false}}"#;
+        let (first, second) = body.split_at(20);
+        let request = format!(
+            "POST /voice/tools HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x};note=1\r\n{first}\r\n{:x}\r\n{second}\r\n0\r\nX-Trailer: yes\r\n\r\n",
+            first.len(),
+            second.len()
+        );
+        let (head, rest) = request.split_at(request.len() / 2);
+        let response = send_raw(addr, &[head.as_bytes(), rest.as_bytes()]).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn webhook_refuses_a_malformed_or_oversized_chunked_body() {
+        let addr = spawn_webhook(WebhookAuth::Unauthenticated).await;
+        let malformed = send_raw(
+            addr,
+            &[b"POST /voice/tools HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n{}\r\n0\r\n\r\n"],
+        )
+        .await;
+        assert!(malformed.starts_with("HTTP/1.1 400"), "{malformed}");
+        assert!(malformed.contains("malformed chunked"), "{malformed}");
+        let oversized = send_raw(
+            addr,
+            &[b"POST /voice/tools HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nffffffffff\r\n"],
+        )
+        .await;
+        assert!(oversized.starts_with("HTTP/1.1 413"), "{oversized}");
     }
 
     /// Recorded review P3: there was no cap on concurrent connections.
