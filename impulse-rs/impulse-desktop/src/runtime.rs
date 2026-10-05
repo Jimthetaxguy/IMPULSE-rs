@@ -521,6 +521,12 @@ impl PaneInput {
     }
 
     fn send(&self, data: Vec<u8>) -> Result<(), DesktopBridgeError> {
+        // Once the writer has failed, its error is the answer: writes it left
+        // in the channel stay counted and would read as a pane that is not
+        // reading.
+        if let Some(message) = self.writer_failure() {
+            return Err(DesktopBridgeError::TerminalWriteFailed { message });
+        }
         let len = data.len();
         let queued = self
             .queued_bytes
@@ -547,17 +553,21 @@ impl PaneInput {
                 ),
             }),
             Err(mpsc::TrySendError::Disconnected(_)) => {
-                let failure = self
-                    .failure
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
                 Err(DesktopBridgeError::TerminalWriteFailed {
-                    message: failure
+                    message: self
+                        .writer_failure()
                         .unwrap_or_else(|| "the pane's input writer has stopped".to_string()),
                 })
             }
         }
+    }
+
+    /// The writer thread's write error, once it has failed.
+    fn writer_failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -4663,6 +4673,28 @@ mod tests {
                 session_id: "agent-1".to_string(),
             })
             .expect("close the busy pane");
+    }
+
+    /// Round 3 on 84493f1: writes a failed writer left in the channel stay
+    /// counted, so a later write was refused as "already queued" instead of
+    /// getting the writer's own error.
+    #[test]
+    fn test_pane_input_reports_the_writer_failure_before_the_byte_cap() {
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(1);
+        drop(receiver);
+        let input = PaneInput {
+            sender,
+            failure: Arc::new(Mutex::new(Some(
+                "Input/output error (os error 5)".to_string(),
+            ))),
+            queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(PANE_INPUT_BYTES)),
+        };
+        assert_eq!(
+            input.send(vec![b'x'; 16]),
+            Err(DesktopBridgeError::TerminalWriteFailed {
+                message: "Input/output error (os error 5)".to_string(),
+            })
+        );
     }
 
     /// Verification round on af63095: a single write over the byte cap was
