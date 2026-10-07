@@ -496,6 +496,13 @@ events remain a separate `kind: host_event` stream. A missing discriminator is a
 not a browser fallback opportunity.
 - **Source of truth:** `impulse-desktop/src/host_bridge.rs`.
 
+### bounded tool specialist — `[vocabulary]`
+A bounded delegate that owns tool schemas and intermediate chains while the main agent receives
+conceptual capability descriptions and a minimal typed contract. Runtime/control-plane authority
+and original evidence ownership remain separate.
+- **Boundary:** conceptual direction approved by James on 2026-10-03; implementation deferred.
+- **Design:** [bounded tool specialists](docs/ARCHITECTURE-CLARIFICATION.md#bounded-tool-specialists).
+
 ### tool capability — `[code]`
 A deny-by-default permission required by a typed tool. Tool availability varies by runtime bridge;
 conceptual parity does not imply identical enforcement.
