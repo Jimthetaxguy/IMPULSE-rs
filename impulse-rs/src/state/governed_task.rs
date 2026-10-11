@@ -2017,12 +2017,22 @@ pub(crate) fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
     }
     // A worktree whose shared-configuration pin this build cannot compare —
     // absent, or recorded under a superseded digest scheme — can never be
-    // promoted, so discarding it is the only way forward and must always be
-    // available.
-    if task
-        .staged_worktree
-        .as_ref()
-        .is_some_and(|staged| !staged.shared_config_digest.is_comparable())
+    // promoted, so discarding it is the only way forward. A Builder still
+    // working in it is stopped first, which the clause above then covers.
+    // Keep this clause identical to
+    // `impulse_ops::governed_wiring::staged_worktree_is_discardable`.
+    let builder_still_working = task.execution_state == GovernedExecutionState::Running
+        && !matches!(
+            task.review_state,
+            GovernedReviewState::Accepted
+                | GovernedReviewState::Rejected
+                | GovernedReviewState::Escalated
+        );
+    if !builder_still_working
+        && task
+            .staged_worktree
+            .as_ref()
+            .is_some_and(|staged| !staged.shared_config_digest.is_comparable())
     {
         return true;
     }

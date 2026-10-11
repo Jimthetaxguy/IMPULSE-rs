@@ -76,7 +76,7 @@ pub(crate) fn spawn_agent_in_terminal(state: &mut TuiState, agent_cmd: &str, pla
                 state.status_message = Some(format!(
                     "Spawned {} with session {}",
                     agent_cmd,
-                    &session_id[..session_id.len().min(12)]
+                    crate::ui::visualization::prefix_on_char_boundary(&session_id, 12)
                 ));
             }
             Err(e) => {

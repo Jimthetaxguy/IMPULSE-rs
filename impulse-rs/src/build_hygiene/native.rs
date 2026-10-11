@@ -115,12 +115,12 @@ pub fn native_sweep_paths(
     max_age_days: u32,
     dry_run: bool,
 ) -> Result<CleanResult> {
-    let projects = crate::build_hygiene::discover_rust_projects(paths);
+    let (projects, skipped) = crate::build_hygiene::projects_to_clean(paths);
 
     let mut total_freed: u64 = 0;
     let mut total_removed: u32 = 0;
     let mut total_projects: u32 = 0;
-    let mut all_errors: Vec<String> = Vec::new();
+    let mut all_errors: Vec<String> = skipped;
 
     for project in &projects {
         let target_dir = project.path.join("target");
@@ -171,14 +171,14 @@ pub fn native_sweep_paths(
 ///
 /// This replaces `cargo-wipe` for systems where it isn't installed.
 pub fn native_wipe(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> {
-    let projects = crate::build_hygiene::discover_rust_projects(paths);
+    let (projects, skipped) = crate::build_hygiene::projects_to_clean(paths);
 
     if projects.is_empty() {
         return Ok(CleanResult {
             bytes_freed: 0,
             files_removed: 0,
             projects_cleaned: 0,
-            errors: vec![],
+            errors: skipped,
             was_dry_run: dry_run,
             summary: "No Rust projects with target/ directories found.".to_string(),
         });
@@ -190,7 +190,7 @@ pub fn native_wipe(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> {
             bytes_freed: total_bytes,
             files_removed: 0,
             projects_cleaned: projects.len() as u32,
-            errors: vec![],
+            errors: skipped,
             was_dry_run: true,
             summary: format!(
                 "[DRY RUN] Would remove target/ from {} projects, freeing ~{}",
@@ -202,7 +202,7 @@ pub fn native_wipe(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> {
 
     let mut total_freed: u64 = 0;
     let mut cleaned: u32 = 0;
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = skipped;
 
     for project in &projects {
         let target_dir = project.path.join("target");
@@ -377,6 +377,43 @@ fn remove_empty_dirs_recursive(dir: &Path, root: &Path, errors: &mut Vec<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 5 (reviewer C): sweep and wipe acted through a `target` that
+    /// links outside the root; a real sweep would delete the files there.
+    #[cfg(unix)]
+    #[test]
+    fn test_native_sweep_and_wipe_skip_a_target_that_is_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside-target");
+        std::fs::create_dir_all(root.join("p")).unwrap();
+        std::fs::create_dir_all(outside.join("debug")).unwrap();
+        std::fs::write(outside.join("debug/stale.bin"), b"stale").unwrap();
+        std::fs::write(root.join("p/Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("p/target")).unwrap();
+
+        let swept = native_sweep_paths(std::slice::from_ref(&root), 0, false).unwrap();
+        assert!(
+            outside.join("debug/stale.bin").exists(),
+            "sweep deleted through the link"
+        );
+        assert!(
+            swept.errors.iter().any(|e| e.contains("symbolic link")),
+            "{:?}",
+            swept.errors
+        );
+
+        let wiped = native_wipe(std::slice::from_ref(&root), false).unwrap();
+        assert!(
+            outside.join("debug/stale.bin").exists(),
+            "wipe deleted through the link"
+        );
+        assert!(
+            root.join("p/target").symlink_metadata().is_ok(),
+            "wipe removed the link"
+        );
+        assert_eq!(wiped.projects_cleaned, 0);
+    }
     use std::fs;
 
     fn create_file_with_mtime(path: &Path, content: &str, age_days: u64) {
@@ -521,6 +558,7 @@ mod tests {
         fs::create_dir_all(proj.join("target")).unwrap();
         fs::write(proj.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
         fs::write(proj.join("target/artifact"), "data").unwrap();
+        tag(&proj.join("target"));
 
         let result = native_wipe(&[tmp.path().to_path_buf()], true).unwrap();
 
@@ -538,6 +576,7 @@ mod tests {
         fs::create_dir_all(proj.join("target")).unwrap();
         fs::write(proj.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
         fs::write(proj.join("target/artifact"), "data").unwrap();
+        tag(&proj.join("target"));
 
         let result = native_wipe(&[tmp.path().to_path_buf()], false).unwrap();
 
@@ -548,6 +587,61 @@ mod tests {
         assert!(!proj.join("target").exists());
         // Cargo.toml should still exist
         assert!(proj.join("Cargo.toml").exists());
+    }
+
+    fn tag(target: &Path) {
+        fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+    }
+
+    /// Round 6 (reviewer C): like `cargo clean`, sweep and wipe leave a
+    /// `target` without cargo's `CACHEDIR.TAG` alone.
+    #[test]
+    fn test_native_sweep_and_wipe_skip_an_untagged_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("plain");
+        fs::create_dir_all(proj.join("target")).unwrap();
+        fs::write(proj.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
+        fs::write(proj.join("target/notes.txt"), "not a build output").unwrap();
+
+        let swept = native_sweep_paths(&[tmp.path().to_path_buf()], 0, false).unwrap();
+        let wiped = native_wipe(&[tmp.path().to_path_buf()], false).unwrap();
+        assert!(proj.join("target/notes.txt").exists());
+        assert_eq!(wiped.projects_cleaned, 0);
+        for errors in [&swept.errors, &wiped.errors] {
+            assert!(
+                errors.iter().any(|e| e.contains("CACHEDIR.TAG")),
+                "{errors:?}"
+            );
+        }
+    }
+
+    /// Round 7 (reviewer C): a `CACHEDIR.TAG` that is a symbolic link to a
+    /// real tag elsewhere counted, and a non-cargo `target/` was deleted;
+    /// cargo refuses such a tag.
+    #[cfg(unix)]
+    #[test]
+    fn test_native_wipe_skips_a_target_whose_tag_is_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real_tag_dir = tmp.path().join("real-tag");
+        fs::create_dir_all(&real_tag_dir).unwrap();
+        tag(&real_tag_dir);
+        let proj = tmp.path().join("root").join("p");
+        fs::create_dir_all(proj.join("target")).unwrap();
+        fs::write(proj.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
+        fs::write(proj.join("target/not_cargo_data.txt"), "keep").unwrap();
+        std::os::unix::fs::symlink(
+            real_tag_dir.join("CACHEDIR.TAG"),
+            proj.join("target/CACHEDIR.TAG"),
+        )
+        .unwrap();
+
+        let wiped = native_wipe(&[tmp.path().join("root")], false).unwrap();
+        assert!(proj.join("target/not_cargo_data.txt").exists());
+        assert_eq!(wiped.projects_cleaned, 0);
     }
 
     #[test]
@@ -566,6 +660,7 @@ mod tests {
             fs::create_dir_all(proj.join("target")).unwrap();
             fs::write(proj.join("Cargo.toml"), "[package]").unwrap();
             fs::write(proj.join("target/bin"), "binary").unwrap();
+            tag(&proj.join("target"));
         }
 
         let result = native_wipe(&[tmp.path().to_path_buf()], false).unwrap();
@@ -608,6 +703,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let proj = tmp.path().join("test-proj");
         fs::create_dir_all(proj.join("target/debug")).unwrap();
+        tag(&proj.join("target"));
         fs::write(proj.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
 
         create_file_with_mtime(&proj.join("target/debug/old.o"), "old", 60);
@@ -662,12 +758,14 @@ mod tests {
         // Project A: valid, with a stale file
         let proj_a = tmp.path().join("proj-a");
         fs::create_dir_all(proj_a.join("target")).unwrap();
+        tag(&proj_a.join("target"));
         fs::write(proj_a.join("Cargo.toml"), "[package]\nname = \"a\"\n").unwrap();
         create_file_with_mtime(&proj_a.join("target/old.o"), "stale", 60);
 
         // Project B: valid, with a stale file
         let proj_b = tmp.path().join("proj-b");
         fs::create_dir_all(proj_b.join("target")).unwrap();
+        tag(&proj_b.join("target"));
         fs::write(proj_b.join("Cargo.toml"), "[package]\nname = \"b\"\n").unwrap();
         create_file_with_mtime(&proj_b.join("target/old.o"), "stale", 60);
 

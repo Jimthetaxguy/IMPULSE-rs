@@ -219,7 +219,7 @@ cargo run -- agent-discover --json   # Print manifest as JSON (pipe to agent)
 cargo run -- agent-discover --summary # Brief overview of capabilities
 
 # ImpulseAgent (LLM coordination)
-cargo run -- agent-configure --provider anthropic --api-key $ANTHROPIC_API_KEY
+cargo run -- agent-configure --provider anthropic   # key comes from ANTHROPIC_API_KEY
 cargo run -- agent-configure --harness claude-code
 cargo run -- agent-status [--json]
 cargo run -- agent-query "Review cross-pane activity" [--json]
@@ -279,6 +279,7 @@ cargo run -- config <key> --value <val>  # Set value
 # Guardrails
 cargo run -- guard --action "git push --force" --target bash --json
 cargo run -- guard --list
+cargo run -- guard --hook < pre-tool-use.json   # Claude Code PreToolUse hook: exit 2 blocks
 cargo run -- guard --enable <rule-id>
 cargo run -- guard --disable <rule-id>
 
@@ -490,7 +491,7 @@ It operates in two modes:
 
 ```bash
 # Configure with API provider
-impulse-rs agent-configure --provider anthropic --api-key $ANTHROPIC_API_KEY
+impulse-rs agent-configure --provider anthropic   # key comes from ANTHROPIC_API_KEY
 
 # Configure with CLI harness
 impulse-rs agent-configure --harness claude-code

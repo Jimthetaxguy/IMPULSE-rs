@@ -8,8 +8,10 @@ use super::{load_build_hygiene_config, print_json, print_verification_report};
 
 /// Handle the `verify` command.
 ///
-/// Runs the default verification steps (build, test, clippy, fmt) and prints
-/// a pass/fail report. Bails on failure.
+/// Runs the verification steps detected for the current directory (package
+/// scripts, `cargo check` and `cargo test`, and the retrieval contract check;
+/// see `verify::default_steps`) and prints a pass/fail report. Bails on
+/// failure.
 pub fn handle_verify() -> Result<()> {
     let steps = verify::default_steps(&std::env::current_dir()?);
     let report = verify::run_verification(steps)?;
@@ -22,8 +24,9 @@ pub fn handle_verify() -> Result<()> {
 
 /// Handle the `clean-all` command.
 ///
-/// Runs `cargo clean` across all discovered Rust projects under the
-/// configured scan paths. Respects the dry-run flag.
+/// Removes each discovered Rust project's own `target/` under the
+/// configured scan paths (cargo-clean-all runs instead when installed).
+/// Respects the dry-run flag.
 pub fn handle_clean_all(state: &Arc<state::State>, dry_run: Option<bool>) -> Result<()> {
     let config = load_build_hygiene_config(state);
     let dry_run = dry_run.unwrap_or(config.dry_run_default);
@@ -40,7 +43,7 @@ pub fn handle_clean_all(state: &Arc<state::State>, dry_run: Option<bool>) -> Res
         if dry_run {
             "DRY RUN"
         } else {
-            "LIVE \u{2014} will cargo clean all projects!"
+            "LIVE \u{2014} will remove target/ from all projects!"
         }
     );
 
@@ -54,9 +57,7 @@ pub fn handle_clean_all(state: &Arc<state::State>, dry_run: Option<bool>) -> Res
                 }
             }
         }
-        Err(e) => {
-            eprintln!("Clean-all failed: {}", e);
-        }
+        Err(e) => anyhow::bail!("Clean-all failed: {e}"),
     }
     Ok(())
 }
@@ -215,10 +216,9 @@ pub fn handle_sweep(
                 }
             }
         }
-        Err(e) => {
-            eprintln!("Sweep failed: {}", e);
-            eprintln!("\nHint: Check filesystem permissions and scan path configuration.");
-        }
+        Err(e) => anyhow::bail!(
+            "Sweep failed: {e}\nHint: Check filesystem permissions and scan path configuration."
+        ),
     }
     Ok(())
 }
@@ -272,10 +272,9 @@ pub fn handle_wipe(
                 }
             }
         }
-        Err(e) => {
-            eprintln!("Wipe failed: {}", e);
-            eprintln!("\nHint: Check filesystem permissions and scan path configuration.");
-        }
+        Err(e) => anyhow::bail!(
+            "Wipe failed: {e}\nHint: Check filesystem permissions and scan path configuration."
+        ),
     }
     Ok(())
 }

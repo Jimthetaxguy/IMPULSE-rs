@@ -162,6 +162,10 @@ pub struct ToolUse {
     pub name: String,
     pub input_preview: String,
     pub input_chars: usize,
+    /// `file_path` from the full input, read before the preview is cut (a
+    /// preview of a larger input is not valid JSON).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
 }
 
 /// A parsed tool result from a transcript message.

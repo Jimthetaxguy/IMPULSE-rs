@@ -16,7 +16,7 @@ mod tests;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 // Re-export key types
 pub use clean_all::clean_all_projects;
@@ -131,6 +131,68 @@ pub fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+/// The signature that starts a `CACHEDIR.TAG` file, which cargo writes into
+/// each build directory it creates.
+const CACHEDIR_TAG_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+
+/// Whether `target` carries cargo's `CACHEDIR.TAG`. Cargo itself refuses to
+/// clean a directory without one, to avoid deleting unrelated files, and so
+/// does a tag that is a symbolic link; `metadata` followed such a link and
+/// let a non-cargo `target/` be deleted. The tag is opened without
+/// following links or blocking and checked through the open handle, so a
+/// FIFO or link swapped in cannot block the caller or count.
+fn is_cargo_build_dir(target: &Path) -> bool {
+    let tag = target.join("CACHEDIR.TAG");
+    if !std::fs::symlink_metadata(&tag).is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let Ok(mut file) = options.open(&tag) else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let mut start = [0u8; CACHEDIR_TAG_SIGNATURE.len()];
+    std::io::Read::read_exact(&mut file, &mut start).is_ok()
+        && start.as_slice() == CACHEDIR_TAG_SIGNATURE
+}
+
+/// Projects under `paths` that a destructive operation may act on, and a
+/// note for each one skipped. A project is left alone when its `target` is a
+/// symbolic link, since acting through the link changed files outside the
+/// scanned roots, possibly a directory other projects share; or when its
+/// `target` lacks cargo's `CACHEDIR.TAG`, as cargo would refuse it too.
+pub fn projects_to_clean(paths: &[PathBuf]) -> (Vec<RustProject>, Vec<String>) {
+    let mut skipped = Vec::new();
+    let projects = discover_rust_projects(paths)
+        .into_iter()
+        .filter(|project| {
+            let target = project.path.join("target");
+            let reason = if std::fs::symlink_metadata(&target)
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                Some("target is a symbolic link")
+            } else if !is_cargo_build_dir(&target) {
+                Some("target has no CACHEDIR.TAG, so it is not treated as a cargo build directory")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                skipped.push(format!("{}: {reason}; skipped", project.path.display()));
+            }
+            reason.is_none()
+        })
+        .collect();
+    (projects, skipped)
 }
 
 /// Check if a cargo tool is installed

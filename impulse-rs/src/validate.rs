@@ -4,8 +4,6 @@
 //! as filesystem paths, SQL components, IDs, or URL segments. This is the
 //! single enforcement point for the "treat agent inputs as adversarial" rule.
 
-use std::path::{Component, Path, PathBuf};
-
 /// Validation error with machine-readable `kind` for envelope error payloads.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ValidationError {
@@ -53,12 +51,34 @@ impl ValidationError {
 
 // ─── Validators ─────────────────────────────────────────────────────────────
 
-/// Reject ASCII control characters (< 0x20 except \n, \r, \t).
+/// Reject control characters (except \n, \r, \t) and Unicode bidi
+/// controls, which make stored text display differently from what it is.
 pub fn reject_control_chars(input: &str, field: &'static str) -> Result<(), ValidationError> {
     for ch in input.chars() {
-        if ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t' {
+        if (ch.is_control() && ch != '\n' && ch != '\r' && ch != '\t') || is_bidi_control(ch) {
             return Err(ValidationError::ControlChars { field });
         }
+    }
+    Ok(())
+}
+
+/// Unicode bidirectional controls, which reorder how text displays
+/// ("Trojan Source"): a path or name can read differently from what it is.
+fn is_bidi_control(ch: char) -> bool {
+    // Embeddings, overrides and isolates reorder a run of text. The plain
+    // direction marks (U+200E, U+200F, U+061C) do not, and are ordinary in
+    // Hebrew and Arabic text, so they stay allowed.
+    matches!(ch, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Reject any control character, line breaks and tabs included, and bidi
+/// controls: for one-line values such as a file path or a tool name.
+pub fn validate_single_line_text(input: &str, field: &'static str) -> Result<(), ValidationError> {
+    if input
+        .chars()
+        .any(|ch| ch.is_control() || is_bidi_control(ch))
+    {
+        return Err(ValidationError::ControlChars { field });
     }
     Ok(())
 }
@@ -87,33 +107,6 @@ pub fn validate_resource_name(name: &str, field: &'static str) -> Result<(), Val
     }
     reject_control_chars(name, field)?;
     Ok(())
-}
-
-/// Validate a path is sandboxed under `root` — no traversal, no absolute escape.
-pub fn validate_path_sandboxed(path: &str, root: &Path) -> Result<PathBuf, ValidationError> {
-    let p = Path::new(path);
-
-    // Reject absolute paths that don't start with root
-    if p.is_absolute() {
-        let canonical = p.to_path_buf();
-        if !canonical.starts_with(root) {
-            return Err(ValidationError::PathTraversal {
-                path: path.to_string(),
-            });
-        }
-        return Ok(canonical);
-    }
-
-    // Reject component-level traversal
-    for component in p.components() {
-        if matches!(component, Component::ParentDir) {
-            return Err(ValidationError::PathTraversal {
-                path: path.to_string(),
-            });
-        }
-    }
-
-    Ok(root.join(p))
 }
 
 /// Reject inputs longer than `max` bytes.
@@ -170,6 +163,18 @@ pub fn validate_file_arg(path: &str) -> Result<(), ValidationError> {
 mod tests {
     use super::*;
 
+    /// Verification round on 986ba23: the right-to-left and Arabic letter
+    /// marks are ordinary text, unlike overrides and isolates.
+    #[test]
+    fn bidi_overrides_are_refused_but_direction_marks_are_text() {
+        assert!(
+            reject_control_chars("\u{05E9}\u{05DC}\u{05D5}\u{05DD}\u{200F}", "summary").is_ok()
+        );
+        assert!(reject_control_chars("\u{0627}\u{061C}\u{0628}", "name").is_ok());
+        assert!(reject_control_chars("abc\u{202E}fed", "name").is_err());
+        assert!(validate_single_line_text("a\u{2066}b\u{2069}", "tool").is_err());
+    }
+
     #[test]
     fn control_chars_rejected() {
         assert!(reject_control_chars("hello\x00world", "test").is_err());
@@ -194,15 +199,6 @@ mod tests {
         assert!(validate_resource_name("id#section", "test").is_err());
         assert!(validate_resource_name("id\0null", "test").is_err());
         assert!(validate_resource_name("valid-id-123", "test").is_ok());
-    }
-
-    #[test]
-    fn path_traversal_blocked() {
-        let root = Path::new("/home/user/project");
-        assert!(validate_path_sandboxed("../../etc/passwd", root).is_err());
-        assert!(validate_path_sandboxed("src/../../../etc/passwd", root).is_err());
-        assert!(validate_path_sandboxed("src/main.rs", root).is_ok());
-        assert!(validate_path_sandboxed("/etc/passwd", root).is_err());
     }
 
     #[test]

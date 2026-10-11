@@ -19,6 +19,15 @@
 //! re-adding the manifest's own `env_allowlist` entries, instead of
 //! relying on full inheritance plus a redundant re-add of already-present
 //! vars.
+//!
+//! **Timeouts and output:** the tool runs in its own process group, and a
+//! timed-out or cancelled call kills the group, so nothing it started keeps
+//! running (before, the tool itself kept running). A detached group does not
+//! receive the terminal's Ctrl-C, so `tooling-run` handles Ctrl-C itself by
+//! cancelling the call; a tool that reads the terminal is stopped by the OS
+//! and ends at its timeout. Manifest tools get no stdin. Output is read through `tooling::capture`;
+//! stdout beyond `MAX_STDOUT_BYTES` fails the call rather than growing this
+//! process's memory, since a cut prefix would not parse in JSON mode.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -26,12 +35,22 @@ use std::path::Path;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use super::capture::wait_with_capped_output;
 use super::env_scrub::scrub_and_allowlist_env;
 use super::error::ToolError;
 use super::traits::{
     Capability, DynamicTool, ParamType, ToolCategory, ToolContext, ToolDescriptor, ToolParam,
     ToolResult,
 };
+
+/// Stdout kept from a manifest tool. Far more than the executor ever returns
+/// (`ToolContext::max_output_bytes`, 256 KiB by default), so ordinary output,
+/// including pretty-printed JSON that compacts to fit, is unaffected. Kept
+/// well below what JSON mode can afford to parse: a parsed tree costs many
+/// times its text (16 MB of `[0,0,...]` took about 300 MB).
+const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+/// Stderr kept for the error message of a failed call.
+const MAX_STDERR_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -221,18 +240,39 @@ impl DynamicTool for ProcessTool {
             command.env("IMPULSE_SESSION_ID", session_id);
         }
         command.env("IMPULSE_EXECUTION_ORIGIN", ctx.execution_origin.as_str());
+        command.stdin(std::process::Stdio::null());
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        // A timeout or a cancelled call drops `child`; without this the
+        // tool kept running after its caller had given up on it.
+        command.kill_on_drop(true);
+        // Its own process group, so the guard below also reaches anything
+        // the tool starts (a wrapper script's children). Keeping CLI tools in
+        // the CLI's group instead let a timeout orphan those children.
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+        }
+
+        let mut child = command
+            .spawn()
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        let mut process_group_guard = crate::process_group::ProcessGroupGuard::new(child.id());
 
         let timeout_ms = self.spec.timeout_ms.unwrap_or(ctx.timeout_ms).max(1);
         let output = tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
-            command.output(),
+            wait_with_capped_output(&mut child, MAX_STDOUT_BYTES, MAX_STDERR_BYTES),
         )
         .await
         .map_err(|_| ToolError::Timeout(timeout_ms))?
         .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        process_group_guard.disarm();
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr.bytes)
+                .trim()
+                .to_string();
             let message = if stderr.is_empty() {
                 format!("external tool exited with status {}", output.status)
             } else {
@@ -240,8 +280,15 @@ impl DynamicTool for ProcessTool {
             };
             return Err(ToolError::ExecutionFailed(message));
         }
+        if output.stdout.truncated() {
+            return Err(ToolError::ExecutionFailed(format!(
+                "external tool wrote {} bytes to stdout, more than the {MAX_STDOUT_BYTES}-byte \
+                 limit; its output was discarded",
+                output.stdout.total
+            )));
+        }
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout.bytes).to_string();
         let result = match self.spec.output_mode {
             ExternalToolOutputMode::Text => ToolResult::text(stdout.trim_end()),
             ExternalToolOutputMode::Json => {
@@ -689,5 +736,120 @@ mod tests {
             .expect("env should succeed");
         let stdout = result.output.as_str().unwrap();
         assert!(stdout.contains("PATH="), "PATH must survive the scrub");
+    }
+
+    fn script_spec(script: &str, timeout_ms: u64) -> ExternalToolSpec {
+        ExternalToolSpec {
+            id: "script".into(),
+            name: "Script".into(),
+            description: "Runs a fixed shell script".into(),
+            source: ExternalToolSource::Process,
+            command: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            env_allowlist: vec![],
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+            output_mode: ExternalToolOutputMode::Text,
+            capabilities: vec![],
+            timeout_ms: Some(timeout_ms),
+            cwd_policy: CwdPolicy::Current,
+        }
+    }
+
+    use crate::tooling::ExecutionOrigin;
+
+    fn origin_context(execution_origin: ExecutionOrigin) -> ToolContext {
+        ToolContext {
+            execution_origin,
+            ..ToolContext::with_all_capabilities()
+        }
+    }
+
+    /// Review P3-9: a timed-out tool was left running, along with anything
+    /// it had started (outside the CLI, which detaches it into its own group).
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_execute_timeout_kills_the_tool_and_its_children() {
+        let pattern = format!(
+            "sleep 7.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let tool = ProcessTool::new(script_spec(&format!("{pattern} & wait"), 300)).unwrap();
+        let result = tool
+            .execute(
+                serde_json::json!({}),
+                &origin_context(ExecutionOrigin::Daemon),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::Timeout(300))), "{result:?}");
+        if let Err(stray) = crate::test_support::wait_for_no_matching_process(
+            &pattern,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        {
+            panic!("a timed-out tool must not keep running; found pids: {stray}");
+        }
+    }
+
+    /// Verification round on d033932: from the CLI, a timeout orphaned
+    /// what a wrapper script had started. Every origin now kills the group.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_cli_timeout_kills_what_the_tool_started() {
+        let pattern = format!(
+            "sleep 6.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        let tool = ProcessTool::new(script_spec(&format!("{pattern} & wait"), 300)).unwrap();
+        let result = tool
+            .execute(serde_json::json!({}), &origin_context(ExecutionOrigin::Cli))
+            .await;
+        assert!(matches!(result, Err(ToolError::Timeout(300))), "{result:?}");
+        if let Err(stray) = crate::test_support::wait_for_no_matching_process(
+            &pattern,
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        {
+            panic!("a timed-out CLI tool must not leave children; found pids: {stray}");
+        }
+    }
+
+    /// Review P3-9: stdout was buffered whole, however large.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_execute_refuses_stdout_past_the_cap() {
+        let tool = ProcessTool::new(script_spec("head -c 20000000 /dev/zero", 30_000)).unwrap();
+        let err = tool
+            .execute(serde_json::json!({}), &ToolContext::with_all_capabilities())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::ExecutionFailed(message) if message.contains("20000000 bytes")),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_execute_failure_reports_stderr() {
+        let tool = ProcessTool::new(script_spec("echo boom >&2; exit 4", 5_000)).unwrap();
+        let err = tool
+            .execute(serde_json::json!({}), &ToolContext::with_all_capabilities())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::ExecutionFailed(message) if message == "boom"),
+            "{err}"
+        );
     }
 }

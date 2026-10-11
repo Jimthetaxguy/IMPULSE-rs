@@ -1364,6 +1364,112 @@ mod tests {
         }
     }
 
+    // ── Startup fallbacks (review P3-7) ──────────────────
+
+    fn state_in_project(tmp: &tempfile::TempDir) -> std::sync::Arc<crate::state::State> {
+        let impulse_dir = tmp.path().join(".impulse");
+        std::fs::create_dir_all(&impulse_dir).unwrap();
+        std::sync::Arc::new(crate::state::State::new(impulse_dir).unwrap())
+    }
+
+    /// An invalid manifest in `tools.d` dropped every external tool without
+    /// a word; the reason is now kept for `start` to log.
+    #[tokio::test]
+    async fn test_new_records_why_external_tools_were_not_loaded() {
+        use super::super::Daemon;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tools_dir = tmp.path().join(".impulse").join("tools.d");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(tools_dir.join("broken.json"), "{ not json").unwrap();
+
+        let daemon = Daemon::new(state_in_project(&tmp));
+        assert!(
+            daemon
+                .startup_warnings()
+                .iter()
+                .any(|w| w.contains("were not loaded") && w.contains("tools.d")),
+            "{:?}",
+            daemon.startup_warnings()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_without_fallbacks_has_no_startup_warnings() {
+        use super::super::Daemon;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let daemon = Daemon::new(state_in_project(&tmp));
+        assert!(
+            daemon.startup_warnings().is_empty(),
+            "{:?}",
+            daemon.startup_warnings()
+        );
+    }
+
+    /// Round 3 on d2789af: lock emulation on some network filesystems
+    /// reports a held lock as EACCES, which read as "flock unsupported" and
+    /// started a second daemon unlocked. Unknown errors refuse to start.
+    #[test]
+    fn test_classify_lock_failure_holds_eacces_and_refuses_the_unknown() {
+        use super::super::{classify_lock_failure, LockFailure};
+        assert_eq!(
+            classify_lock_failure(Some(libc::EWOULDBLOCK)),
+            LockFailure::Held
+        );
+        assert_eq!(classify_lock_failure(Some(libc::EACCES)), LockFailure::Held);
+        assert_eq!(
+            classify_lock_failure(Some(libc::ENOTSUP)),
+            LockFailure::Unsupported
+        );
+        assert_eq!(
+            classify_lock_failure(Some(libc::ENOLCK)),
+            LockFailure::Unsupported
+        );
+        assert_eq!(classify_lock_failure(Some(libc::EIO)), LockFailure::Other);
+        assert_eq!(classify_lock_failure(None), LockFailure::Other);
+    }
+
+    /// Refutation review of dddee6d (suspected): ownership rested on a
+    /// connect() check alone. A held lock now stops a second daemon before it
+    /// touches the socket or reconciles anything.
+    #[tokio::test]
+    async fn test_start_refuses_while_another_daemon_holds_the_lock() {
+        use super::super::{acquire_daemon_lock, Daemon};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let daemon = Daemon::new(state_in_project(&tmp));
+        let lock_path = daemon.socket_path().parent().unwrap().join("daemon.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let held = acquire_daemon_lock(&lock_path)
+            .expect("the first holder gets the lock")
+            .expect("flock is supported here");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), daemon.start())
+            .await
+            .expect("start must refuse at once, not run");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("already running"), "{err}");
+        assert!(
+            !daemon.socket_path().exists(),
+            "a refused daemon must not bind"
+        );
+
+        drop(held);
+        // A child another test forks in this process holds a copy of the
+        // descriptor until it execs (files are close-on-exec), so the release
+        // can lag the drop by a moment.
+        let mut again = acquire_daemon_lock(&lock_path);
+        for _ in 0..100 {
+            if matches!(again, Ok(Some(_))) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            again = acquire_daemon_lock(&lock_path);
+        }
+        assert!(
+            matches!(again, Ok(Some(_))),
+            "released with its holder: {again:?}"
+        );
+    }
+
     // ── Stale socket detection tests ─────────────────────
 
     #[tokio::test]

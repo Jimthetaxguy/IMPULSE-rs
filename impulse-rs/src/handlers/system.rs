@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -152,54 +152,58 @@ pub fn handle_swarm(agent_a: String, agent_b: String, threshold: f64, json: bool
 }
 
 pub fn handle_hooks(state: &Arc<state::State>, platform: String) -> Result<()> {
-    let impulse_path = state.storage().base_path().display().to_string();
+    install_hook_templates(Path::new("."), &platform)?;
+    println!("\nImpulse path: {}", state.storage().base_path().display());
+    Ok(())
+}
 
-    if platform == "claude-code" || platform == "all" {
+/// Writes the hook templates under `project_root` (`.claude/hooks/hooks.json`,
+/// `.opencode/impulse.json`) for `platform`. Taking the root explicitly keeps
+/// tests out of the source tree they run in.
+pub(crate) fn install_hook_templates(project_root: &Path, platform: &str) -> Result<()> {
+    let claude = platform == "claude-code" || platform == "all";
+    let opencode = platform == "opencode" || platform == "all";
+    if !claude && !opencode {
+        anyhow::bail!("unknown hooks platform '{platform}' (use claude-code, opencode, or all)");
+    }
+
+    if claude {
         println!("Setting up Claude Code hooks...");
-        let hooks_dir = std::path::Path::new(".claude/hooks");
-        if let Err(e) = std::fs::create_dir_all(hooks_dir) {
-            eprintln!("Error creating .claude/hooks: {}", e);
-        } else {
-            let hook_config = build_claude_hook_config();
-            let hook_json = serde_json::to_string_pretty(&hook_config).unwrap_or_else(|e| {
-                eprintln!("Error serializing hook config: {}", e);
-                String::from("{}")
-            });
-            let hook_path = std::path::Path::new(".claude/hooks/hooks.json");
-            if let Err(e) = stewardship::atomic_write_file(hook_path, hook_json.as_bytes()) {
-                eprintln!("Error writing hooks: {}", e);
-            } else {
-                println!("  \u{2713} Created .claude/hooks/hooks.json");
-            }
-        }
+        let hooks_dir = project_root.join(".claude").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).context("Failed to create .claude/hooks")?;
+        let hook_config = build_claude_hook_config();
+        let hook_json = serde_json::to_string_pretty(&hook_config)
+            .context("Failed to serialize the Claude hook template")?;
+        let hook_path = hooks_dir.join("hooks.json");
+        stewardship::atomic_write_file(&hook_path, hook_json.as_bytes())
+            .context("Failed to write .claude/hooks/hooks.json")?;
+        println!("  \u{2713} Wrote the hook template to .claude/hooks/hooks.json");
+        // Claude Code reads hooks from its settings files, not this path, so
+        // say exactly what makes the guard enforce anything.
+        let guard_entry =
+            serde_json::json!({ "hooks": { "PreToolUse": hook_config["hooks"]["PreToolUse"] } });
+        println!(
+            "\nClaude Code does not load .claude/hooks/hooks.json; it is a template. To enforce \
+             the Impulse guard, add this to .claude/settings.local.json (merge with any hooks \
+             already there):\n{}\nThe template's session-tracking entries need your session wiring; \
+             see `impulse-rs validate-hooks claude-code`.",
+            serde_json::to_string_pretty(&guard_entry)
+                .context("Failed to serialize the guard hook entry")?
+        );
     }
 
-    if platform == "opencode" || platform == "all" {
+    if opencode {
         println!("\nSetting up OpenCode integration...");
-        let opencode_dir = std::path::Path::new(".opencode");
-        if let Err(e) = std::fs::create_dir_all(opencode_dir) {
-            eprintln!("Error creating .opencode: {}", e);
-        } else {
-            let opencode_config = build_opencode_hook_config();
-            let opencode_json =
-                serde_json::to_string_pretty(&opencode_config).unwrap_or_else(|e| {
-                    eprintln!("Error serializing OpenCode config: {}", e);
-                    String::from("{}")
-                });
-            let opencode_path = std::path::Path::new(".opencode/impulse.json");
-            if let Err(e) = stewardship::atomic_write_file(opencode_path, opencode_json.as_bytes())
-            {
-                eprintln!("Error writing OpenCode config: {}", e);
-            } else {
-                println!("  \u{2713} Created .opencode/impulse.json");
-            }
-        }
+        let opencode_dir = project_root.join(".opencode");
+        std::fs::create_dir_all(&opencode_dir).context("Failed to create .opencode")?;
+        let opencode_config = build_opencode_hook_config();
+        let opencode_json = serde_json::to_string_pretty(&opencode_config)
+            .context("Failed to serialize the OpenCode config")?;
+        let opencode_path = opencode_dir.join("impulse.json");
+        stewardship::atomic_write_file(&opencode_path, opencode_json.as_bytes())
+            .context("Failed to write .opencode/impulse.json")?;
+        println!("  \u{2713} Created .opencode/impulse.json");
     }
-
-    println!(
-        "\nHooks setup complete!\nImpulse path: {}\nEdit .claude/hooks/hooks.json to customize.",
-        impulse_path
-    );
     Ok(())
 }
 
@@ -380,9 +384,11 @@ pub async fn handle_docs(
         }
         "status" => {
             let metadata = cache.load_metadata()?;
-            let age = cache.age_seconds().unwrap_or(0);
             println!("Cache Status:");
-            println!("  Last updated: {} seconds ago", age);
+            println!(
+                "  Last updated: {}",
+                cache::describe_age(metadata.last_updated, std::time::SystemTime::now())
+            );
             println!("  Models cached: {}", metadata.model_count);
             println!("  Providers cached: {}", metadata.provider_count);
             println!("  Source: {}", metadata.source);
@@ -394,7 +400,7 @@ pub async fn handle_docs(
             }
         }
         _ => {
-            eprintln!(
+            anyhow::bail!(
                 "Unknown docs subcommand: {}. Use: fetch, list, providers, status",
                 subcommand
             );
@@ -465,16 +471,13 @@ pub fn handle_tools(
             if tools.is_empty() {
                 println!("No tools installed");
             } else {
-                println!("{:<20} {:<15} Status", "Tool", "Version");
-                println!("{:-<20} {:-<-15} ", "", "");
-                for (id, version, up_to_date) in tools {
-                    let status = if up_to_date {
-                        "up to date"
-                    } else {
-                        "update available"
-                    };
-                    println!("{:<20} {:<15} {}", id, version, status);
+                println!("{:<20} Version", "Tool");
+                println!("{:-<20} {:-<15}", "", "");
+                for (id, version) in tools {
+                    println!("{:<20} {}", id, version);
                 }
+                println!();
+                println!("Newer versions are not checked; `tools update` updates each tool.");
             }
         }
         _ => {
@@ -511,23 +514,30 @@ mod chat_tests {
         );
     }
 
+    /// Review finding: an unknown `docs` subcommand printed a message and
+    /// exited 0.
     #[tokio::test]
-    async fn test_chat_valid_modes_accepted() {
-        // "off", "review", "apply" are valid inject modes — they won't fail on mode validation
-        // (they'll fail later at the API call stage, but mode parsing succeeds)
+    async fn test_an_unknown_docs_subcommand_is_an_error() {
         let (_dir, st) = test_state();
-        for mode in &["off", "review", "apply"] {
-            let result = handle_chat(&st, "hello", Some(mode), false).await;
-            // Should NOT fail with inject_mode error — may fail with API key or network
-            if let Err(e) = &result {
-                assert!(
-                    !e.to_string().contains("inject_mode"),
-                    "Valid mode '{}' rejected: {}",
-                    mode,
-                    e
-                );
-            }
+        let err = handle_docs(&st, false, "frobnicate".to_string(), None, false, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Unknown docs subcommand"), "{err}");
+    }
+
+    /// Checks the mode parser `handle_chat` validates with, not
+    /// `handle_chat` itself: with an API key in the environment, calling it
+    /// sent a real request to api.anthropic.com from the test suite.
+    #[test]
+    fn test_chat_valid_modes_accepted() {
+        use crate::injection::types::InjectionMode;
+        for mode in ["off", "review", "apply"] {
+            assert!(
+                InjectionMode::parse(mode).is_some(),
+                "valid mode '{mode}' rejected"
+            );
         }
+        assert!(InjectionMode::parse("invalid_mode").is_none());
     }
 }
 

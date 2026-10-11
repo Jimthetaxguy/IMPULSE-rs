@@ -12,7 +12,7 @@ use crate::{envelope, plugin, semantic_diff, verify, Commands};
 
 use super::{
     capture_hook_evidence, default_session_name, get_session_id, parse_injection_mode, print_json,
-    print_verification_report, read_hook_stdin_payload, HookEvidenceInput,
+    print_verification_report, read_hook_stdin_payload, HookEvidenceInput, DAEMON_STOP_UNSUPPORTED,
 };
 
 /// Run a CLI command in daemon mode (forwarding over IPC).
@@ -31,9 +31,12 @@ pub async fn dispatch(
         Commands::SessionStart {
             name,
             platform,
-            inject_mode: _,
+            inject_mode,
             inject_explain: _,
         } => {
+            // Daemon mode does not inject, but a mistyped mode is still an
+            // error rather than silently accepted.
+            parse_injection_mode(inject_mode.as_deref())?;
             handle_session_start(client, impulse_dir, name, platform)
                 .await
                 .context("Failed to handle session-start daemon request")?;
@@ -575,9 +578,7 @@ mod governed_message_tests {
 
 async fn handle_daemon(client: &DaemonClient, stop: bool) -> Result<()> {
     if stop {
-        println!("Stopping daemon...");
-        let _ = client.ping().await;
-        println!("Daemon stopped");
+        anyhow::bail!(DAEMON_STOP_UNSUPPORTED);
     } else {
         println!("Daemon running");
         let status = client
@@ -681,7 +682,13 @@ async fn handle_session_end(
             .context("Failed to capture hook evidence for session-end")?;
             println!("Session {} ended", session_id)
         }
-        Err(e) => eprintln!("Error: {}", e),
+        // An unknown session fails open, as in direct mode (hooks must not
+        // break the agent); the daemon reports it as exactly this. Any other
+        // failure, such as the daemon's history write, is a real error.
+        Err(e) if format!("{e:#}").contains("Session not found") => {
+            println!("Session not found: {}", session_id)
+        }
+        Err(e) => return Err(e).context("Failed to end session"),
     }
     Ok(())
 }
@@ -744,13 +751,7 @@ async fn handle_chat(
     inject_mode: Option<String>,
     inject_explain: bool,
 ) -> Result<()> {
-    let inject_mode = match parse_injection_mode(inject_mode.as_deref()) {
-        Ok(mode) => mode.map(|m| m.as_str().to_string()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return Ok(());
-        }
-    };
+    let inject_mode = parse_injection_mode(inject_mode.as_deref())?.map(|m| m.as_str().to_string());
     match client
         .chat(session_id.clone(), message, inject_mode, inject_explain)
         .await
@@ -914,6 +915,37 @@ fn format_session_line(session: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review P3-5: `--stop` printed "Daemon stopped" after a ping and left
+    /// the daemon running. It fails before touching the socket now.
+    #[tokio::test]
+    async fn test_daemon_stop_fails_instead_of_claiming_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let client = DaemonClient::new(tmp.path().join("no-daemon.sock"));
+        let err = handle_daemon(&client, true).await.unwrap_err();
+        assert!(err.to_string().contains("no stop request"), "{err}");
+    }
+
+    /// Refutation review of c19a1dd: daemon mode dropped `--inject-mode`,
+    /// so a mistyped mode was accepted. It fails before the daemon is asked.
+    #[tokio::test]
+    async fn test_daemon_session_start_refuses_an_invalid_inject_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let client = DaemonClient::new(tmp.path().join("no-daemon.sock"));
+        let command = Commands::SessionStart {
+            name: Some("s".to_string()),
+            platform: None,
+            inject_mode: Some("of".to_string()),
+            inject_explain: false,
+        };
+        let err = dispatch(command, tmp.path(), &client, None)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").to_lowercase().contains("inject"),
+            "{err:#}"
+        );
+    }
 
     /// Parse plugin options string: valid JSON passes through, invalid wraps as `{"raw": ...}`.
     /// Delegates to the shared `parse_json_or_raw` helper.

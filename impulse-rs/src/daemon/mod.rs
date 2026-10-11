@@ -127,6 +127,68 @@ fn build_remote_tool_context(
     )
 }
 
+/// Takes the per-project daemon lock, failing at once if another process
+/// holds it. The returned file holds the lock until it is dropped. On a
+/// filesystem that does not support `flock` (some network mounts) the
+/// daemon runs unlocked, as before the lock existed, with a warning; the
+/// liveness check still applies.
+fn acquire_daemon_lock(path: &std::path::Path) -> Result<Option<std::fs::File>> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("Failed to open daemon lock {}", path.display()))?;
+    // SAFETY: `file` stays open for the whole call, so the descriptor is
+    // valid; flock only takes an advisory lock on it and touches no memory.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        match classify_lock_failure(error.raw_os_error()) {
+            LockFailure::Held => anyhow::bail!(
+                "Another daemon is already running (lock held: {})",
+                path.display()
+            ),
+            LockFailure::Unsupported => {
+                tracing::warn!(
+                    "daemon lock unavailable on {} ({error}); continuing without it",
+                    path.display()
+                );
+                return Ok(None);
+            }
+            LockFailure::Other => {
+                return Err(error).with_context(|| format!("Failed to lock {}", path.display()))
+            }
+        }
+    }
+    Ok(Some(file))
+}
+
+/// What a failed non-blocking `flock` means for starting the daemon.
+#[derive(Debug, PartialEq, Eq)]
+enum LockFailure {
+    /// Another process holds the lock.
+    Held,
+    /// This filesystem cannot lock; the daemon runs unlocked.
+    Unsupported,
+    /// Anything else, which refuses to start.
+    Other,
+}
+
+fn classify_lock_failure(code: Option<i32>) -> LockFailure {
+    match code {
+        // EWOULDBLOCK is flock's answer when another process holds the lock;
+        // lock emulation on some network filesystems (CIFS) answers EACCES.
+        Some(code) if code == libc::EWOULDBLOCK || code == libc::EACCES => LockFailure::Held,
+        Some(code)
+            if [libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOLCK, libc::EINVAL].contains(&code) =>
+        {
+            LockFailure::Unsupported
+        }
+        _ => LockFailure::Other,
+    }
+}
+
 pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub state: SharedState,
@@ -158,6 +220,11 @@ pub struct Daemon {
     /// an empty cell simply means no connection can reach operator class.
     operator_capability: Arc<std::sync::OnceLock<OperatorCapability>>,
     daemon_uid: u32,
+    /// Fallbacks taken while constructing the daemon (unreadable config,
+    /// external tools not loaded, manifest not refreshed). `start` logs them
+    /// once its tracing subscriber exists; a `tracing::warn!` in `new` would
+    /// go nowhere, and these used to be dropped silently.
+    startup_warnings: Vec<String>,
 }
 
 impl Daemon {
@@ -172,18 +239,30 @@ impl Daemon {
             .base_path()
             .parent()
             .unwrap_or_else(|| state.storage().base_path());
-        let config_snapshot = state.config_snapshot().unwrap_or_default();
+        let mut startup_warnings = Vec::new();
+        let config_snapshot = state.config_snapshot().unwrap_or_else(|err| {
+            startup_warnings.push(format!("could not read config, using defaults: {err:#}"));
+            Default::default()
+        });
         let external_tools_dir = config_snapshot.resolved_external_tools_dir_from(project_root);
+        // One invalid manifest fails the whole directory; the daemon still
+        // starts, with the built-in tools only, and says so.
         let tool_registry = crate::tooling::ToolRegistry::with_runtime(
             state.storage().base_path(),
             &external_tools_dir,
         )
-        .unwrap_or_else(|_| crate::tooling::ToolRegistry::with_defaults());
+        .unwrap_or_else(|err| {
+            startup_warnings.push(format!(
+                "external tools in {} were not loaded ({err}); serving the built-in tools only",
+                external_tools_dir.display()
+            ));
+            crate::tooling::ToolRegistry::with_defaults()
+        });
         if let Err(err) = crate::agent_discovery::write_capabilities_manifest(
             state.storage().base_path(),
             &tool_registry,
         ) {
-            tracing::warn!("failed to refresh capabilities manifest: {}", err);
+            startup_warnings.push(format!("failed to refresh capabilities manifest: {err}"));
         }
         let tool_context = build_remote_tool_context(state.storage().base_path(), &config_snapshot);
 
@@ -210,7 +289,13 @@ impl Daemon {
             cached_agent: Arc::new(tokio::sync::Mutex::new(None)),
             operator_capability: Arc::new(std::sync::OnceLock::new()),
             daemon_uid: actor_provenance::daemon_uid(),
+            startup_warnings,
         }
+    }
+
+    #[cfg(test)]
+    pub fn startup_warnings(&self) -> &[String] {
+        &self.startup_warnings
     }
 
     /// Where this daemon publishes its operator capability.
@@ -234,6 +319,9 @@ impl Daemon {
             .with_target(false)
             .compact()
             .try_init();
+        for warning in &self.startup_warnings {
+            tracing::warn!("{warning}");
+        }
 
         let socket_dir = self
             .config
@@ -246,6 +334,14 @@ impl Daemon {
         tokio::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o700))
             .await
             .context("Failed to restrict socket directory permissions")?;
+
+        // One daemon per project, enforced by an exclusive lock held for this
+        // daemon's lifetime and taken before the liveness check below. The
+        // check alone raced: two daemons starting together both found no live
+        // socket and both reconciled reservations, and a live daemon whose
+        // connect() failed under load had its socket unlinked. The kernel
+        // drops the lock when the process exits, so a crash never leaves it.
+        let _daemon_lock = acquire_daemon_lock(&socket_dir.join("daemon.lock"))?;
 
         // Stale socket detection: try connecting to distinguish crash residue from running daemon
         let pid_path = self.config.socket_path.with_extension("pid");
@@ -266,6 +362,13 @@ impl Daemon {
             let _ = tokio::fs::remove_file(&pid_path).await;
         }
 
+        // No other daemon serves this project, so reservations still open on
+        // disk were left by a run that died before writing its receipt.
+        self.config
+            .state
+            .reconcile_producer_reservations()
+            .context("Failed to reconcile interrupted producer reservations")?;
+
         // Publish the capability BEFORE binding, so that "the socket is
         // connectable" implies "the capability is on disk". Publishing after
         // bind leaves a window in which a client that uses socket readiness as
@@ -275,11 +378,8 @@ impl Daemon {
         // The trade: if bind then fails, a capability file is left for a daemon
         // that never listened. That authenticates nothing (a presentation is
         // compared against a *running* daemon's in-memory value) and the next
-        // successful run overwrites it. The one case this is worse than
-        // publishing later is two daemons starting concurrently, where the
-        // loser can clobber the winner's file; that race already exists for the
-        // PID file, is what the liveness check above is there to catch, and
-        // self-corrects on restart.
+        // successful run overwrites it. Two daemons cannot both get here: the
+        // lock above stops the second before it reaches the liveness check.
         let capability_path = self.operator_capability_path();
         let capability = OperatorCapability::generate()
             .context("Failed to mint this daemon run's operator capability")?;
@@ -352,7 +452,10 @@ impl Daemon {
                             });
                         }
                         Err(e) => {
+                            // Out of descriptors (EMFILE) fails every accept;
+                            // retrying at once spun a core and flooded the log.
                             eprintln!("Accept error: {}", e);
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         }
                     }
                 }

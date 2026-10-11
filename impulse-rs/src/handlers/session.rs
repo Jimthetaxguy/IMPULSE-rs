@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 
 use crate::envelope::{write_envelope, EnvelopeBuilder, OutputFormat};
@@ -6,8 +6,8 @@ use crate::{guardrail, injection, semantic_diff, state, validate, verify};
 
 use super::{
     capture_hook_evidence, default_session_name, get_session_id, hook_session_start_banner,
-    parse_platform, persist_claude_env_var, preview_block, print_verification_report,
-    read_hook_stdin_payload, HookEvidenceInput,
+    parse_injection_mode, parse_platform, persist_claude_env_var, preview_block,
+    print_verification_report, read_hook_stdin_payload, HookEvidenceInput,
 };
 
 pub async fn handle_session_start(
@@ -22,15 +22,18 @@ pub async fn handle_session_start(
     let name = name.unwrap_or_else(default_session_name);
     validate::reject_control_chars(&name, "name")?;
     let platform = platform.and_then(|p| parse_platform(&p));
+    // Unspecified means the configured `context_injection_mode` (review by
+    // default): principle 6, never inject without consent. This used to force
+    // Apply, so the SessionStart hook injected memory even with the mode set
+    // to `off` or `review`, and a typo such as `--inject-mode of` also
+    // applied instead of failing like every other injection entry point.
+    // Checked before the session exists, so a typo leaves nothing behind.
+    let mode_override = parse_injection_mode(inject_mode.as_deref())?;
     let session = state.create_session(name.clone(), platform).await?;
     let _ = persist_claude_env_var("IMPULSE_SESSION_ID", &session.id);
 
     let query_parts = vec![name];
     let config = state.config_snapshot()?;
-    let mode_override = inject_mode
-        .as_deref()
-        .and_then(injection::InjectionMode::parse)
-        .or(Some(injection::InjectionMode::Apply));
 
     let injection_result = injection::run_injection(
         state.storage().base_path(),
@@ -232,7 +235,9 @@ pub async fn handle_session_end(
                 println!("Session not found: {}", session_id)
             }
         }
-        Err(e) => eprintln!("Error: {}", e),
+        // An unknown session fails open above (hooks must not break the
+        // agent), but a state write that failed is a real error.
+        Err(e) => return Err(e).context("Failed to end session"),
     }
     Ok(())
 }
@@ -244,6 +249,7 @@ pub async fn handle_track_write(
     format: Option<OutputFormat>,
 ) -> Result<()> {
     validate::validate_file_arg(&file)?;
+    validate::validate_single_line_text(&file, "file")?;
 
     let structured = matches!(format, Some(OutputFormat::Json | OutputFormat::Ndjson));
     if let Some(sid) = get_session_id(session_id) {
@@ -276,7 +282,7 @@ pub async fn handle_track_tool(
     session_id: Option<String>,
     format: Option<OutputFormat>,
 ) -> Result<()> {
-    validate::reject_control_chars(&tool, "tool")?;
+    validate::validate_single_line_text(&tool, "tool")?;
 
     let structured = matches!(format, Some(OutputFormat::Json | OutputFormat::Ndjson));
     if let Some(sid) = get_session_id(session_id) {
