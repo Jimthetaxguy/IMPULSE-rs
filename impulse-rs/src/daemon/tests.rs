@@ -776,7 +776,6 @@ mod tests {
         for format in [
             crate::office::OfficeFormat::Docx,
             crate::office::OfficeFormat::Xlsx,
-            crate::office::OfficeFormat::Xls,
             crate::office::OfficeFormat::Csv,
         ] {
             assert!(
@@ -785,6 +784,11 @@ mod tests {
                 format.as_str()
             );
         }
+        // Legacy `.xls` cannot be read under the office bounds, so the
+        // provider does not claim it.
+        assert!(!registry
+            .supports_format(crate::office::OfficeFormat::Xls)
+            .unwrap());
     }
 
     #[cfg(not(feature = "office-support"))]
