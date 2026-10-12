@@ -14,8 +14,8 @@ use std::time::Duration;
 use impulse_ops::{AgentRuntime, ContextHealthSummary, MachineTarget, TerminalOpsReport};
 
 use crate::runtime::{
-    AgentRuntimeSnapshot, DesktopEvent, DesktopEventSink, GovernedRoutingMetadata,
-    GovernedTaskGateway,
+    AgentRuntimeSnapshot, DesktopEvent, DesktopEventSink, GovernedPromotionResponse,
+    GovernedRoutingMetadata, GovernedTaskGateway,
 };
 
 /// Desktop heartbeats stay well below the daemon's ten-second stale boundary.
@@ -393,7 +393,13 @@ mod unix {
     // permits 15 seconds of execution plus two sequential five-second pipe
     // drains, for a 75-second theoretical aggregate. Leave cleanup/persistence
     // headroom without weakening the two-second bound on ordinary IPC.
-    const GOVERNED_REGISTRATION_READ_TIMEOUT: Duration = Duration::from_secs(90);
+    //
+    // ADR-0019's promotion and discard producers run Git in the canonical
+    // checkout and the staged worktree under the same daemon-side bounds, so
+    // they share this budget rather than inheriting the ordinary IPC timeout,
+    // under which every real promotion would read as a transport failure and be
+    // retried three times.
+    const GOVERNED_PRODUCER_READ_TIMEOUT: Duration = Duration::from_secs(90);
     const ACKNOWLEDGED_REQUEST_ATTEMPTS: usize = 3;
     const GOVERNED_LIFECYCLE_OUTBOX_SCHEMA: u32 = 1;
     const MAX_GOVERNED_LIFECYCLE_OUTBOX_ENTRIES: usize = 1_024;
@@ -563,7 +569,7 @@ mod unix {
         lifecycle_outbox_path: Option<PathBuf>,
         lifecycle_outbox_lock: Arc<Mutex<()>>,
         io_timeout: Duration,
-        governed_registration_read_timeout: Duration,
+        governed_producer_read_timeout: Duration,
     }
 
     impl UnixDaemonOpsClient {
@@ -573,7 +579,7 @@ mod unix {
                 lifecycle_outbox_path: None,
                 lifecycle_outbox_lock: Arc::new(Mutex::new(())),
                 io_timeout: IO_TIMEOUT,
-                governed_registration_read_timeout: GOVERNED_REGISTRATION_READ_TIMEOUT,
+                governed_producer_read_timeout: GOVERNED_PRODUCER_READ_TIMEOUT,
             }
         }
 
@@ -581,10 +587,10 @@ mod unix {
         fn with_io_timeouts(
             mut self,
             io_timeout: Duration,
-            governed_registration_read_timeout: Duration,
+            governed_producer_read_timeout: Duration,
         ) -> Self {
             self.io_timeout = io_timeout;
-            self.governed_registration_read_timeout = governed_registration_read_timeout;
+            self.governed_producer_read_timeout = governed_producer_read_timeout;
             self
         }
 
@@ -611,6 +617,27 @@ mod unix {
                 .set_write_timeout(Some(self.io_timeout))
                 .map_err(|error| format!("set daemon write timeout: {error}"))?;
 
+            // One reader for the whole connection. A second `BufReader` over
+            // the same socket would silently discard whatever the first had
+            // buffered past its line, so the handshake and the request share
+            // this one.
+            let mut reader = BufReader::new(
+                stream
+                    .try_clone()
+                    .map_err(|error| format!("clone daemon connection for reading: {error}"))?,
+            );
+
+            // ADR-0018: the daemon classifies each connection, and this client
+            // opens a fresh one per request, so the capability is presented on
+            // this connection before a request the daemon gates on operator
+            // class. With no capability reachable the request still goes out and
+            // the daemon's own typed authorization error surfaces below.
+            let capability_refusal = if Self::requires_operator_class(request) {
+                self.present_operator_capability(&stream, &mut reader)?
+            } else {
+                None
+            };
+
             let encoded = serde_json::to_vec(request)
                 .map_err(|error| format!("serialize daemon request: {error}"))?;
             stream
@@ -620,13 +647,125 @@ mod unix {
                 .map_err(|error| format!("write daemon request: {error}"))?;
 
             let mut line = String::new();
-            let bytes = BufReader::new(stream)
+            let bytes = reader
                 .read_line(&mut line)
                 .map_err(|error| format!("read daemon response: {error}"))?;
             if bytes == 0 {
                 return Err("daemon closed connection before responding".to_string());
             }
-            serde_json::from_str(&line).map_err(|error| format!("parse daemon response: {error}"))
+            let response: WorkbenchDaemonResponse = serde_json::from_str(&line)
+                .map_err(|error| format!("parse daemon response: {error}"))?;
+
+            // A refused capability is why an operator mutation is about to be
+            // rejected, so it belongs in the message the cockpit already shows
+            // rather than only in a log the operator never reads.
+            match (capability_refusal, response) {
+                (Some(refusal), WorkbenchDaemonResponse::Error { message }) => {
+                    // Deliberately `Ok` carrying an `Error`, not `Err`. A
+                    // completed exchange that carried a refusal is a terminal
+                    // daemon verdict, not the ambiguous transport failure
+                    // `send_acknowledged` exists to retry -- and
+                    // `mutate_current_once` wraps that in its own revision loop,
+                    // so an `Err` here would reconnect up to nine times to be
+                    // refused identically each time. `ok_result` converts this
+                    // into the caller's `Err` with the refusal text intact.
+                    Ok(WorkbenchDaemonResponse::Error {
+                        message: Self::capability_refusal_message(&refusal, &message),
+                    })
+                }
+                (Some(refusal), response) => {
+                    // The daemon answered successfully despite refusing the
+                    // capability, which means the request was not one it gates.
+                    // The refusal still matters -- this connection was not
+                    // operator class -- so it must not vanish silently.
+                    eprintln!(
+                        "desktop daemon-ops: the daemon refused this operator capability \
+                         ({refusal}); the request succeeded on a non-operator connection, so any \
+                         governed decision recorded through it carries declared, not \
+                         authenticated, provenance"
+                    );
+                    Ok(response)
+                }
+                (None, response) => Ok(response),
+            }
+        }
+
+        /// Whether the daemon refuses `request` on a non-operator connection.
+        ///
+        /// Deliberately coarse: every governed mutation presents, rather than
+        /// this client re-deriving which mutations need it (that answer depends
+        /// on the task's verification profile, which only the daemon holds).
+        ///
+        /// The two ADR-0019 staged-worktree endpoints are not coarse at all —
+        /// `daemon::governed_wiring` calls `require_operator_class` on both
+        /// unconditionally, before any state read — so they are named here for
+        /// the same reason `DaemonClient::requires_operator_class` names them.
+        fn requires_operator_class(request: &WorkbenchDaemonRequest) -> bool {
+            matches!(
+                request,
+                WorkbenchDaemonRequest::MutateGovernedTask { .. }
+                    | WorkbenchDaemonRequest::PromoteGovernedOutcome { .. }
+                    | WorkbenchDaemonRequest::DiscardGovernedStagedWorktree { .. }
+            )
+        }
+
+        /// Explain that an operator mutation failed behind a refused capability.
+        ///
+        /// Named as a provenance downgrade, not just a refusal: the connection
+        /// acted as a non-operator, which is why the daemon rejected the
+        /// mutation.
+        fn capability_refusal_message(refusal: &str, daemon_error: &str) -> String {
+            format!(
+                "{daemon_error} (this connection presented an operator capability and the daemon \
+                 refused it: {refusal}; it therefore acted as a non-operator connection)"
+            )
+        }
+
+        /// Present this daemon run's operator capability on an open connection.
+        ///
+        /// The capability is discovered through the shared
+        /// `impulse_ops::operator_capability` helper, the same one the CLI/TUI
+        /// client uses, and `reader` is the connection's single reader so no
+        /// buffered bytes are dropped between the handshake and the request.
+        ///
+        /// Returns the daemon's reason when a capability was presented and
+        /// refused, so the caller can fold it into the error the cockpit already
+        /// surfaces. `None` means either nothing to present or a clean
+        /// acceptance. Only transport failures propagate as `Err`.
+        fn present_operator_capability(
+            &self,
+            stream: &UnixStream,
+            reader: &mut BufReader<UnixStream>,
+        ) -> Result<Option<String>, String> {
+            let Some(token) =
+                impulse_ops::operator_capability::resolve_for_socket(&self.socket_path)
+            else {
+                return Ok(None);
+            };
+            let encoded = serde_json::to_vec(&WorkbenchDaemonRequest::PresentOperatorCapability(
+                impulse_ops::operator_capability::OperatorCapabilityPresentation { token },
+            ))
+            .map_err(|error| format!("serialize operator capability: {error}"))?;
+            let mut handle = stream;
+            handle
+                .write_all(&encoded)
+                .and_then(|_| handle.write_all(b"\n"))
+                .and_then(|_| handle.flush())
+                .map_err(|error| format!("present operator capability: {error}"))?;
+            let mut line = String::new();
+            let bytes = reader
+                .read_line(&mut line)
+                .map_err(|error| format!("read operator capability response: {error}"))?;
+            if bytes == 0 {
+                return Err(
+                    "daemon closed connection before answering the operator capability".to_string(),
+                );
+            }
+            match serde_json::from_str::<WorkbenchDaemonResponse>(&line) {
+                Ok(WorkbenchDaemonResponse::Error { message }) => Ok(Some(message)),
+                Ok(_) => Ok(None),
+                Err(error) => Err(format!("parse operator capability response: {error}")),
+            }
         }
 
         fn send(
@@ -984,7 +1123,7 @@ mod unix {
             registration: impulse_ops::governed_task::GovernedTaskRegistration,
         ) -> Result<impulse_ops::governed_task::GovernedTaskRun, String> {
             let read_timeout = if registration.verification_profile.is_some() {
-                self.governed_registration_read_timeout
+                self.governed_producer_read_timeout
             } else {
                 self.io_timeout
             };
@@ -1038,6 +1177,50 @@ mod unix {
                     "{error}; lifecycle mutation retained for durable daemon retry"
                 )),
             }
+        }
+
+        fn promote_outcome(
+            &self,
+            request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+        ) -> Result<GovernedPromotionResponse, String> {
+            // Acknowledged, not fire-and-forget: the request carries its own
+            // idempotency key and expected revision, so a daemon commit followed
+            // by a lost response is replayed off the stored receipt rather than
+            // fast-forwarding the canonical branch twice.
+            let response = self.send_acknowledged_with_read_timeout(
+                &WorkbenchDaemonRequest::PromoteGovernedOutcome { request },
+                self.governed_producer_read_timeout,
+            )?;
+            let value = Self::ok_result(response)?;
+            match value.get("refused") {
+                Some(serde_json::Value::Bool(true)) => serde_json::from_value(value)
+                    .map(GovernedPromotionResponse::StagedConfigRefused)
+                    .map_err(|error| format!("parse governed promotion refusal: {error}")),
+                None => serde_json::from_value(value)
+                    .map(GovernedPromotionResponse::Recorded)
+                    .map_err(|error| format!("parse governed promotion acknowledgement: {error}")),
+                Some(_) => Err("invalid governed promotion refusal discriminator".to_string()),
+            }
+        }
+
+        fn discard_staged_worktree(
+            &self,
+            request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+        ) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck, String>
+        {
+            // Validate the one caller-authored field here rather than paying a
+            // round trip to be told the reason was blank.
+            request
+                .validate()
+                .map_err(|error| format!("invalid governed discard request: {error}"))?;
+            let response = self.send_acknowledged_with_read_timeout(
+                &WorkbenchDaemonRequest::DiscardGovernedStagedWorktree { request },
+                self.governed_producer_read_timeout,
+            )?;
+            let value = Self::ok_result(response)?;
+            serde_json::from_value(value).map_err(|error| {
+                format!("parse governed staged-worktree discard acknowledgement: {error}")
+            })
         }
 
         fn routing_metadata(&self) -> Option<GovernedRoutingMetadata> {
@@ -1540,7 +1723,7 @@ mod unix {
 
             assert_eq!(IO_TIMEOUT, Duration::from_secs(2));
             assert!(
-                GOVERNED_REGISTRATION_READ_TIMEOUT > Duration::from_secs(75),
+                GOVERNED_PRODUCER_READ_TIMEOUT > Duration::from_secs(75),
                 "profiled registration must exceed all three probe and drain bounds"
             );
 
@@ -1584,6 +1767,7 @@ mod unix {
                 task: registration.task.clone(),
                 acceptance_criteria: registration.acceptance_criteria.clone(),
                 approval_policy: ApprovalPolicy::OperatorRequired,
+                world_scope: Default::default(),
                 verification_profile: registration.verification_profile,
                 role_assignment: registration.role_assignment.clone(),
                 role_compatibility: registration.role_compatibility.clone(),
@@ -1591,6 +1775,8 @@ mod unix {
                 agent_id: registration.agent_id.clone(),
                 session_id: None,
                 initial_subject_revision: registration.initial_subject_revision.clone(),
+                staged_worktree: None,
+                promotions: vec![],
                 execution_state: GovernedExecutionState::Registered,
                 review_state: GovernedReviewState::AwaitingClaim,
                 claims: vec![],
@@ -1680,6 +1866,7 @@ mod unix {
                 task: registration.task.clone(),
                 acceptance_criteria: registration.acceptance_criteria.clone(),
                 approval_policy: ApprovalPolicy::OperatorRequired,
+                world_scope: Default::default(),
                 verification_profile: None,
                 role_assignment: None,
                 role_compatibility: None,
@@ -1687,6 +1874,8 @@ mod unix {
                 agent_id: registration.agent_id.clone(),
                 session_id: None,
                 initial_subject_revision: None,
+                staged_worktree: None,
+                promotions: vec![],
                 execution_state: GovernedExecutionState::Registered,
                 review_state: GovernedReviewState::AwaitingClaim,
                 claims: vec![],
@@ -1752,6 +1941,7 @@ mod unix {
                 task: "persist exit while daemon is down".to_string(),
                 acceptance_criteria: vec![],
                 approval_policy: ApprovalPolicy::OperatorRequired,
+                world_scope: Default::default(),
                 verification_profile: None,
                 role_assignment: None,
                 role_compatibility: None,
@@ -1759,6 +1949,8 @@ mod unix {
                 agent_id: "worker-1".to_string(),
                 session_id: None,
                 initial_subject_revision: None,
+                staged_worktree: None,
+                promotions: vec![],
                 execution_state: GovernedExecutionState::Running,
                 review_state: GovernedReviewState::AwaitingClaim,
                 claims: vec![],
@@ -1881,6 +2073,7 @@ mod unix {
                 task: "prove drain does not block new exit intent".to_string(),
                 acceptance_criteria: vec![],
                 approval_policy: ApprovalPolicy::OperatorRequired,
+                world_scope: Default::default(),
                 verification_profile: None,
                 role_assignment: None,
                 role_compatibility: None,
@@ -1888,6 +2081,8 @@ mod unix {
                 agent_id: "worker-1".to_string(),
                 session_id: None,
                 initial_subject_revision: None,
+                staged_worktree: None,
+                promotions: vec![],
                 execution_state: GovernedExecutionState::Running,
                 review_state: GovernedReviewState::AwaitingClaim,
                 claims: vec![],
@@ -2036,6 +2231,7 @@ mod unix {
                 task: "later valid lifecycle intent".to_string(),
                 acceptance_criteria: vec![],
                 approval_policy: ApprovalPolicy::OperatorRequired,
+                world_scope: Default::default(),
                 verification_profile: None,
                 role_assignment: None,
                 role_compatibility: None,
@@ -2043,6 +2239,8 @@ mod unix {
                 agent_id: "worker-valid".to_string(),
                 session_id: None,
                 initial_subject_revision: None,
+                staged_worktree: None,
+                promotions: vec![],
                 execution_state: GovernedExecutionState::Running,
                 review_state: GovernedReviewState::AwaitingClaim,
                 claims: vec![],
@@ -2465,6 +2663,932 @@ mod unix {
                     ..Default::default()
                 },
             }
+        }
+
+        /// ADR-0018: the cockpit's Approve/Reject path is a governed mutation,
+        /// so the capability must reach the daemon first, on the same
+        /// connection the mutation uses.
+        #[test]
+        fn governed_mutation_presents_the_operator_capability_first_on_a_fresh_connection() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("operator-capability.sock");
+            let token = "c".repeat(64);
+            std::fs::write(
+                impulse_ops::operator_capability::path_for_socket(&socket),
+                format!("{token}\n"),
+            )
+            .expect("publish capability");
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+
+            let task_id =
+                impulse_ops::governed_task::GovernedTaskId::try_new("cap-task").expect("task id");
+            let mutation_request = impulse_ops::governed_task::GovernedTaskMutationRequest {
+                request_id: impulse_ops::governed_task::GovernedRequestId::try_new("cap-approve")
+                    .expect("request id"),
+                project_id: "project".to_string(),
+                task_id: task_id.clone(),
+                expected_revision: 4,
+                mutation:
+                    impulse_ops::governed_task::GovernedTaskMutation::RecordOperatorDecision {
+                        decision: impulse_ops::governed_task::OperatorDecisionInput {
+                            actor: impulse_ops::governed_task::GovernedActor {
+                                kind: impulse_ops::governed_task::GovernedActorKind::Operator,
+                                id: "cockpit-operator".to_string(),
+                            },
+                            supervisor_verdict_id:
+                                impulse_ops::governed_task::GovernedRecordId::try_new("verdict-a")
+                                    .expect("verdict id"),
+                            decision: impulse_ops::governed_task::OperatorDecisionKind::Approve,
+                            rationale: "approved from the cockpit".to_string(),
+                        },
+                    },
+            };
+            let accepted = impulse_ops::governed_task::GovernedTaskRun {
+                id: task_id,
+                revision: 5,
+                project_id: "project".to_string(),
+                workspace_root: "/tmp/project".to_string(),
+                task: "prove the cockpit presents its capability".to_string(),
+                acceptance_criteria: vec!["approval reaches the daemon".to_string()],
+                approval_policy: impulse_ops::governed_task::ApprovalPolicy::OperatorRequired,
+                verification_profile: None,
+                role_assignment: None,
+                role_compatibility: None,
+                runtime_id: "codex".to_string(),
+                agent_id: "worker-1".to_string(),
+                session_id: None,
+                initial_subject_revision: None,
+                world_scope: Default::default(),
+                staged_worktree: None,
+                promotions: vec![],
+                execution_state: impulse_ops::governed_task::GovernedExecutionState::Registered,
+                review_state: impulse_ops::governed_task::GovernedReviewState::Accepted,
+                claims: vec![],
+                verifications: vec![],
+                supervisor_verdicts: vec![],
+                operator_decisions: vec![],
+                events: vec![],
+                created_at: "2026-09-02T00:00:00Z".to_string(),
+                updated_at: "2026-09-02T00:00:00Z".to_string(),
+            };
+
+            let accepted_for_server = accepted.clone();
+            let (requests_tx, requests_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept mutation connection");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                for index in 0..2 {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read request");
+                    let request: WorkbenchDaemonRequest =
+                        serde_json::from_str(&line).expect("parse request");
+                    requests_tx.send(request).expect("record request");
+                    if index == 0 {
+                        write_response(
+                            &mut stream,
+                            &WorkbenchDaemonResponse::Ok {
+                                result: serde_json::json!({"connection_class": "operator"}),
+                            },
+                        );
+                    } else {
+                        write_response(
+                            &mut stream,
+                            &WorkbenchDaemonResponse::Ok {
+                                result: serde_json::to_value(&accepted_for_server).unwrap(),
+                            },
+                        );
+                    }
+                }
+                // A second connection would mean the capability and the
+                // mutation did not share one classification.
+                listener.set_nonblocking(true).expect("nonblocking");
+                assert!(
+                    listener.accept().is_err(),
+                    "the mutation must reuse the connection the capability was presented on"
+                );
+            });
+
+            let client = UnixDaemonOpsClient::new(socket);
+            assert_eq!(
+                client.mutate_governed_task(mutation_request).unwrap(),
+                accepted
+            );
+
+            let presented = requests_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capability request");
+            match presented {
+                WorkbenchDaemonRequest::PresentOperatorCapability(presentation) => assert_eq!(
+                    presentation.token, token,
+                    "the published capability is presented verbatim"
+                ),
+                other => panic!("expected the capability first, received {other:?}"),
+            }
+            assert!(matches!(
+                requests_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("mutation request"),
+                WorkbenchDaemonRequest::MutateGovernedTask { .. }
+            ));
+            server.join().unwrap();
+        }
+
+        /// ADR-0018 review round 1: the cockpit's lifecycle reconciler marks a
+        /// profiled task's runtime exit, which is an operator-only mutation. If
+        /// only the approval path presented the capability, a profiled Builder
+        /// exit would be refused and the task would stay stuck in Running. The
+        /// read that precedes it is not gated and must not pay for a handshake.
+        #[test]
+        fn a_profiled_runtime_exit_from_the_cockpit_presents_the_capability_and_reconciles() {
+            use impulse_ops::governed_task as gt;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("profiled-exit.sock");
+            let token = "d".repeat(64);
+            std::fs::write(
+                impulse_ops::operator_capability::path_for_socket(&socket),
+                format!("{token}\n"),
+            )
+            .expect("publish capability");
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+
+            let task_id = gt::GovernedTaskId::try_new("profiled-exit-task").expect("task id");
+            let running = gt::GovernedTaskRun {
+                id: task_id.clone(),
+                revision: 2,
+                project_id: "project".to_string(),
+                workspace_root: "/tmp/project".to_string(),
+                task: "prove a profiled exit still reconciles".to_string(),
+                acceptance_criteria: vec!["the committed workspace passes".to_string()],
+                approval_policy: gt::ApprovalPolicy::OperatorRequired,
+                verification_profile: Some(gt::GovernedVerificationProfile::RustWorkspaceV1),
+                role_assignment: None,
+                role_compatibility: None,
+                runtime_id: "ion".to_string(),
+                agent_id: "profiled-builder".to_string(),
+                session_id: None,
+                initial_subject_revision: Some("a".repeat(40)),
+                world_scope: Default::default(),
+                staged_worktree: None,
+                promotions: vec![],
+                execution_state: gt::GovernedExecutionState::Running,
+                review_state: gt::GovernedReviewState::AwaitingClaim,
+                claims: vec![],
+                verifications: vec![],
+                supervisor_verdicts: vec![],
+                operator_decisions: vec![],
+                events: vec![],
+                created_at: "2026-09-02T00:00:00Z".to_string(),
+                updated_at: "2026-09-02T00:00:00Z".to_string(),
+            };
+            let mut exited = running.clone();
+            exited.revision = 3;
+            exited.execution_state = gt::GovernedExecutionState::RuntimeExited;
+
+            let running_for_server = running.clone();
+            let exited_for_server = exited.clone();
+            let (requests_tx, requests_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                // Connection 1: the ungated read that resolves the current
+                // revision. Connection 2: capability, then the gated mutation.
+                for connection in 0..2 {
+                    let (mut stream, _) = listener.accept().expect("accept connection");
+                    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                    let exchanges = if connection == 0 { 1 } else { 2 };
+                    for exchange in 0..exchanges {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).expect("read request");
+                        let request: WorkbenchDaemonRequest =
+                            serde_json::from_str(&line).expect("parse request");
+                        requests_tx.send(request).expect("record request");
+                        let result = match (connection, exchange) {
+                            (0, _) => serde_json::to_value(Some(&running_for_server)).unwrap(),
+                            (_, 0) => serde_json::json!({"connection_class": "operator"}),
+                            _ => serde_json::to_value(&exited_for_server).unwrap(),
+                        };
+                        write_response(&mut stream, &WorkbenchDaemonResponse::Ok { result });
+                    }
+                }
+            });
+
+            // `mutate_current` is the durable lifecycle path: it queues the
+            // mutation, applies it, then clears the entry, so it needs the same
+            // outbox the cockpit configures.
+            let client = UnixDaemonOpsClient::new(socket)
+                .with_lifecycle_outbox(Some(dir.path().join("lifecycle-outbox.json")));
+            let reconciled = client
+                .mutate_current(
+                    "project",
+                    &task_id,
+                    gt::GovernedRequestId::try_new("profiled-exit-1").expect("request id"),
+                    gt::GovernedTaskMutation::MarkRuntimeExited {
+                        actor: gt::GovernedActor {
+                            kind: gt::GovernedActorKind::System,
+                            id: "cockpit-runtime".to_string(),
+                        },
+                        reason: Some("builder exited".to_string()),
+                    },
+                )
+                .expect("a profiled runtime exit must reconcile from the cockpit");
+            assert_eq!(reconciled, exited);
+            assert_eq!(
+                reconciled.execution_state,
+                gt::GovernedExecutionState::RuntimeExited,
+                "the task must not stay stuck in Running"
+            );
+
+            let observed: Vec<WorkbenchDaemonRequest> = (0..3)
+                .map(|_| {
+                    requests_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("recorded request")
+                })
+                .collect();
+            assert!(
+                matches!(observed[0], WorkbenchDaemonRequest::GetGovernedTask { .. }),
+                "the ungated read must not pay for a handshake"
+            );
+            match &observed[1] {
+                WorkbenchDaemonRequest::PresentOperatorCapability(presentation) => {
+                    assert_eq!(presentation.token, token)
+                }
+                other => panic!("expected the capability before the mutation, got {other:?}"),
+            }
+            assert!(matches!(
+                observed[2],
+                WorkbenchDaemonRequest::MutateGovernedTask { .. }
+            ));
+            server.join().unwrap();
+        }
+
+        /// ADR-0018 review round 2: a refused capability plus a daemon error is
+        /// a completed exchange, not an ambiguous transport failure. Returning
+        /// `Err` from `send_with_read_timeout` would feed it back through
+        /// `send_acknowledged`'s retry loop -- and `mutate_current_once`'s
+        /// revision loop on top of that -- reconnecting up to nine times to be
+        /// refused identically each time.
+        #[test]
+        fn a_refused_capability_is_terminal_and_makes_exactly_one_connection() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("refused-capability.sock");
+            std::fs::write(
+                impulse_ops::operator_capability::path_for_socket(&socket),
+                "e".repeat(64),
+            )
+            .expect("publish capability");
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+
+            let mutation_request = impulse_ops::governed_task::GovernedTaskMutationRequest {
+                request_id: impulse_ops::governed_task::GovernedRequestId::try_new("refused-1")
+                    .expect("request id"),
+                project_id: "project".to_string(),
+                task_id: impulse_ops::governed_task::GovernedTaskId::try_new("refused-task")
+                    .expect("task id"),
+                expected_revision: 4,
+                mutation:
+                    impulse_ops::governed_task::GovernedTaskMutation::RecordOperatorDecision {
+                        decision: impulse_ops::governed_task::OperatorDecisionInput {
+                            actor: impulse_ops::governed_task::GovernedActor {
+                                kind: impulse_ops::governed_task::GovernedActorKind::Operator,
+                                id: "cockpit-operator".to_string(),
+                            },
+                            supervisor_verdict_id:
+                                impulse_ops::governed_task::GovernedRecordId::try_new("verdict-a")
+                                    .expect("verdict id"),
+                            decision: impulse_ops::governed_task::OperatorDecisionKind::Approve,
+                            rationale: "approved from the cockpit".to_string(),
+                        },
+                    },
+            };
+
+            let (connections_tx, connections_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                connections_tx.send(()).expect("record connection");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                // Refuse the capability, then refuse the mutation.
+                for message in [
+                    "operator capability rejected: the presented token does not match this daemon run",
+                    "request `RecordOperatorDecision` requires an operator-class connection",
+                ] {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read request");
+                    write_response(
+                        &mut stream,
+                        &WorkbenchDaemonResponse::Error {
+                            message: message.to_string(),
+                        },
+                    );
+                }
+                listener.set_nonblocking(true).expect("nonblocking");
+                while listener.accept().is_ok() {
+                    connections_tx.send(()).expect("record retry connection");
+                }
+            });
+
+            let client = UnixDaemonOpsClient::new(socket);
+            let error = client.mutate_governed_task(mutation_request).unwrap_err();
+            assert!(
+                error.contains("operator-class"),
+                "the daemon's own refusal must survive: {error}"
+            );
+            assert!(
+                error.contains("does not match this daemon run"),
+                "and so must the capability refusal that explains it: {error}"
+            );
+
+            server.join().unwrap();
+            drop(client);
+            let connections = connections_rx.iter().count();
+            assert_eq!(
+                connections, 1,
+                "a terminal refusal must not be retried; saw {connections} connections"
+            );
+        }
+
+        /// Without a published capability the cockpit still connects and sends
+        /// the mutation, so the daemon's typed refusal is what the existing
+        /// error path surfaces.
+        #[test]
+        fn a_missing_capability_still_sends_the_mutation_and_surfaces_the_daemon_error() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("no-capability.sock");
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+
+            let mutation_request = impulse_ops::governed_task::GovernedTaskMutationRequest {
+                request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                    "no-cap-approve",
+                )
+                .expect("request id"),
+                project_id: "project".to_string(),
+                task_id: impulse_ops::governed_task::GovernedTaskId::try_new("no-cap-task")
+                    .expect("task id"),
+                expected_revision: 4,
+                mutation:
+                    impulse_ops::governed_task::GovernedTaskMutation::RecordOperatorDecision {
+                        decision: impulse_ops::governed_task::OperatorDecisionInput {
+                            actor: impulse_ops::governed_task::GovernedActor {
+                                kind: impulse_ops::governed_task::GovernedActorKind::Operator,
+                                id: "cockpit-operator".to_string(),
+                            },
+                            supervisor_verdict_id:
+                                impulse_ops::governed_task::GovernedRecordId::try_new("verdict-a")
+                                    .expect("verdict id"),
+                            decision: impulse_ops::governed_task::OperatorDecisionKind::Approve,
+                            rationale: "approved from the cockpit".to_string(),
+                        },
+                    },
+            };
+
+            let (requests_tx, requests_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                // One connection only: a typed refusal is a completed exchange,
+                // so `send_acknowledged` (which retries transport failures, not
+                // daemon errors) must not reconnect.
+                let (mut stream, _) = listener.accept().expect("accept mutation connection");
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().expect("clone stream"))
+                    .read_line(&mut line)
+                    .expect("read request");
+                requests_tx
+                    .send(serde_json::from_str::<WorkbenchDaemonRequest>(&line).unwrap())
+                    .expect("record request");
+                write_response(
+                    &mut stream,
+                    &WorkbenchDaemonResponse::Error {
+                        message: "request `RecordOperatorDecision` requires an operator-class \
+                                  connection"
+                            .to_string(),
+                    },
+                );
+                listener.set_nonblocking(true).expect("nonblocking");
+                assert!(
+                    listener.accept().is_err(),
+                    "a typed daemon refusal must not be retried as a transport failure"
+                );
+            });
+
+            let client = UnixDaemonOpsClient::new(socket);
+            let error = client.mutate_governed_task(mutation_request).unwrap_err();
+            assert!(
+                error.contains("operator-class"),
+                "the daemon's typed refusal must reach the existing error path, got: {error}"
+            );
+            assert!(
+                matches!(
+                    requests_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("mutation request"),
+                    WorkbenchDaemonRequest::MutateGovernedTask { .. }
+                ),
+                "with no capability reachable the mutation is still sent"
+            );
+            server.join().unwrap();
+        }
+
+        // ── ADR-0019 staged-worktree controls (protocol v9) ─────────────────
+
+        /// An accepted, staged governed task: the only shape from which the
+        /// cockpit offers Promote.
+        fn staged_accepted_task() -> impulse_ops::governed_task::GovernedTaskRun {
+            use impulse_ops::governed_task as gt;
+            gt::GovernedTaskRun {
+                id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+                revision: 7,
+                project_id: "project".to_string(),
+                workspace_root: "/tmp/project".to_string(),
+                task: "Prove the cockpit drives the staged controls".to_string(),
+                acceptance_criteria: vec!["the gate is green".to_string()],
+                approval_policy: gt::ApprovalPolicy::OperatorRequired,
+                verification_profile: Some(gt::GovernedVerificationProfile::RustWorkspaceV1),
+                role_assignment: None,
+                role_compatibility: None,
+                runtime_id: "ion".to_string(),
+                agent_id: "worker-1".to_string(),
+                session_id: None,
+                initial_subject_revision: Some("a".repeat(40)),
+                world_scope: gt::WorldScope::StagedAuthoritative,
+                staged_worktree: Some(gt::StagedWorktree {
+                    id: gt::GovernedRecordId::try_new("staged-1").expect("staged id"),
+                    actor: gt::GovernedActor {
+                        kind: gt::GovernedActorKind::System,
+                        id: "impulse-daemon:staged_worktree".to_string(),
+                    },
+                    root: "/tmp/project/.impulse/worktrees/staged-task".to_string(),
+                    initial_subject_revision: "a".repeat(40),
+                    shared_config_digest: gt::SharedRepositoryConfigPin::Unknown,
+                    status: gt::StagedWorktreeStatus::Active,
+                    materialized_at: "2026-09-12T00:00:00Z".to_string(),
+                    based_on_revision: 1,
+                }),
+                promotions: vec![],
+                execution_state: gt::GovernedExecutionState::RuntimeExited,
+                review_state: gt::GovernedReviewState::Accepted,
+                claims: vec![],
+                verifications: vec![],
+                supervisor_verdicts: vec![],
+                operator_decisions: vec![],
+                events: vec![],
+                created_at: "2026-09-12T00:00:00Z".to_string(),
+                updated_at: "2026-09-12T00:00:00Z".to_string(),
+            }
+        }
+
+        /// Serve a capability handshake and then one request, recording both.
+        ///
+        /// The listener is asserted to see exactly one connection, which is what
+        /// proves the capability and the gated request shared a classification.
+        fn serve_capability_then_one_request(
+            listener: UnixListener,
+            response: WorkbenchDaemonResponse,
+        ) -> (
+            thread::JoinHandle<()>,
+            mpsc::Receiver<WorkbenchDaemonRequest>,
+        ) {
+            let (requests_tx, requests_rx) = mpsc::channel();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept connection");
+                let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+                for index in 0..2 {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).expect("read request");
+                    let request: WorkbenchDaemonRequest =
+                        serde_json::from_str(&line).expect("parse request");
+                    requests_tx.send(request).expect("record request");
+                    if index == 0 {
+                        write_response(
+                            &mut stream,
+                            &WorkbenchDaemonResponse::Ok {
+                                result: serde_json::json!({"connection_class": "operator"}),
+                            },
+                        );
+                    } else {
+                        write_response(&mut stream, &response);
+                    }
+                }
+                listener.set_nonblocking(true).expect("nonblocking");
+                assert!(
+                    listener.accept().is_err(),
+                    "the gated request must reuse the connection the capability was presented on"
+                );
+            });
+            (server, requests_rx)
+        }
+
+        fn publish_capability(socket: &Path, token: &str) {
+            std::fs::write(
+                impulse_ops::operator_capability::path_for_socket(socket),
+                format!("{token}\n"),
+            )
+            .expect("publish capability");
+        }
+
+        /// ADR-0019 rule 6: a canonical branch that cannot be advanced is an
+        /// execution fact, so the daemon answers `Ok` with a blocked outcome and
+        /// the client must return it as success. Reading it as an error is the
+        /// exact mistake the desktop handoff note warns about.
+        #[test]
+        fn a_blocked_promotion_is_an_operator_class_success_not_a_client_error() {
+            use impulse_ops::governed_task as gt;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("promote.sock");
+            let token = "e".repeat(64);
+            publish_capability(&socket, &token);
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+
+            let mut blocked = staged_accepted_task();
+            blocked.revision = 8;
+            blocked.promotions.push(gt::GovernedPromotion {
+                id: gt::GovernedRecordId::try_new("promotion-1").expect("promotion id"),
+                actor: gt::GovernedActor {
+                    kind: gt::GovernedActorKind::Operator,
+                    id: "local-operator-ui".to_string(),
+                },
+                accepted_revision: "b".repeat(40),
+                initial_subject_revision: "a".repeat(40),
+                outcome: gt::GovernedPromotionOutcome::PromotionBlocked {
+                    canonical_head: "c".repeat(40),
+                    reason: gt::PromotionBlockedReason::CanonicalHeadMoved,
+                },
+                recorded_at: "2026-09-12T00:01:00Z".to_string(),
+                based_on_revision: 7,
+            });
+            let ack = impulse_ops::governed_wiring::GovernedProducerAck::new(
+                blocked.clone(),
+                false,
+                Some("a previous promotion producer was interrupted".to_string()),
+            );
+            let (server, requests_rx) = serve_capability_then_one_request(
+                listener,
+                WorkbenchDaemonResponse::Ok {
+                    result: serde_json::to_value(&ack).expect("serialize ack"),
+                },
+            );
+
+            let client = UnixDaemonOpsClient::new(socket);
+            let acknowledged = client
+                .promote_outcome(impulse_ops::governed_wiring::GovernedPromotionRequest {
+                    request_id: gt::GovernedRequestId::try_new("ui-promote-1").expect("request id"),
+                    project_id: "project".to_string(),
+                    task_id: blocked.id.clone(),
+                    expected_revision: 7,
+                })
+                .expect("a blocked promotion is a successful response");
+            let GovernedPromotionResponse::Recorded(acknowledged) = acknowledged else {
+                panic!("a recorded blocked promotion is not a refusal");
+            };
+            assert_eq!(acknowledged.task, blocked);
+            assert_eq!(
+                acknowledged
+                    .task
+                    .latest_promotion()
+                    .and_then(|promotion| promotion.outcome.blocked_reason()),
+                Some(gt::PromotionBlockedReason::CanonicalHeadMoved)
+            );
+            assert!(!acknowledged.replayed);
+            assert_eq!(
+                acknowledged.pending_rerun_reason.as_deref(),
+                Some("a previous promotion producer was interrupted"),
+                "a reconciled reservation's reason must survive the desktop client -- it exists \
+                 only on this acknowledgement, and the JS bridge forwards it into the banner \
+                 channel (see test_ack_only_facts_reach_the_banner_channel)"
+            );
+
+            match requests_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capability request")
+            {
+                WorkbenchDaemonRequest::PresentOperatorCapability(presentation) => {
+                    assert_eq!(presentation.token, token)
+                }
+                other => panic!("promotion must present the capability first, received {other:?}"),
+            }
+            assert!(matches!(
+                requests_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("promotion request"),
+                WorkbenchDaemonRequest::PromoteGovernedOutcome { .. }
+            ));
+            server.join().unwrap();
+        }
+
+        #[test]
+        fn promotion_refusal_crosses_the_socket_and_runtime_without_a_mutation_event() {
+            use impulse_ops::governed_wiring::{
+                GovernedStagedConfigRefusalAck, StagedConfigRefusalReason,
+            };
+            #[derive(Default)]
+            struct Sink(Mutex<Vec<DesktopEvent>>);
+            impl DesktopEventSink for Sink {
+                fn emit(&self, event: DesktopEvent) {
+                    self.0.lock().unwrap().push(event);
+                }
+            }
+            let expected = staged_accepted_task();
+            for scenario in [
+                "refused",
+                "wrong-project",
+                "wrong-task",
+                "wrong-revision",
+                "recorded-unchanged",
+                "recorded-newer",
+                "bad-flag",
+                "missing-reason",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let socket = dir.path().join("refusal.sock");
+                publish_capability(&socket, &"a".repeat(64));
+                let listener = UnixListener::bind(&socket).unwrap();
+                let refusal = GovernedStagedConfigRefusalAck::new(
+                    expected.clone(),
+                    StagedConfigRefusalReason::UnsupportedSubmodules {
+                        path: "/tmp/project/.gitmodules".to_string(),
+                    },
+                );
+                let mut value = serde_json::to_value(&refusal).unwrap();
+                match scenario {
+                    "wrong-project" => value["project_id"] = serde_json::json!("other-project"),
+                    "wrong-task" => value["id"] = serde_json::json!("other-task"),
+                    "wrong-revision" => {
+                        value["revision"] = serde_json::json!(expected.revision + 1)
+                    }
+                    "bad-flag" => value["refused"] = serde_json::json!("true"),
+                    "missing-reason" => {
+                        value.as_object_mut().unwrap().remove("reason");
+                    }
+                    "recorded-unchanged" | "recorded-newer" => {
+                        let mut task = expected.clone();
+                        if scenario == "recorded-newer" {
+                            task.revision += 1;
+                        }
+                        value = serde_json::to_value(
+                            impulse_ops::governed_wiring::GovernedProducerAck::new(
+                                task, false, None,
+                            ),
+                        )
+                        .unwrap();
+                    }
+                    _ => {}
+                }
+                let (server, _requests) = serve_capability_then_one_request(
+                    listener,
+                    WorkbenchDaemonResponse::Ok { result: value },
+                );
+                let sink = Arc::new(Sink::default());
+                let runtime = crate::runtime::DesktopRuntime::builder()
+                    .with_event_sink(sink.clone())
+                    .with_governed_task_gateway(Arc::new(UnixDaemonOpsClient::new(socket)))
+                    .build();
+                let result = runtime.promote_governed_outcome(
+                    impulse_ops::governed_wiring::GovernedPromotionRequest {
+                        request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                            "promote-refusal",
+                        )
+                        .unwrap(),
+                        project_id: expected.project_id.clone(),
+                        task_id: expected.id.clone(),
+                        expected_revision: expected.revision,
+                    },
+                );
+                match scenario {
+                    "refused" => {
+                        let GovernedPromotionResponse::StagedConfigRefused(actual) =
+                            result.unwrap()
+                        else {
+                            panic!("refusal became a record");
+                        };
+                        assert_eq!(actual, refusal);
+                        let host_wire = serde_json::to_value(
+                            GovernedPromotionResponse::StagedConfigRefused(actual),
+                        )
+                        .unwrap();
+                        assert_eq!(host_wire["refused"], true);
+                        assert_eq!(host_wire["revision"], expected.revision);
+                        assert_eq!(host_wire["remedy"], refusal.remedy);
+                    }
+                    "recorded-newer" => {
+                        assert!(matches!(result, Ok(GovernedPromotionResponse::Recorded(_))))
+                    }
+                    _ => assert!(result.is_err(), "{scenario} must fail closed"),
+                }
+                assert!(
+                    sink.0.lock().unwrap().is_empty(),
+                    "an uncached task or refusal cannot invent a runtime state change"
+                );
+                server.join().unwrap();
+            }
+        }
+
+        /// The discard acknowledgement is what tells the cockpit an accepted
+        /// commit just lost its only ref, so the client must carry that field
+        /// through rather than collapsing the response to a bare task.
+        #[test]
+        fn a_discard_presents_the_capability_and_carries_the_unreferenced_commit() {
+            use impulse_ops::governed_task as gt;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            let socket = dir.path().join("discard.sock");
+            let token = "f".repeat(64);
+            publish_capability(&socket, &token);
+            let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+
+            let mut discarded = staged_accepted_task();
+            discarded.revision = 9;
+            if let Some(staged) = discarded.staged_worktree.as_mut() {
+                staged.status = gt::StagedWorktreeStatus::Discarded;
+            }
+            let ack = impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck {
+                task: discarded.clone(),
+                discarded_root: "/tmp/project/.impulse/worktrees/staged-task".to_string(),
+                unreferenced_accepted_commit: Some("b".repeat(40)),
+            };
+            let (server, requests_rx) = serve_capability_then_one_request(
+                listener,
+                WorkbenchDaemonResponse::Ok {
+                    result: serde_json::to_value(&ack).expect("serialize ack"),
+                },
+            );
+
+            let client = UnixDaemonOpsClient::new(socket);
+            let acknowledged = client
+                .discard_staged_worktree(
+                    impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                        request_id: gt::GovernedRequestId::try_new("ui-discard-1")
+                            .expect("request id"),
+                        project_id: "project".to_string(),
+                        task_id: discarded.id.clone(),
+                        expected_revision: 7,
+                        reason: "the run was rejected and the checkout is finished with"
+                            .to_string(),
+                    },
+                )
+                .expect("discard acknowledgement");
+            assert_eq!(
+                acknowledged.discarded_root,
+                "/tmp/project/.impulse/worktrees/staged-task"
+            );
+            assert_eq!(
+                acknowledged.unreferenced_accepted_commit.as_deref(),
+                Some("b".repeat(40).as_str())
+            );
+
+            match requests_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("capability request")
+            {
+                WorkbenchDaemonRequest::PresentOperatorCapability(presentation) => {
+                    assert_eq!(presentation.token, token)
+                }
+                other => panic!("discard must present the capability first, received {other:?}"),
+            }
+            assert!(matches!(
+                requests_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("discard request"),
+                WorkbenchDaemonRequest::DiscardGovernedStagedWorktree { .. }
+            ));
+            server.join().unwrap();
+        }
+
+        /// A blank reason is the one caller-authored field that can be wrong, and
+        /// a destructive request should not reach a socket to be told so.
+        #[test]
+        fn a_blank_discard_reason_is_refused_before_any_daemon_connection() {
+            use impulse_ops::governed_task as gt;
+
+            let dir = tempfile::tempdir().expect("tempdir");
+            // Deliberately never bound: a request that reaches the transport
+            // fails with a connect error instead of the validation message.
+            let socket = dir.path().join("never-bound.sock");
+            let client = UnixDaemonOpsClient::new(socket);
+            let error = client
+                .discard_staged_worktree(
+                    impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                        request_id: gt::GovernedRequestId::try_new("ui-discard-blank")
+                            .expect("request id"),
+                        project_id: "project".to_string(),
+                        task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+                        expected_revision: 7,
+                        reason: "   ".to_string(),
+                    },
+                )
+                .expect_err("a blank discard reason is refused");
+            assert!(
+                error.contains("invalid governed discard request"),
+                "the refusal must name the request, got: {error}"
+            );
+            assert!(
+                !error.contains("connect to daemon"),
+                "validation must happen before the transport, got: {error}"
+            );
+        }
+
+        /// The two staged endpoints are operator-class in the daemon before any
+        /// state read, so the client has to present on both.
+        #[test]
+        fn both_staged_worktree_endpoints_require_the_operator_capability() {
+            use impulse_ops::governed_task as gt;
+
+            let promote = WorkbenchDaemonRequest::PromoteGovernedOutcome {
+                request: impulse_ops::governed_wiring::GovernedPromotionRequest {
+                    request_id: gt::GovernedRequestId::try_new("promote").expect("request id"),
+                    project_id: "project".to_string(),
+                    task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+                    expected_revision: 1,
+                },
+            };
+            let discard = WorkbenchDaemonRequest::DiscardGovernedStagedWorktree {
+                request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                    request_id: gt::GovernedRequestId::try_new("discard").expect("request id"),
+                    project_id: "project".to_string(),
+                    task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+                    expected_revision: 1,
+                    reason: "finished with".to_string(),
+                },
+            };
+            assert!(UnixDaemonOpsClient::requires_operator_class(&promote));
+            assert!(UnixDaemonOpsClient::requires_operator_class(&discard));
+            assert!(
+                !UnixDaemonOpsClient::requires_operator_class(
+                    &WorkbenchDaemonRequest::GetGovernedTask {
+                        project_id: "project".to_string(),
+                        task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),
+                    }
+                ),
+                "a read must not pay for a handshake"
+            );
+        }
+
+        /// Every protocol-v9 acknowledgement shape, parsed the way the client
+        /// parses it. `GovernedProducerAck` flattens the task, so a field
+        /// rename or a lost `#[serde(flatten)]` shows up here rather than as a
+        /// silent parse failure against a live daemon.
+        #[test]
+        fn the_desktop_parses_every_protocol_v9_acknowledgement() {
+            use impulse_ops::governed_task as gt;
+            use impulse_ops::governed_wiring::{
+                GovernedProducerAck, GovernedStagedWorktreeDiscardAck,
+            };
+
+            let task = staged_accepted_task();
+            let mut promoted = task.clone();
+            promoted.promotions.push(gt::GovernedPromotion {
+                id: gt::GovernedRecordId::try_new("promotion-ok").expect("promotion id"),
+                actor: gt::GovernedActor {
+                    kind: gt::GovernedActorKind::Operator,
+                    id: "local-operator-ui".to_string(),
+                },
+                accepted_revision: "b".repeat(40),
+                initial_subject_revision: "a".repeat(40),
+                outcome: gt::GovernedPromotionOutcome::Promoted {
+                    promoted_revision: "b".repeat(40),
+                },
+                recorded_at: "2026-09-12T00:01:00Z".to_string(),
+                based_on_revision: 7,
+            });
+
+            for ack in [
+                GovernedProducerAck::new(task.clone(), false, None),
+                GovernedProducerAck::new(promoted, true, Some("needs rerun".to_string())),
+            ] {
+                let value = serde_json::to_value(&ack).expect("serialize producer ack");
+                assert_eq!(
+                    value.get("id").and_then(serde_json::Value::as_str),
+                    Some("staged-task"),
+                    "the task must stay flattened so an older client still reads one"
+                );
+                let recovered: GovernedProducerAck =
+                    serde_json::from_value(value).expect("parse producer ack");
+                assert_eq!(recovered, ack);
+            }
+
+            for discard in [
+                GovernedStagedWorktreeDiscardAck {
+                    task: task.clone(),
+                    discarded_root: "/tmp/project/.impulse/worktrees/staged-task".to_string(),
+                    unreferenced_accepted_commit: None,
+                },
+                GovernedStagedWorktreeDiscardAck {
+                    task: task.clone(),
+                    discarded_root: "/tmp/project/.impulse/worktrees/staged-task".to_string(),
+                    unreferenced_accepted_commit: Some("b".repeat(40)),
+                },
+            ] {
+                let value = serde_json::to_value(&discard).expect("serialize discard ack");
+                let recovered: GovernedStagedWorktreeDiscardAck =
+                    serde_json::from_value(value).expect("parse discard ack");
+                assert_eq!(recovered, discard);
+            }
+
+            // An acknowledgement written by a daemon that predates the
+            // `replayed`/`pending_rerun_reason` fields still parses.
+            let bare = serde_json::to_value(&task).expect("serialize bare task");
+            let recovered: GovernedProducerAck =
+                serde_json::from_value(bare).expect("parse a bare governed task as an ack");
+            assert_eq!(recovered.task, task);
+            assert!(!recovered.replayed);
+            assert_eq!(recovered.pending_rerun_reason, None);
         }
 
         fn write_response(

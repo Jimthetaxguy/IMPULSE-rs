@@ -37,7 +37,7 @@ authors:
 | **Now** | Rust memory core + hooks + retrieval/injection + Dioxus desktop host | Active |
 | **Next** | Dioxus Desktop launch scaffold + live terminal bridge parity | [x] Complete (scaffold + bridge parity via smoke + real dispatch_host_invoke/LiveHostContext + Mcp execute unit tests + registry centralization; autoresearch cleanup; capture evidence + full verif gate; pushed) |
 | **Later** | Daemon parity in desktop shell + agent control + artifact polish | Planned |
-| **Cleanup** | Full egui decommission (remove frozen `impulse-gui` + `impulse-term` egui layer) | Planned — gated on Dioxus host operationally authoritative; see [`plans/EGUI-DECOMMISSION.md`](./plans/EGUI-DECOMMISSION.md) |
+| **Cleanup** | Retire nonfunctional UI: EGUI/eframe, unwired affordances, then temporary Tauri compatibility | Planned — EGUI starts after release truth; retained controls must be wired or removed; Tauri waits for packaged Dioxus acceptance; see [`plans/EGUI-DECOMMISSION.md`](./plans/EGUI-DECOMMISSION.md) |
 
 This document is intentionally aligned with [`spec/RUST-CANONICAL-CONTRACT.md`](./spec/RUST-CANONICAL-CONTRACT.md). If another active doc conflicts, the contract wins.
 
