@@ -182,6 +182,7 @@ mod tests {
     /// `static ENV_LOCK`s do NOT serialize across files in the same test
     /// binary, which silently reintroduced the exact race this lock exists
     /// to prevent.
+    use crate::test_support::init_git_repo;
     use crate::test_support::ion_gate_launcher_env_lock as env_lock;
     use crate::test_git_repo::init_git_repo_with_empty_commit;
 

@@ -22,6 +22,15 @@ pub enum SlashCommand {
     /// `/tools` -- list the tools registered in the REPL's `ReplToolRegistry`
     /// (TUI_SPEC.md T7).
     Tools,
+    /// `/allow <path>` -- grant an additional read root for the rest of this
+    /// session (Stage 1 tool sandbox: write roots are fixed to `repo_root`,
+    /// but a read root can be extended one path at a time). Carries raw
+    /// argument tokens, same shape as `Verify`; an empty argument list is a
+    /// usage error rendered by the handler, not the router.
+    Allow(Vec<String>),
+    /// `/loop` -- print the full `LoopReport` from the most recent chat turn
+    /// (Stage 1 loop evidence in the REPL, ADR-0017).
+    Loop,
 }
 
 /// The result of routing one line of input.
@@ -41,7 +50,9 @@ pub enum RouterOutcome {
 
 /// Slash commands recognized by [`route`], used to render `/help` and the
 /// unknown-command message so the two never drift out of sync.
-pub const KNOWN_COMMANDS: &[&str] = &["/help", "/quit", "/clear", "/verify", "/tools"];
+pub const KNOWN_COMMANDS: &[&str] = &[
+    "/help", "/quit", "/clear", "/verify", "/tools", "/allow", "/loop",
+];
 
 /// Route one line of raw input. Never reads stdin itself — the caller owns
 /// the readline loop.
@@ -65,6 +76,8 @@ pub fn route(line: &str) -> RouterOutcome {
             "clear" => RouterOutcome::Command(SlashCommand::Clear),
             "verify" => RouterOutcome::Command(SlashCommand::Verify(args)),
             "tools" => RouterOutcome::Command(SlashCommand::Tools),
+            "allow" => RouterOutcome::Command(SlashCommand::Allow(args)),
+            "loop" => RouterOutcome::Command(SlashCommand::Loop),
             other => RouterOutcome::UnknownCommand(other.to_string()),
         };
     }
@@ -224,12 +237,33 @@ mod tests {
     fn test_known_commands_lists_all_slash_commands() {
         assert_eq!(
             KNOWN_COMMANDS,
-            &["/help", "/quit", "/clear", "/verify", "/tools"]
+            &["/help", "/quit", "/clear", "/verify", "/tools", "/allow", "/loop"]
         );
     }
 
     #[test]
     fn test_route_tools_returns_tools_command() {
         assert_eq!(route("/tools"), RouterOutcome::Command(SlashCommand::Tools));
+    }
+
+    #[test]
+    fn test_route_allow_with_no_args_returns_empty_args() {
+        assert_eq!(
+            route("/allow"),
+            RouterOutcome::Command(SlashCommand::Allow(Vec::new()))
+        );
+    }
+
+    #[test]
+    fn test_route_allow_splits_the_path_argument() {
+        assert_eq!(
+            route("/allow /tmp/some-dir"),
+            RouterOutcome::Command(SlashCommand::Allow(vec!["/tmp/some-dir".to_string()]))
+        );
+    }
+
+    #[test]
+    fn test_route_loop_returns_loop_command() {
+        assert_eq!(route("/loop"), RouterOutcome::Command(SlashCommand::Loop));
     }
 }

@@ -2,14 +2,14 @@
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
 version: '1.7'
-updated: 2026-08-17
+updated: 2026-09-26
 type: doc
 category: navigation
 phase: all
 status: active
 audience: everyone
 tags: [index, navigation, discovery]
-last_updated: 2026-08-17
+last_updated: 2026-09-26
 authors:
   - name: Impulse Maintainers
     role: Maintainer
@@ -24,7 +24,7 @@ authors:
 > current implementation contract [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md).
 >
 > **Canonical stack: Rust (impulse-rs)**
-> **Roadmap contract:** Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=explicit memory promotion/dismissal + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
+> **Roadmap contract:** Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 > **Current governed slice:** profiled Builder preflight, exact criteria, daemon-attested clean Git
 > subjects, daemon-derived claim/verification, strict API Supervisor review, operator acceptance,
 > and deterministic pending candidates that do not mutate `GENOME`/`HISTORY`.
@@ -97,7 +97,12 @@ in `VISION.md` are resolved.
 | [0012](decisions/0012-daemon-owned-governed-runtime-producers.md) | Daemon-owned governed runtime producers | Accepted | Profiled clean-Git claims, detached Rust verification, and strict API Supervisor review |
 | [0013](decisions/0013-deterministic-accepted-run-memory-candidates.md) | Deterministic accepted-run memory candidates | Accepted | Owner-only pending review projection, provenance/source assurance, and no `GENOME`/`HISTORY` mutation |
 | [0014](decisions/0014-work-item-and-comparative-settlement.md) | WorkItem identity and comparative settlement | Proposed | Proposed planning identity, fan-out effect bound, and four-part settlement record |
-| [0015](decisions/0015-harness-owned-step-model.md) | Harness-owned step model choice | Proposed | Harness-owned per-step model hook; gateway must not pick the model |
+| [0015](decisions/0015-harness-owned-step-model.md) | Harness-owned step model choice | Accepted | Pure Impulse-owned per-step policy; hosts retain inference, provider, and evidence authority |
+| [0017](decisions/0017-canonical-loop-contract.md) | Canonical loop contract | Proposed | Typed loop budgets, breaker-evaluated stop conditions, and termination evidence for Ion tool loops |
+| [0018](decisions/0018-socket-actor-provenance.md) | Socket actor provenance | Proposed | Connection classes from peer credentials plus a per-run operator capability; only an operator surface can mint `accepted` |
+| [0019](decisions/0019-builder-staged-worktree-world-scope.md) | Builder staged-worktree world scope | Proposed | Declared world scope, a disposable staged Builder worktree, fast-forward-only promotion after acceptance, and the governed Builder loop binding |
+| [0020](decisions/0020-scoped-memory-promotion-and-dismissal.md) | Scoped memory promotion and dismissal | Proposed | Operator-class promote/dismiss, an append-only hash-chained memory log, a separate regenerated GENOME projection, and promoted-only retrieval indexing |
+| [0021](decisions/0021-monty-sandbox-for-calculator-and-python-exec.md) | Monty sandbox for calculator and python_exec | Proposed | In-process Monty interpreter replaces `python3 -c` for the Python tool surfaces; no filesystem, network, or process access; typed fault classes; crash isolation via `monty-pool` deferred |
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 

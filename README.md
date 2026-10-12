@@ -21,6 +21,9 @@ proprietary runtime internals. Memory is a governed platform service, not the wh
 > capability-checked tools, governed-task producers (`rust_workspace_v1`), accepted-run memory
 > candidates (review queue — not auto-written to `GENOME.md`), and Ion's native REPL/tool loop.
 > Worker claim, verifier evidence, supervisor judgment, and operator approval stay separate.
+> candidates (review queue — not auto-written to `GENOME.md`), Ion's native REPL/tool loop under
+> the ADR-0017 loop contract, and Ion's read-only `document_read` tool for spreadsheets and Word
+> files. Worker claim, verifier evidence, supervisor judgment, and operator approval stay separate.
 >
 > **Still forming:** generalized role contracts, adapter capability negotiation, explicit memory
 > promotion/dismissal, and stronger structural enforcement across runtimes. See
@@ -94,6 +97,20 @@ adds a blanket `.impulse/` rule.
 Durable project inputs such as `.impulse/GENOME.md`, `.impulse/config.json`, and
 `.impulse/impulse-capabilities.json` therefore remain available to commit unless an existing
 operator-owned blanket rule already hides them. Init preserves but warns about that broader rule.
+
+### Release artifacts
+
+Tagged releases contain the `impulse-rs` CLI for macOS (Intel and Apple silicon) and Linux
+(x86_64 and ARM64), with `SHA256SUMS.txt`. The release workflow builds each CLI, smoke-tests
+the renamed executable’s root, daemon, and MCP serve help parsers on its native architecture,
+then verifies the complete four-artifact checksum set. Relevant pull requests run the same build/package checks with read-only permissions;
+GitHub Release publication runs only for pushed `v*` tags.
+
+Desktop `.app` bundles and DMGs are unavailable until the Dioxus packaging and real launch gates
+in [EGUI decommission, Track A / R1](docs/plans/EGUI-DECOMMISSION.md#r1--make-release-state-truthful)
+are satisfied. The old `scripts/build-macos-app.sh` entry point exits with an explanation before
+building or changing artifacts. This CLI-only release path does not satisfy Dioxus operational
+acceptance or unblock Tauri-adapter retirement.
 
 ### Governed Builder workflow
 
@@ -228,6 +245,7 @@ See `cargo run -- --help` for the full command list.
 ```
 impulse-rs/          # Rust implementation (canonical)
   impulse-ops/       # Shared control-plane protocol, workbench, policy, artifact models
+  impulse-step-model/ # Pure provider-neutral per-step model policy (no app graph)
   impulse-term/      # PTY lifecycle, parser, write queue, terminal context
   impulse-desktop/   # Dioxus cockpit, host bridge, workspace/runtime/MCP adapters
   impulse-ion/       # Ion harness contract + adapter crate
