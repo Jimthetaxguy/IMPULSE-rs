@@ -186,12 +186,6 @@ mod tests {
     use crate::test_support::ion_gate_launcher_env_lock as env_lock;
     use crate::test_git_repo::init_git_repo_with_empty_commit;
 
-    /// Creates a throwaway git repo with one empty commit, so `diff_ref`
-    /// values like `HEAD` resolve via `git rev-parse`.
-    fn init_git_repo() -> tempfile::TempDir {
-        init_git_repo_with_empty_commit()
-    }
-
     /// T3 item 4: proves `run_ion_verify` returns a `HarnessResponse` without
     /// going through the CLI print/exit path, by driving `PiAdapter` against
     /// the stub gate script under `tests/fakes/` (via the `ION_GATE_LAUNCHER`

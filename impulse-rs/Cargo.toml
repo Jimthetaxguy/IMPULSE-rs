@@ -13,7 +13,6 @@ exclude = ["impulse-gui"]
 name = "impulse-rs"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
 rust-version = "1.96" # floor set by monty 1.0 (ADR-0021)
 description = "Terminal-native local control plane and harness manager for AI coding agents"
 authors = ["Impulse Maintainers"]
@@ -154,14 +153,6 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 # Pinned while the MSRV was 1.82 (security-framework 3.7 requires Rust 1.85). The
 # floor is now 1.96 for the Monty sandbox (ADR-0021), so this pin can be revisited.
-security-framework = "=3.6.0"
-security-framework-sys = "=2.17.0"
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# Keep Impulse's Rust 1.82 MSRV: security-framework 3.7 requires Rust 1.85.
 security-framework = "=3.6.0"
 security-framework-sys = "=2.17.0"
 

@@ -120,16 +120,6 @@ impl<T> GovernedProducerOutcome<T> {
     }
 }
 
-fn daemon_busy_error(
-    resource: impulse_ops::DaemonBusyResource,
-    retry_after_ms: u64,
-) -> anyhow::Error {
-    let resource = match resource {
-        impulse_ops::DaemonBusyResource::AgentTurn => "agent turn",
-    };
-    anyhow!("Daemon {resource} is busy; retry after at least {retry_after_ms}ms")
-}
-
 pub struct DaemonClient {
     socket_path: PathBuf,
 }

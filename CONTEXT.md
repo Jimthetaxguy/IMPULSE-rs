@@ -3,7 +3,6 @@
 > **Read this first.** Shared L0/L1 vocabulary for Impulse. Update a term here when its stable
 > meaning changes; put detailed history in plans/ADRs rather than growing this glossary.
 >
-> Entries are tagged **`[code]`** (live in the verified local implementation) or
 > Entries are tagged **`[code]`** (live in the current repository implementation) or
 > **`[vocabulary]`** (the product contract; "Closest in code" names today's partial carrier).
 >
@@ -16,17 +15,6 @@
 ## What Impulse is
 
 Impulse is a **terminal-native local control plane and harness manager for AI software-engineering
-agents**. It launches and manages heterogeneous coding runtimes, supervises their operating
-conditions, and supplies shared platform services: memory, tools, telemetry, messaging/handoffs,
-policy, credentials, artifacts, and verification.
-
-Claude Code, Codex, and similar CLIs retain their internal coding loops. Ion is the Impulse-native
-coding runtime. Dioxus is the cockpit that renders and controls the system; backend daemon/runtime
-contracts remain authoritative. Memory is essential, but it is one control-plane service rather
-than the complete product.
-
-Workspace: `impulse-rs/` (Cargo workspace). Main crates: `impulse-rs`, `impulse-ops`,
-`impulse-term`, `impulse-desktop`, and `impulse-ion`; `impulse-gui` is legacy/frozen.
 agents**. It launches and scopes heterogeneous runtimes, supervises their work, and holds completion
 to observed evidence and human approval. Shared services include tools, telemetry, handoffs,
 policy, credentials, artifacts, verification, and memory. Claude Code, Codex, and similar CLIs
@@ -48,15 +36,6 @@ fallback does not unblock Tauri-adapter retirement.
 
 ### role — `[vocabulary]`
 The stable behavioral contract assigned to an agent: obligations, permissions, tools, context,
-communication rules, and completion evidence. A role is independent of model, runtime, process,
-session, and pane.
-- **Closest in code:** narrow `AgentRole::{Coordinator, Worker}` plus the concrete
-  `SupervisorPermissionPolicy` in `impulse-ops/src/lib.rs`.
-- **Boundary:** a generalized typed role contract is direction for a later ADR, not live today.
-- **Closest in code:** the narrow launch-time `AgentRoleId`/`AgentRoleAssignment` contract plus the
-  concrete `SupervisorPermissionPolicy`. `AgentRole::{Coordinator, Worker}` remains legacy pane and
-  delegation topology, not product-role identity.
-- **Boundary:** generalized role composition and a durable governed-run lifecycle are not live.
 communication, and evidence; independent of model, runtime, process, session, and pane.
 - **Closest in code:** the narrow launch-time `AgentRoleId`/`AgentRoleAssignment` contract plus the
   concrete `SupervisorPermissionPolicy`. `AgentRole::{Coordinator, Worker}` remains legacy pane and
@@ -72,16 +51,6 @@ Claude Code or Codex); Ion is a native direct-provider/tool-loop runtime.
 - **Boundary:** there is not yet one common runtime-adapter trait or capability-negotiation protocol.
 
 ### agent platform id — `[code]`
-An open, validated string identity (`AgentPlatformId`) whose metadata and launch command are owned
-by `AgentRegistry`. The live implementation carries the registry through desktop runtime, host, MCP,
-browser bridge, reducer, dynamic workspace launcher, and serialized snapshots. It adds Ion as a
-builtin launchable platform, derives capability manifests from the registry, resolves the real
-sibling Ion binary without an override, and fails closed on unknown/blank ids. Runtime output
-canonicalizes aliases and case; the declared platform remains distinct from the observed command,
-so explicit wrapper/alternate-installation overrides stay supported and visible. Legacy closed
-enums remain where wire/disk compatibility still requires them.
-- **Source of truth:** `impulse-ops/src/agent_registry.rs`.
-
 An open, validated string identity (`AgentPlatformId`) owned by `AgentRegistry` across desktop,
 host, MCP, browser, reducer, launcher, and snapshot paths. The registry adds Ion, derives capability
 manifests, resolves its sibling binary, and fails closed on unknown/blank IDs. Declared platform and
@@ -104,26 +73,6 @@ It is not interchangeable with its session or pane.
 - **Closest in code:** `AgentRuntime`, `AgentRuntimeSnapshot`, and desktop runtime records.
 
 ### session — `[code]`
-A bounded, persisted unit of work with a start, tracked activity, and recorded end. The API can
-optionally gate that end on verification. A session may
-be linked to a running agent instance but does not own that process.
-- **Source of truth:** `WorkbenchDaemonRequest::{CreateSession, EndSession}` and CLI
-  `session-start` / `session-end --verify`.
-
-### task — `[vocabulary]`
-An assignment plus acceptance and verification criteria. A task may span sessions; a session may
-perform more than one task.
-- **Closest in code:** delegation records, `AgentRuntime.current_task`, and Ion `Task` contracts.
-
-### pane — `[code]`
-A UI/terminal viewport attached to an agent channel. It is a presentation and input-routing object,
-not an authorization or identity boundary.
-- **Source of truth:** `src/ui/pane_manager.rs`, `src/ui/terminal_pane.rs`, and desktop runtime ids.
-
-### project — `[vocabulary]`
-A logical codebase/governance boundary for memory, artifacts, policy, and verification. Today it is
-usually represented by one registered workspace root and one daemon-owned `ProjectOpsSnapshot`.
-
 A bounded, persisted unit of work with a start, tracked activity, and recorded end. Verification
 may gate that end. A session may link to an agent instance but does not own its process.
 - **Source of truth:** `WorkbenchDaemonRequest::{CreateSession, EndSession}` and CLI
@@ -220,7 +169,6 @@ Structural filesystem enforcement depends on the selected runtime or sandbox.
 
 ### daemon / workbench truth — `[code]`
 The long-running coordination point that owns project workbench snapshots, session operations,
-supervisor actions, artifacts, and telemetry overlays over a versioned JSON-line Unix socket.
 supervisor actions, artifacts, governed tasks, and telemetry overlays over a versioned JSON-line
 Unix socket.
 - **Source of truth:** `impulse-ops/src/lib.rs` and `src/daemon/{mod,protocol,handlers}.rs`.
@@ -251,17 +199,6 @@ One exclusive, bounded use of the cached `ImpulseAgent`. Concurrent turns fail f
 the cached agent or losing history.
 - **Source of truth:** `try_lock_agent_for_turn` and agent request handlers in
   `src/daemon/handlers.rs`; provider timeouts bound the turn.
-
-### agent registry — `[code]`
-The catalog of platform identity and launch metadata. It answers what can be named, detected, and
-launched; daemon/runtime telemetry separately answers what is currently running.
-- **Invariant:** ids and aliases have one owner, identity-collision registration fails
-  transactionally, and explicit command overrides remain observable.
-
-### terminal runtime — `[code]`
-The PTY/process lifecycle boundary for spawn, input, resize, focus, exit, and cleanup. Terminal
-mechanics publish state; they do not own durable project truth.
-- **Source of truth:** `impulse-term/src/backend.rs` and `impulse-desktop/src/runtime.rs`.
 
 ### step-model policy — `[code]`
 The pure, provider-neutral runtime-control policy that selects a final model from a host-resolved
@@ -598,9 +535,6 @@ policy, not a generalized role system.
 - **Source of truth:** `SupervisorPermissionPolicy`/`SupervisorPermissionState` in
   `impulse-ops/src/lib.rs` and enforcement in `src/daemon/handlers.rs`.
 
-### memory / genome — `[code]`
-Scoped durable continuity: session history plus verified decisions/preferences, retrieval indexes,
-and review-first context injection. Memory records must carry project/session provenance.
 ### governed producer profile — `[code]`
 `rust_workspace_v1` combines env-routed/typed claim intent, fixed detached Rust verification, and
 criteria-bound, history/tool-free API Supervisor review. It runs host-trusted code, not a sandbox;
@@ -630,27 +564,6 @@ actions. Artifacts keep worker claims separate from evidence and operator decisi
 - **Source of truth:** `ArtifactEnvelope` and artifact IPC in `impulse-ops/src/lib.rs`.
 
 ### verification gate — `[code]`
-Evidence that claimed work holds before a session/task is accepted: commands run, tests/build/lint,
-artifact review, and explicit approval where policy requires it.
-- **Source of truth:** `session-end --verify`, `src/verify/`, and Ion harness verdict contracts.
-
----
-
-## Live-versus-direction boundary (2026-07-12)
-## Live-versus-direction boundary (2026-07-13)
-
-- **Live foundation:** PTY lifecycle, daemon workbench truth, managed agent turns, open
-  registry-backed desktop platform identity, real Ion desktop launch, daemon-truth terminal
-  telemetry, supervisor-specific permissions, capability-checked tools, memory/retrieval/injection,
-  artifacts, credentials, and Ion's native coding REPL/tool loop.
-- **Direction:** generalized role contracts, one runtime-adapter interface, explicit capability
-  negotiation/enforcement strength, and typed cross-agent messaging. These require an ADR and
-  vertical slice; names and schemas are intentionally not frozen here.
-  artifacts, credentials, Ion's native coding REPL/tool loop, and explicit role/task launch
-  preflight with typed compatibility telemetry.
-- **Direction:** daemon-owned task evidence, verification and supervisor decisions; generalized
-  role composition; one runtime-adapter interface; negotiated runtime capabilities; and typed
-  cross-agent messaging.
 Evidence that claimed work holds before a session/task is accepted. Governed profiled verification
 is daemon-observed against the claimed commit in a symlink-free detached source tree with a
 committed regular root `Cargo.lock`. It persists fixed argv plus digests, never raw output;

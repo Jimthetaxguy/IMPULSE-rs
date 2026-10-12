@@ -4,12 +4,6 @@ use std::time::{Duration, Instant};
 
 use impulse_desktop::{
     AgentPlatformId, AgentSpawnRequest, AgentWriteRequest, DesktopEvent, DesktopEventSink,
-    DesktopRuntime, LocalSupervisorAction, SupervisorLocalActionRequest, TerminalCloseRequest,
-    TerminalFocusRequest, TerminalResizeRequest, WeakDesktopRuntime, WorkspaceTarget,
-};
-use impulse_ops::role_assignment::{
-    AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleCapabilityRequirement,
-    RuntimeCapabilityId,
     DesktopRuntime, GovernedRoutingMetadata, GovernedTaskGateway, LocalSupervisorAction,
     SupervisorLocalActionRequest, TerminalCloseRequest, TerminalFocusRequest,
     TerminalResizeRequest, WeakDesktopRuntime, WorkspaceTarget,
@@ -162,14 +156,6 @@ fn shell_spawn(agent_id: &str, script: &str) -> AgentSpawnRequest {
 }
 
 fn governed_builder_assignment() -> AgentRoleAssignment {
-    AgentRoleAssignment {
-        role: AgentRoleId::try_new("builder").expect("valid Builder role id"),
-        requirements: vec![RoleCapabilityRequirement {
-            capability: RuntimeCapabilityId::try_new("workspace.target")
-                .expect("valid workspace capability id"),
-            minimum_enforcement: EnforcementStrength::Mediated,
-            mandatory: true,
-        }],
     canonical_governed_builder_assignment()
 }
 
@@ -587,133 +573,6 @@ fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_direc
     let temp = tempfile::tempdir().expect("temporary workspace parent");
     let workspace = temp.path().join("workspace");
     std::fs::create_dir(&workspace).expect("create governed workspace");
-    let alias = temp.path().join("workspace-alias");
-    symlink(&workspace, &alias).expect("create workspace symlink");
-    let canonical = workspace.canonicalize().expect("canonical workspace");
-    let canonical_text = canonical.display().to_string();
-
-    let sink = Arc::new(RecordingSink::default());
-    let runtime = DesktopRuntime::builder()
-        .with_event_sink(sink.clone())
-        .build();
-    let mut request = shell_spawn(
-        "canonical-workspace-agent",
-        "printf '%s|%s' \"$PWD\" \"$IMPULSE_WORKSPACE_ROOT\"",
-    );
-    request.cwd = Some(alias.display().to_string());
-    request.workspace = Some(WorkspaceTarget {
-        root: workspace.display().to_string(),
-        label: Some("governed workspace".to_string()),
-        purpose: None,
-        project_notes: None,
-    });
-    request.task = Some("prove canonical workspace binding".to_string());
-    request.role_assignment = Some(governed_builder_assignment());
-
-    let snapshot = runtime
-        .spawn_agent(request)
-        .expect("symlink-equivalent paths must bind to one canonical workspace");
-    assert_eq!(snapshot.cwd.as_deref(), Some(canonical_text.as_str()));
-    assert_eq!(
-        snapshot
-            .workspace
-            .as_ref()
-            .map(|target| target.root.as_str()),
-        Some(canonical_text.as_str())
-    );
-    let telemetry = impulse_desktop::daemon_ops::agent_runtime_from_snapshot(&snapshot);
-    assert_eq!(telemetry.working_directory, canonical_text);
-
-    let expected_output = format!("{canonical_text}|{canonical_text}");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        let output = String::from_utf8_lossy(&terminal_output(&sink, "canonical-workspace-agent"))
-            .to_string();
-        if output.contains(&expected_output) {
-            runtime
-                .close_agent(TerminalCloseRequest {
-                    session_id: snapshot.agent_id,
-                })
-                .ok();
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-
-    panic!(
-        "expected PTY cwd and trusted workspace env to use `{canonical_text}`, got `{}`",
-        String::from_utf8_lossy(&terminal_output(&sink, "canonical-workspace-agent"))
-    );
-}
-
-#[test]
-fn test_ungoverned_cross_workspace_spawn_does_not_receive_daemon_control_routing() {
-    const HELPER_ENV: &str = "IMPULSE_ROUTING_ISOLATION_TEST_HELPER";
-    if std::env::var_os(HELPER_ENV).is_none() {
-        let output = std::process::Command::new(
-            std::env::current_exe().expect("locate desktop runtime test binary"),
-        )
-        .args([
-            "--exact",
-            "test_ungoverned_cross_workspace_spawn_does_not_receive_daemon_control_routing",
-            "--nocapture",
-        ])
-        .env(HELPER_ENV, "1")
-        .env("IMPULSE_SOCKET_PATH", "/tmp/parent-leak.sock")
-        .env("IMPULSE_CONTROL_CLI", "/bin/echo")
-        .output()
-        .expect("run routing-isolation subprocess");
-        assert!(
-            output.status.success(),
-            "poisoned-parent routing isolation failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-
-    let workspace = tempfile::tempdir().expect("temporary ungoverned workspace");
-    let sink = Arc::new(RecordingSink::default());
-    let gateway: Arc<dyn GovernedTaskGateway> = Arc::new(TestGovernedGateway::default());
-    let runtime = DesktopRuntime::builder()
-        .with_event_sink(sink.clone())
-        .with_governed_task_gateway(gateway)
-        .build();
-    let mut request = shell_spawn(
-        "ungoverned-cross-workspace",
-        "printf '%s|%s' \"${IMPULSE_SOCKET_PATH-unset}\" \"${IMPULSE_CONTROL_CLI-unset}\"; sleep 0.1",
-    );
-    request.cwd = Some(workspace.path().display().to_string());
-    request.workspace = Some(WorkspaceTarget::from_root(
-        workspace.path().display().to_string(),
-    ));
-
-    runtime
-        .spawn_agent(request)
-        .expect("ordinary cross-workspace agent should launch");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let output = String::from_utf8_lossy(&terminal_output(&sink, "ungoverned-cross-workspace"))
-            .to_string();
-        if output.contains("unset|unset") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "ordinary agent output did not prove routing isolation: {output:?}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-#[cfg(unix)]
-#[test]
-fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_directory() {
-    use std::os::unix::fs::symlink;
-
-    let temp = tempfile::tempdir().expect("temporary workspace parent");
-    let workspace = temp.path().join("workspace");
-    std::fs::create_dir(&workspace).expect("create governed workspace");
     let git = |args: &[&str]| {
         let status = std::process::Command::new("git")
             .arg("-C")
@@ -797,6 +656,67 @@ fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_direc
         String::from_utf8_lossy(&terminal_output(&sink, "canonical-workspace-agent"))
     );
 }
+
+#[test]
+fn test_ungoverned_cross_workspace_spawn_does_not_receive_daemon_control_routing() {
+    const HELPER_ENV: &str = "IMPULSE_ROUTING_ISOLATION_TEST_HELPER";
+    if std::env::var_os(HELPER_ENV).is_none() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("locate desktop runtime test binary"),
+        )
+        .args([
+            "--exact",
+            "test_ungoverned_cross_workspace_spawn_does_not_receive_daemon_control_routing",
+            "--nocapture",
+        ])
+        .env(HELPER_ENV, "1")
+        .env("IMPULSE_SOCKET_PATH", "/tmp/parent-leak.sock")
+        .env("IMPULSE_CONTROL_CLI", "/bin/echo")
+        .output()
+        .expect("run routing-isolation subprocess");
+        assert!(
+            output.status.success(),
+            "poisoned-parent routing isolation failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let workspace = tempfile::tempdir().expect("temporary ungoverned workspace");
+    let sink = Arc::new(RecordingSink::default());
+    let gateway: Arc<dyn GovernedTaskGateway> = Arc::new(TestGovernedGateway::default());
+    let runtime = DesktopRuntime::builder()
+        .with_event_sink(sink.clone())
+        .with_governed_task_gateway(gateway)
+        .build();
+    let mut request = shell_spawn(
+        "ungoverned-cross-workspace",
+        "printf '%s|%s' \"${IMPULSE_SOCKET_PATH-unset}\" \"${IMPULSE_CONTROL_CLI-unset}\"; sleep 0.1",
+    );
+    request.cwd = Some(workspace.path().display().to_string());
+    request.workspace = Some(WorkspaceTarget::from_root(
+        workspace.path().display().to_string(),
+    ));
+
+    runtime
+        .spawn_agent(request)
+        .expect("ordinary cross-workspace agent should launch");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let output = String::from_utf8_lossy(&terminal_output(&sink, "ungoverned-cross-workspace"))
+            .to_string();
+        if output.contains("unset|unset") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ordinary agent output did not prove routing isolation: {output:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 
 #[test]
 fn test_terminal_harness_spawn_request_binds_workspace_and_default_tools() {

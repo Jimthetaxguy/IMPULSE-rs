@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use impulse_ops::{AgentRuntime, ContextHealthSummary, MachineTarget, TerminalOpsReport};
 
-use crate::runtime::{AgentRuntimeSnapshot, DesktopEvent, DesktopEventSink};
 use crate::runtime::{
     AgentRuntimeSnapshot, DesktopEvent, DesktopEventSink, GovernedPromotionResponse,
     GovernedRoutingMetadata, GovernedTaskGateway,
@@ -365,9 +364,6 @@ pub enum DesktopDaemonOpsStartError {
     WorkerStart(#[source] std::io::Error),
 }
 
-#[cfg(unix)]
-mod unix {
-    use std::io::{BufRead, BufReader, Write};
 /// Both halves of the desktop/daemon boundary: asynchronous lifecycle
 /// telemetry and acknowledged governed-task commands.
 pub struct DesktopDaemonOpsAttachment {
@@ -562,11 +558,6 @@ mod unix {
     trait DaemonOpsTransport: Send {
         fn publish(&mut self, report: &TerminalOpsReport) -> Result<(), String>;
         fn subscribe(&mut self, since_seq: Option<u64>) -> Result<OpsSubscription, String>;
-    }
-
-    #[derive(Debug)]
-    struct UnixDaemonOpsClient {
-        socket_path: PathBuf,
         fn drain_governed_lifecycle_outbox(&mut self) -> Result<(), String> {
             Ok(())
         }
@@ -583,12 +574,6 @@ mod unix {
 
     impl UnixDaemonOpsClient {
         fn new(socket_path: PathBuf) -> Self {
-            Self { socket_path }
-        }
-
-        fn send(
-            &self,
-            request: &WorkbenchDaemonRequest,
             Self {
                 socket_path,
                 lifecycle_outbox_path: None,
@@ -626,12 +611,6 @@ mod unix {
                 )
             })?;
             stream
-                .set_read_timeout(Some(IO_TIMEOUT))
-                .map_err(|error| format!("set daemon read timeout: {error}"))?;
-            stream
-                .set_write_timeout(Some(IO_TIMEOUT))
-                .map_err(|error| format!("set daemon write timeout: {error}"))?;
-
                 .set_read_timeout(Some(read_timeout))
                 .map_err(|error| format!("set daemon read timeout: {error}"))?;
             stream
@@ -668,14 +647,12 @@ mod unix {
                 .map_err(|error| format!("write daemon request: {error}"))?;
 
             let mut line = String::new();
-            let bytes = BufReader::new(stream)
             let bytes = reader
                 .read_line(&mut line)
                 .map_err(|error| format!("read daemon response: {error}"))?;
             if bytes == 0 {
                 return Err("daemon closed connection before responding".to_string());
             }
-            serde_json::from_str(&line).map_err(|error| format!("parse daemon response: {error}"))
             let response: WorkbenchDaemonResponse = serde_json::from_str(&line)
                 .map_err(|error| format!("parse daemon response: {error}"))?;
 
@@ -1375,7 +1352,6 @@ mod unix {
     pub(super) fn attach(
         downstream: Arc<dyn DesktopEventSink>,
         config: DesktopDaemonOpsConfig,
-    ) -> Result<Arc<dyn DesktopEventSink>, DesktopDaemonOpsStartError> {
     ) -> Result<DesktopDaemonOpsAttachment, DesktopDaemonOpsStartError> {
         let lifecycle_outbox_path = config.project_root.as_ref().map(|root| {
             root.join(".impulse")
@@ -1392,7 +1368,6 @@ mod unix {
         let worker_stop = Arc::clone(&stop);
         let worker_downstream = Arc::clone(&downstream);
         let heartbeat_interval = config.heartbeat_interval;
-        let mut client = UnixDaemonOpsClient::new(config.socket_path);
         let client = UnixDaemonOpsClient::new(config.socket_path)
             .with_lifecycle_outbox(lifecycle_outbox_path);
         let command_client = Arc::new(client.clone());
@@ -1411,14 +1386,12 @@ mod unix {
             })
             .map_err(DesktopDaemonOpsStartError::WorkerStart)?;
 
-        Ok(Arc::new(DesktopDaemonOpsSink {
         let event_sink: Arc<dyn DesktopEventSink> = Arc::new(DesktopDaemonOpsSink {
             downstream,
             telemetry,
             wake_tx,
             stop,
             worker: Mutex::new(Some(worker)),
-        }))
         });
         let governed_task_gateway: Arc<dyn GovernedTaskGateway> = command_client;
         Ok(DesktopDaemonOpsAttachment {
@@ -1438,7 +1411,6 @@ mod unix {
         let mut cursor = SubscriptionCursor::new();
         let mut last_error = None;
         let mut last_connected = None;
-        let initial_errors = subscribe_and_emit(client, &mut cursor, &downstream);
         let mut initial_errors = client
             .drain_governed_lifecycle_outbox()
             .err()
@@ -3683,7 +3655,6 @@ mod unix {
 
             let downstream = Arc::new(RecordingSink::default());
             let downstream_trait: Arc<dyn DesktopEventSink> = downstream.clone();
-            let sink = attach(
             let attachment = attach(
                 downstream_trait,
                 DesktopDaemonOpsConfig::new(socket, Some(PathBuf::from("/tmp/project")))
@@ -3804,7 +3775,6 @@ mod unix {
             });
 
             let downstream: Arc<dyn DesktopEventSink> = Arc::new(RecordingSink::default());
-            let sink = attach(
             let attachment = attach(
                 downstream,
                 DesktopDaemonOpsConfig::new(socket, None)
@@ -3830,7 +3800,6 @@ mod unix {
             let dir = tempfile::tempdir().expect("tempdir");
             let downstream = Arc::new(RecordingSink::default());
             let downstream_trait: Arc<dyn DesktopEventSink> = downstream.clone();
-            let sink = attach(
             let attachment = attach(
                 downstream_trait,
                 DesktopDaemonOpsConfig::new(dir.path().join("missing.sock"), None)
@@ -4040,7 +4009,6 @@ mod unix {
 pub fn attach_desktop_daemon_ops(
     downstream: Arc<dyn DesktopEventSink>,
     config: DesktopDaemonOpsConfig,
-) -> Result<Arc<dyn DesktopEventSink>, DesktopDaemonOpsStartError> {
 ) -> Result<DesktopDaemonOpsAttachment, DesktopDaemonOpsStartError> {
     #[cfg(unix)]
     {

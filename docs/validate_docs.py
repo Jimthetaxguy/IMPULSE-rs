@@ -51,9 +51,6 @@ CONTRACT_KEY_FILES = [
 ]
 
 DURABLE_ROADMAP_MARKER = (
-    "Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + "
-    "hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; "
-    "Legacy=egui compile-maintenance only"
     "Now=control-plane foundations + governed runtime producers + accepted-run review candidates; "
     "Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; "
     "Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + "

@@ -1,12 +1,5 @@
 ---
 title: Long-Range Enhancement Roadmap
-description: Superseded PR-organized enhancement backlog retained for historical planning context
-version: '1.1'
-updated: 2026-07-19
-type: doc
-category: roadmap
-phase: historical
-status: superseded
 description: Historical 33-candidate enhancement backlog across 8 themed lanes
 version: '1.0'
 updated: 2026-03-17
@@ -25,15 +18,6 @@ authors:
 
 # Long-Range Enhancement Roadmap — Impulse
 
-> **SUPERSEDED — historical planning record.** This file preserves an earlier 33-item enhancement
-> backlog and its dependency ideas. Its Now/Next/Later labels, product framing, file paths, and
-> completion claims are not current implementation guidance. Use [`../VISION.md`](../VISION.md) for
-> the living product north star, [`spec/RUST-CANONICAL-CONTRACT.md`](./spec/RUST-CANONICAL-CONTRACT.md)
-> for current behavior and roadmap boundaries, and [`spec/TEST-TRACEABILITY.md`](./spec/TEST-TRACEABILITY.md)
-> for current evidence gaps.
->
-> [`HONEST-ROADMAP.md`](./HONEST-ROADMAP.md) remains a narrow historical hook and memory validation
-> register, not the current whole-product roadmap.
 > **Historical backlog snapshot; archived 2026-09-14.** All 33 candidates, their
 > acceptance ideas, dependency graph, and provenance below are retained. Their March
 > Now/Next/Later labels and readiness statements are historical, not current work authorization.

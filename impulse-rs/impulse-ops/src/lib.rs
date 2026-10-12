@@ -6,10 +6,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod agent_registry;
-pub mod role_assignment;
-
-/// Shared daemon protocol version for GUI/operator workbench compatibility.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
 pub mod governed_task;
 pub mod governed_wiring;
 pub mod memory_candidate;
@@ -19,7 +15,6 @@ pub mod operator_capability;
 pub mod role_assignment;
 
 /// Shared daemon protocol version for GUI/operator workbench compatibility.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
 ///
 /// v7 (ADR-0018) adds the connection-scoped `PresentOperatorCapability`
 /// request and the operator-class requirement on `RecordOperatorDecision`.

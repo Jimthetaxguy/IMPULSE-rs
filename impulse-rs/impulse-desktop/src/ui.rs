@@ -1,12 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use dioxus::prelude::*;
-use impulse_ops::{agent_registry::AgentPlatformInfo, ProjectOpsSnapshot};
 use impulse_ops::{
     agent_registry::AgentPlatformInfo,
-    role_assignment::{
-        evaluate_role_compatibility, AgentRoleAssignment, AgentRoleId, EnforcementStrength,
-        RoleAssignmentError, RoleCapabilityRequirement, RuntimeCapabilityId,
     governed_task::{
         GovernedActor, GovernedActorKind, GovernedPromotion, GovernedPromotionOutcome,
         GovernedRequestId, GovernedReviewState, GovernedTaskMutation, GovernedTaskMutationRequest,
@@ -1164,26 +1160,6 @@ fn McpReadOnlyRow(tool_name: String, on_invoke: EventHandler<McpInvokeRequest>) 
 /// runtime. Structural filesystem scope is requested as an optional capability
 /// so its current absence remains visible without overstating cwd mediation.
 pub fn builder_role_assignment() -> Result<AgentRoleAssignment, RoleAssignmentError> {
-    Ok(AgentRoleAssignment {
-        role: AgentRoleId::try_new("builder")?,
-        requirements: vec![
-            RoleCapabilityRequirement {
-                capability: RuntimeCapabilityId::try_new("workspace.target")?,
-                minimum_enforcement: EnforcementStrength::Mediated,
-                mandatory: true,
-            },
-            RoleCapabilityRequirement {
-                capability: RuntimeCapabilityId::try_new("process.lifecycle")?,
-                minimum_enforcement: EnforcementStrength::Mediated,
-                mandatory: true,
-            },
-            RoleCapabilityRequirement {
-                capability: RuntimeCapabilityId::try_new("filesystem.scoped")?,
-                minimum_enforcement: EnforcementStrength::Structural,
-                mandatory: false,
-            },
-        ],
-    })
     Ok(canonical_governed_builder_assignment())
 }
 
@@ -1192,16 +1168,6 @@ pub fn builder_role_assignment() -> Result<AgentRoleAssignment, RoleAssignmentEr
 /// This is also the launch preflight: missing or stale catalog entries,
 /// evaluator errors, blocked role compatibility, blank tasks, and invalid
 /// launch roots all return an error before a request can reach the host bridge.
-pub fn build_governed_agent_spawn_request(
-    workspaces: &[WorkspaceEntry],
-    platforms: &[AgentPlatformInfo],
-    launch_root: &str,
-    selected_platform_id: &str,
-    agent_id: &str,
-    command: &str,
-    task: &str,
-) -> Result<AgentSpawnRequest, String> {
-    let root = launch_root.trim();
 pub struct GovernedAgentSpawnInput<'a> {
     pub launch_root: &'a str,
     pub selected_platform_id: &'a str,
@@ -1221,14 +1187,6 @@ pub fn build_governed_agent_spawn_request(
         return Err("a workspace root is required".to_string());
     }
 
-    let task = task.trim();
-    if task.is_empty() {
-        return Err("a governed task is required".to_string());
-    }
-
-    let descriptor = platforms
-        .iter()
-        .find(|candidate| candidate.id.as_str() == selected_platform_id)
     let task = input.task.trim();
     if task.is_empty() {
         return Err("a governed task is required".to_string());
@@ -1260,9 +1218,6 @@ pub fn build_governed_agent_spawn_request(
         return Err("the selected platform is blocked for the Builder role".to_string());
     }
 
-    let platform = AgentPlatformId::try_new(selected_platform_id.to_string())
-        .map_err(|error| format!("invalid selected platform: {error}"))?;
-    let agent_id = optional_text(agent_id.to_string());
     let platform = AgentPlatformId::try_new(input.selected_platform_id.to_string())
         .map_err(|error| format!("invalid selected platform: {error}"))?;
     let agent_id = optional_text(input.agent_id.to_string());
@@ -1277,7 +1232,6 @@ pub fn build_governed_agent_spawn_request(
         agent_id,
         session_id,
         platform,
-        command: optional_text(command.to_string()),
         command: optional_text(input.command.to_string()),
         args: Vec::new(),
         cwd: Some(root.to_string()),
@@ -1349,21 +1303,6 @@ fn WorkspaceLaunchPanel(
     };
     let selected_platform_descriptor = platforms
         .iter()
-        .find(|entry| entry.target.root == launch_root)
-        .map(|entry| entry.target.clone());
-    let selected_platform = platform();
-    let selected_platform_id = if platforms
-        .iter()
-        .any(|candidate| candidate.id.as_str() == selected_platform)
-    {
-        selected_platform
-    } else {
-        platforms
-            .first()
-            .map(|candidate| candidate.id.to_string())
-            .unwrap_or_default()
-    };
-    let can_launch = can_launch && !selected_platform_id.is_empty();
         .find(|candidate| candidate.id.as_str() == selected_platform_id);
     let role_assignment = builder_role_assignment();
     let role_compatibility = selected_platform_descriptor.and_then(|descriptor| {
@@ -1396,11 +1335,6 @@ fn WorkspaceLaunchPanel(
     let launch_request = build_governed_agent_spawn_request(
         &workspaces,
         &platforms,
-        &launch_root,
-        &selected_platform_id,
-        &agent_id(),
-        &command(),
-        &task(),
         GovernedAgentSpawnInput {
             launch_root: &launch_root,
             selected_platform_id: &selected_platform_id,
@@ -1419,7 +1353,6 @@ fn WorkspaceLaunchPanel(
             header { class: "section-header",
                 div {
                     h2 { "Workspace Launcher" }
-                    p { "Register a folder, then launch any agent from the runtime registry inside it." }
                     p { "Register a Rust workspace, then launch a governed Builder from the runtime registry inside it." }
                 }
                 span {
@@ -1616,30 +1549,6 @@ fn WorkspaceLaunchPanel(
                     onclick: move |_| {
                         let Some(request) = request_for_launch.clone() else {
                             return;
-                        }
-                        let agent_id_value = optional_text(agent_id());
-                        let session_id = agent_id_value
-                            .as_ref()
-                            .map(|value| format!("{value}-session"));
-                        let workspace = launch_workspace.clone().unwrap_or_else(|| WorkspaceTarget::from_root(root.clone()));
-                        let Ok(platform_id) = AgentPlatformId::try_new(selected_platform_id.clone()) else {
-                            return;
-                        };
-                        on_launch.call(AgentSpawnRequest {
-                            agent_id: agent_id_value,
-                            session_id,
-                            platform: platform_id,
-                            command: optional_text(command()),
-                            args: Vec::new(),
-                            cwd: Some(root),
-                            env: HashMap::new(),
-                            workspace: Some(workspace),
-                            mcp_tools: default_builtin_mcp_tools(),
-                            rows: 32,
-                            cols: 100,
-                            role: None,
-                            target: None,
-                        });
                         };
                         on_launch.call(request);
                     },
@@ -2961,8 +2870,6 @@ pub fn apply_desktop_bridge_message(
                 .get("platforms")
                 .cloned()
                 .unwrap_or_else(|| message.payload.clone());
-            *agent_platforms = serde_json::from_value::<Vec<AgentPlatformInfo>>(platforms)
-                .map_err(|error| format!("invalid agent_platforms payload: {error}"))?;
             match serde_json::from_value::<Vec<AgentPlatformInfo>>(platforms) {
                 Ok(platforms) => {
                     *agent_platforms = platforms;
@@ -3437,8 +3344,6 @@ pub fn DesktopShellWithSnapshot(
                     class: "bridge-status-banner",
                     "data-daemon-status": "publish-degraded",
                     role: "status",
-                    strong { "Telemetry publish degraded" }
-                    span { "Daemon snapshot reads remain live; desktop lifecycle writes will retry." }
                     strong { "Lifecycle synchronization degraded" }
                     span { "{daemon_publish_error}. Daemon snapshot reads remain live; reconcile daemon-owned task state before deciding." }
                 }
@@ -3720,8 +3625,6 @@ pub fn DesktopShell() -> Element {
                     daemon_ops_status.set(Some(update));
                     continue;
                 }
-                // `bridge_status` messages carry no state to reduce — they tell
-                // the operator the transport degraded or a call failed.
                 // Durable per-task record. Taken before the status branch so a
                 // later banner reset cannot take the OID with it.
                 if let Some(notice) = GovernedAckNotice::parse(&message) {
@@ -3744,7 +3647,6 @@ pub fn DesktopShell() -> Element {
                 let mut next_mcp_tools = mcp_tools();
                 let mut next_queue = review_queue();
                 let mut next_invocations = last_invocations();
-                if apply_desktop_bridge_message(
                 if let Ok(status_update) = apply_desktop_bridge_message_with_status(
                     DesktopBridgeStateMut::new(
                         &mut next_snapshot,

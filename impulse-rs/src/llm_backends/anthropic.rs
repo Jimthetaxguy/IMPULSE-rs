@@ -688,36 +688,6 @@ impl LlmProvider for AnthropicProvider {
 
         let body = build_anthropic_body(&request, self.cache_system_and_tools)?;
 
-        let system = system_msgs.into_iter().next().map(|m| m.content);
-
-        let mut body = serde_json::json!({
-            "model": request.model,
-            "max_tokens": request.max_tokens.unwrap_or(4096),
-            "temperature": request.temperature,
-            "messages": format_anthropic_messages(&non_system),
-        });
-
-        if let Some(sys) = system {
-            body["system"] = serde_json::Value::String(sys);
-        }
-
-        if !request.tools.is_empty() {
-            body["tools"] = serde_json::to_value(&request.tools)
-                .map_err(|e| AgentError::InvalidRequest(format!("failed to encode tools: {e}")))?;
-        }
-
-        let response = bounded_request(
-            self.0
-                .http_client()
-                .post("https://api.anthropic.com/v1/messages"),
-        )
-        .header("x-api-key", self.0.api_key())
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
         let response = bounded_request(self.base.http_client().post(self.endpoint()))
             .header("x-api-key", self.base.api_key())
             .header("anthropic-version", "2023-06-01")
@@ -984,21 +954,6 @@ impl LlmProvider for OpenAiProvider {
 
         let body = build_openai_style_body(&request, None);
 
-        if let Some(max_tokens) = request.max_tokens {
-            body["max_tokens"] = serde_json::json!(max_tokens);
-        }
-
-        let response = bounded_request(
-            self.0
-                .http_client()
-                .post("https://api.openai.com/v1/chat/completions"),
-        )
-        .header("Authorization", format!("Bearer {}", self.0.api_key()))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
         let response = bounded_request(self.0.http_client().post(self.endpoint()))
             .header("Authorization", format!("Bearer {}", self.0.api_key()))
             .header("Content-Type", "application/json")
@@ -1078,17 +1033,6 @@ impl LlmProvider for MinimaxProvider {
 
         let body = build_openai_style_body(&request, Some(MINIMAX_DEFAULT_MAX_TOKENS));
 
-        let response = bounded_request(
-            self.0
-                .http_client()
-                .post("https://api.minimax.chat/v1/text/chatcompletion_v2"),
-        )
-        .header("Authorization", format!("Bearer {}", self.0.api_key()))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
         let response = bounded_request(self.0.http_client().post(self.endpoint()))
             .header("Authorization", format!("Bearer {}", self.0.api_key()))
             .header("Content-Type", "application/json")

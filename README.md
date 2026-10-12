@@ -1,41 +1,5 @@
 # IMPULSE — Feed the impulse to build.
 
-**One governed cockpit for many coding agents.**
-
-Impulse names both the creative urge to make something and the force that sets work in motion. The product exists to protect that first spark, then help it compound across agents, tools, projects, and sessions instead of dissolving into terminal sprawl and repeated context setup.
-
-Everyone has felt it: the itch to open Claude Code or Codex and disappear into a build. Impulse is built for that moment.
-
-Impulse is a terminal-native **local control plane and harness manager** for AI software-engineering agents. It launches and manages heterogeneous coding runtimes, places them in explicit workspaces, supervises their processes, and augments them with shared memory, tools, telemetry, artifacts, policy, and verification.
-
-Claude Code, Codex, and similar CLIs keep their own internal coding loops. Ion is the Impulse-native coding runtime. Impulse governs the operating conditions around those loops; it does not claim to replace or fully control proprietary runtime internals.
-
-**Live foundation:** the Rust workspace provides PTY lifecycle, daemon workbench contracts and telemetry, registry-backed desktop platform identity, supervisor-specific permissions, capability-checked tools, memory/retrieval, artifacts, credentials, verification, and Ion's native REPL/tool loop. **Target:** runtime-independent role contracts, adapter capability negotiation, typed agent messaging, and stronger structural enforcement across supported runtimes. See [`VISION.md`](VISION.md) for the north star and explicit live-versus-target boundary.
-
-## Why
-
-Using several coding agents today usually means several unrelated terminals, permission models, context stores, and completion claims. Impulse brings those runtimes into one observable environment while preserving their terminal-native workflows. Persistent memory solves continuity; the wider control plane solves managed launch, project scoping, coordination, intervention, and evidence-backed completion. Structural filesystem isolation depends on the selected runtime or sandbox rather than on the cockpit alone.
-> **Live foundation:** the Rust workspace provides PTY lifecycle, daemon workbench contracts and
-> telemetry, registry-backed desktop platform identity, supervisor-specific permissions,
-> explicit product-role/task launch preflight, capability-checked tools, memory/retrieval,
-> artifacts, credentials, verification, and Ion's native REPL/tool loop.
->
-> **Target:** runtime-independent role contracts, adapter capability negotiation, typed agent
-> messaging, and stronger structural enforcement across supported runtimes. See
-> [`VISION.md`](VISION.md) for the north star and explicit live-versus-target boundary.
-
-## Why
-
-Using several coding agents today usually means several unrelated terminals, permission models, context stores, and completion claims. Impulse brings those runtimes into one observable environment while preserving their terminal-native workflows. Persistent memory preserves continuity; the wider control plane handles managed launch, project scoping, coordination, intervention, and evidence-backed completion. Structural filesystem isolation depends on the selected runtime or sandbox rather than on the cockpit alone.
-
-## What It Does
-
-- **Managed agent terminals** — Spawns, monitors, writes to, resizes, focuses, and closes PTY-backed agent processes inside explicit workspace roots
-- **Daemon workbench truth** — Serves the authoritative agent, context, artifact, and intervention snapshot over versioned IPC
-- **Role and policy foundations** — Enforces a concrete supervisor permission policy today; generalized runtime-independent role contracts are the next control-plane boundary
-- **Role and policy foundations** — Preflights an explicit Builder role/task against conservative launch capabilities and enforces a concrete supervisor permission policy; generalized role composition remains a later boundary
-- **Typed platform tools** — Exposes capability-checked Rust tools through native registries, MCP, and runtime-specific bridges
-- **Session tracking** — Records files touched, tools used, and decisions made
 **Local control plane for terminal-native coding agents.**
 
 Impulse names both the creative urge to make something and the force that sets work in motion.
@@ -55,8 +19,6 @@ proprietary runtime internals. Memory is a governed platform service, not the wh
 >
 > **Live today:** PTY lifecycle, daemon workbench truth, registry-backed platform identity,
 > capability-checked tools, governed-task producers (`rust_workspace_v1`), accepted-run memory
-> candidates (review queue — not auto-written to `GENOME.md`), and Ion's native REPL/tool loop.
-> Worker claim, verifier evidence, supervisor judgment, and operator approval stay separate.
 > candidates (review queue — not auto-written to `GENOME.md`), Ion's native REPL/tool loop under
 > the ADR-0017 loop contract, and Ion's read-only `document_read` tool for spreadsheets and Word
 > files. Worker claim, verifier evidence, supervisor judgment, and operator approval stay separate.
@@ -97,13 +59,6 @@ the selected runtime or sandbox rather than on Impulse alone.
 - **Persistent memory** — Project genome (decisions/preferences) and session history survive across sessions
 - **Accepted-run review queue** — Derives one versioned, provenance-bearing pending memory candidate from each accepted governed run while keeping `GENOME.md` and `HISTORY.jsonl` unchanged
 - **Context injection** — Relevant past context is surfaced in new sessions via review-first injection
-- **Multi-agent observability** — Tracks active agents, tasks, terminal telemetry, delegations, and intervention recommendations
-- **Retrieval search** — FTS5 keyword search + semantic search across session history and genome
-- **Retrieval search** — FTS5 keyword search plus feature-gated, fallback-safe semantic search across session history and genome
-- **Context stewardship** — Monitors context window usage and proposes cleanup strategies
-- **Artifacts and verification** — Separates worker claims from observed build/test evidence and reviewable outputs
-- **Credential services** — Selects configured credential providers without treating secret values as agent memory
-- **External + native runtimes** — Wraps terminal CLIs and provides Ion's direct model/tool loop in the same product
 - **Retrieval search** — FTS5 keyword search plus feature-gated, fallback-safe semantic search across session history and genome
 - **Context stewardship** — Monitors context window usage and proposes cleanup strategies
 
@@ -126,10 +81,6 @@ cargo run -- run
 cargo run --bin ion
 ```
 
-The live foundation can launch registered PTY runtimes and project daemon-backed state into the
-cockpit. The complete role-assigned supervisor + builder workflow is the next vertical slice, not
-an undocumented command-line flag. Session, memory, hook, and verification commands remain
-available through `cargo run -- --help`.
 The packaged executable is `impulse-rs`. Governed producer commands are daemon-only global-mode
 invocations: `impulse-rs --daemon governed-claim`, `impulse-rs --daemon governed-verify`, and
 `impulse-rs --daemon governed-review`. A governed pane supplies the exact executable path through
@@ -165,8 +116,6 @@ In the Dioxus cockpit, use the governed Builder launch path:
 
 1. Register an existing absolute workspace directory.
 2. Choose a runtime from the current platform catalog.
-3. Enter the required task and inspect each Builder compatibility requirement.
-4. Launch only after the cockpit reports every mandatory requirement satisfied.
 3. Enter the required task and each exact acceptance criterion.
 4. Commit every workspace change, including `Cargo.lock` when Cargo would otherwise generate it, so
    the canonical Git worktree root and the later detached verification checkout stay byte-exact.
@@ -176,10 +125,6 @@ In the Dioxus cockpit, use the governed Builder launch path:
 Current built-in profiles mediate workspace targeting and process lifecycle. Structural filesystem
 scope is optional and currently unsupported, so the initial Builder profile is allowed but visibly
 degraded. The canonical working directory selects where the process starts; cwd mediation is not a
-filesystem sandbox. The complete supervisor + builder evidence/decision workflow remains the next
-vertical slice. Session, memory, hook, and verification commands remain available through
-`cargo run -- --help`.
-
 filesystem sandbox.
 
 Every governed launch is registered with the daemon before a PTY is created. For the profiled
