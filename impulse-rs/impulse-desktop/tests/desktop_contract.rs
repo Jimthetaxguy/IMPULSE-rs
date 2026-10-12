@@ -12,6 +12,9 @@ use dioxus::prelude::document::{Document, Eval, EvalError, Evaluator};
 use dioxus::prelude::*;
 use impulse_desktop::ui::{
     agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
+    desktop_event_bridge_script, mcp_invoke_bridge_script, review_decision_bridge_script,
+    terminal_asset_paths, workspace_registration_bridge_script, BridgeStatusUpdate,
+    DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut, ReviewDecisionUiRequest,
     apply_desktop_bridge_message_with_status, build_governed_agent_spawn_request,
     builder_role_assignment, desktop_event_bridge_script, mcp_invoke_bridge_script,
     review_decision_bridge_script, terminal_asset_paths, workspace_registration_bridge_script,
@@ -35,6 +38,8 @@ use impulse_desktop::{
     WorkspaceTarget,
 };
 use impulse_ops::{
+    agent_registry::AgentPlatformInfo, AgentRuntime, AgentStatus, ContextHealthSummary,
+    MemorySummary, ProjectOpsSnapshot, RetrievalSummary,
     agent_registry::AgentPlatformInfo, role_assignment::EnforcementStrength, AgentRuntime,
     AgentStatus, ContextHealthSummary, MemorySummary, ProjectOpsSnapshot, RetrievalSummary,
 };
@@ -1993,6 +1998,55 @@ fn test_malformed_agent_platform_catalog_revokes_stale_compatibility_and_recover
     .expect("valid catalog recovers");
     assert!(recovery_status.is_none());
     assert!(governed_launch(&agent_platforms, "codex", "Build it").is_ok());
+}
+
+#[test]
+fn test_host_manifest_exposes_registry_platform_catalog() {
+    assert!(
+        impulse_desktop::host_commands::HOST_INVOKE_COMMANDS.contains(&"agent_platforms"),
+        "the launcher must load platform choices from the runtime registry"
+    );
+}
+
+#[test]
+fn test_desktop_reducer_accepts_registry_platform_catalog_messages() {
+    let mut snapshot = ProjectOpsSnapshot::default();
+    let mut runtime_agents = Vec::new();
+    let mut agent_platforms = Vec::new();
+    let mut workspaces = Vec::new();
+    let mut mcp_tools = Vec::new();
+    let mut review_queue = Vec::new();
+    let mut last_invocations = Vec::new();
+
+    let result = apply_desktop_bridge_message(
+        DesktopBridgeStateMut::new(
+            &mut snapshot,
+            &mut runtime_agents,
+            &mut agent_platforms,
+            &mut workspaces,
+            &mut mcp_tools,
+            &mut review_queue,
+            &mut last_invocations,
+        ),
+        DesktopBridgeMessage {
+            kind: "agent_platforms".to_string(),
+            payload: json!({
+                "platforms": [
+                    {"id": "ion", "label": "Ion", "command": "ion"},
+                    {"id": "custom-agent", "label": "Custom", "command": "custom"}
+                ]
+            }),
+        },
+    );
+
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(
+        agent_platforms
+            .iter()
+            .map(|platform| platform.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["ion", "custom-agent"]
+    );
 }
 
 #[test]

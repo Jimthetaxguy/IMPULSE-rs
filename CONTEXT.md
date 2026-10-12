@@ -3,6 +3,7 @@
 > **Read this first.** Shared L0/L1 vocabulary for Impulse. Update a term here when its stable
 > meaning changes; put detailed history in plans/ADRs rather than growing this glossary.
 >
+> Entries are tagged **`[code]`** (live in the verified local implementation) or
 > Entries are tagged **`[code]`** (live in the current repository implementation) or
 > **`[vocabulary]`** (the product contract; "Closest in code" names today's partial carrier).
 >
@@ -49,6 +50,9 @@ fallback does not unblock Tauri-adapter retirement.
 The stable behavioral contract assigned to an agent: obligations, permissions, tools, context,
 communication rules, and completion evidence. A role is independent of model, runtime, process,
 session, and pane.
+- **Closest in code:** narrow `AgentRole::{Coordinator, Worker}` plus the concrete
+  `SupervisorPermissionPolicy` in `impulse-ops/src/lib.rs`.
+- **Boundary:** a generalized typed role contract is direction for a later ADR, not live today.
 - **Closest in code:** the narrow launch-time `AgentRoleId`/`AgentRoleAssignment` contract plus the
   concrete `SupervisorPermissionPolicy`. `AgentRole::{Coordinator, Worker}` remains legacy pane and
   delegation topology, not product-role identity.
@@ -76,6 +80,8 @@ sibling Ion binary without an override, and fails closed on unknown/blank ids. R
 canonicalizes aliases and case; the declared platform remains distinct from the observed command,
 so explicit wrapper/alternate-installation overrides stay supported and visible. Legacy closed
 enums remain where wire/disk compatibility still requires them.
+- **Source of truth:** `impulse-ops/src/agent_registry.rs`.
+
 An open, validated string identity (`AgentPlatformId`) owned by `AgentRegistry` across desktop,
 host, MCP, browser, reducer, launcher, and snapshot paths. The registry adds Ion, derives capability
 manifests, resolves its sibling binary, and fails closed on unknown/blank IDs. Declared platform and
@@ -630,11 +636,16 @@ artifact review, and explicit approval where policy requires it.
 
 ---
 
+## Live-versus-direction boundary (2026-07-12)
 ## Live-versus-direction boundary (2026-07-13)
 
 - **Live foundation:** PTY lifecycle, daemon workbench truth, managed agent turns, open
   registry-backed desktop platform identity, real Ion desktop launch, daemon-truth terminal
   telemetry, supervisor-specific permissions, capability-checked tools, memory/retrieval/injection,
+  artifacts, credentials, and Ion's native coding REPL/tool loop.
+- **Direction:** generalized role contracts, one runtime-adapter interface, explicit capability
+  negotiation/enforcement strength, and typed cross-agent messaging. These require an ADR and
+  vertical slice; names and schemas are intentionally not frozen here.
   artifacts, credentials, Ion's native coding REPL/tool loop, and explicit role/task launch
   preflight with typed compatibility telemetry.
 - **Direction:** daemon-owned task evidence, verification and supervisor decisions; generalized

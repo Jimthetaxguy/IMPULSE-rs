@@ -13,6 +13,19 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 
 | Command | Direct | With `--daemon` | Description |
 |---------|--------|--------|-------------|
+| `daemon` | Yes | — | Run the foreground daemon listener (`--stop` is not wired in direct mode) |
+| `run` | Yes | — | Launch the 10-tab ratatui workbench |
+| `session-start` | Yes | Yes | Begin a new session (`--name`, `--platform`, `--inject-mode`) |
+| `session-end` | Yes | Yes | End session (`--session-id`, `--summary`, `--verify`, `--sem-diff-base`) |
+| `track-write` | Yes | Yes | Record a file write (`--file`, `--session-id`) |
+| `track-tool` | Yes | Yes | Record a tool use (`--tool`, `--session-id`) |
+| `list-sessions` | Yes | Yes | List all sessions |
+| `session-info` | Yes | Yes | Show details for a session (`<id>`) |
+| `session-conflicts` | Yes | Yes | Check cross-session file conflicts (`--file`, `--session-id`) |
+| `status` | Yes | Yes | Show daemon/control-plane status |
+| `debug` | Yes | Yes | Show internal state snapshot (sessions, tools, plugins, config) |
+| `conflict-history` | Yes | Yes | Show historical file conflict audit trail |
+| `chat` | Yes | Yes | Send a message to the LLM (`--session-id`, `--message`, `--inject-mode`) |
 | `daemon` | Yes | IPC status only | Run the foreground daemon listener; `--daemon daemon --stop` does not terminate it |
 | `run` | Yes | — | Launch the 10-tab ratatui workbench |
 | `session-start` | Yes | IPC | Begin a new session (`--name`, `--platform`, `--inject-mode`) |

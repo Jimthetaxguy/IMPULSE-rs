@@ -1,6 +1,8 @@
 ---
 title: User Story Map
 description: Rust-first user stories and documentation baseline for the current Impulse product surface
+version: '1.2'
+updated: 2026-07-12
 version: '1.3'
 updated: 2026-07-13
 version: '1.4'
@@ -39,6 +41,10 @@ These documents describe the current product with the least drift:
 These documents help readers enter or navigate the product, but the canonical contract remains the
 implementation baseline:
 
+- [`../../README.md`](../../README.md) explains the product at a high level
+- [`../INDEX.md`](../INDEX.md) is the navigation hub
+- `../SUMMARY.md` mirrors the `../SUMMARY.yaml` navigation source; use the canonical contract for implementation truth
+- [`../guides/TESTING-STRATEGY-ENHANCEMENTS.md`](../guides/TESTING-STRATEGY-ENHANCEMENTS.md) has reusable testing categories
 - [`../../README.md`](../../README.md) is the product entry point and quick start
 - `../SUMMARY.md` mirrors the `../SUMMARY.yaml` navigation source; use the canonical contract for implementation truth
 
@@ -334,6 +340,8 @@ Acceptance criteria:
 Primary interfaces:
 
 - `AgentRegistry` / `AgentPlatformId`
+- `DesktopRuntime::{spawn_agent, write_agent, focus_agent, close_agent}`
+- daemon `PublishTerminalOps`, `SubscribeOps`, and `RunSupervisorAction`
 - `AgentRoleId` / `AgentRoleAssignment` / `RoleCompatibility`
 - `DesktopRuntime::{spawn_agent, write_agent, focus_agent, close_agent}`
 - daemon `PublishTerminalOps`, `SubscribeOps`, and `RunSupervisorAction`
@@ -348,6 +356,9 @@ Primary interfaces:
 
 Live boundary:
 
+- registry-backed platform identity, terminal lifecycle controls, daemon truth, and supervisor-specific policy are implemented foundations
+- one end-to-end supervisor/builder task contract, runtime-bound role assignment, and completion-evidence review are not yet complete
+- generalized roles, a common runtime-adapter trait, and capability negotiation across arbitrary runtimes remain target architecture; this first slice must not imply that every runtime has equal enforcement
 - the Dioxus Builder launcher now requires an explicit bounded task and product-role assignment, previews trusted static compatibility, and fails closed when its platform catalog is unavailable
 - the backend canonicalizes the workspace, repeats compatibility evaluation, blocks unsatisfied mandatory requirements before agent-id reservation or PTY creation, and preserves task/assignment/result telemetry
 - one end-to-end supervisor/builder governed-run lifecycle carrying evidence through verification, supervisor judgment, and operator approval is not yet complete

@@ -9,6 +9,8 @@ type: reference
 category: architecture
 audience: builder
 tags: [decisions, adr, architecture]
+updated: 2026-07-12
+last_updated: 2026-07-12
 updated: 2026-07-13
 last_updated: 2026-07-13
 updated: 2026-09-26

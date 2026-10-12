@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use dioxus::prelude::*;
+use impulse_ops::{agent_registry::AgentPlatformInfo, ProjectOpsSnapshot};
 use impulse_ops::{
     agent_registry::AgentPlatformInfo,
     role_assignment::{
@@ -1348,6 +1349,21 @@ fn WorkspaceLaunchPanel(
     };
     let selected_platform_descriptor = platforms
         .iter()
+        .find(|entry| entry.target.root == launch_root)
+        .map(|entry| entry.target.clone());
+    let selected_platform = platform();
+    let selected_platform_id = if platforms
+        .iter()
+        .any(|candidate| candidate.id.as_str() == selected_platform)
+    {
+        selected_platform
+    } else {
+        platforms
+            .first()
+            .map(|candidate| candidate.id.to_string())
+            .unwrap_or_default()
+    };
+    let can_launch = can_launch && !selected_platform_id.is_empty();
         .find(|candidate| candidate.id.as_str() == selected_platform_id);
     let role_assignment = builder_role_assignment();
     let role_compatibility = selected_platform_descriptor.and_then(|descriptor| {
@@ -1600,6 +1616,30 @@ fn WorkspaceLaunchPanel(
                     onclick: move |_| {
                         let Some(request) = request_for_launch.clone() else {
                             return;
+                        }
+                        let agent_id_value = optional_text(agent_id());
+                        let session_id = agent_id_value
+                            .as_ref()
+                            .map(|value| format!("{value}-session"));
+                        let workspace = launch_workspace.clone().unwrap_or_else(|| WorkspaceTarget::from_root(root.clone()));
+                        let Ok(platform_id) = AgentPlatformId::try_new(selected_platform_id.clone()) else {
+                            return;
+                        };
+                        on_launch.call(AgentSpawnRequest {
+                            agent_id: agent_id_value,
+                            session_id,
+                            platform: platform_id,
+                            command: optional_text(command()),
+                            args: Vec::new(),
+                            cwd: Some(root),
+                            env: HashMap::new(),
+                            workspace: Some(workspace),
+                            mcp_tools: default_builtin_mcp_tools(),
+                            rows: 32,
+                            cols: 100,
+                            role: None,
+                            target: None,
+                        });
                         };
                         on_launch.call(request);
                     },
@@ -2921,6 +2961,8 @@ pub fn apply_desktop_bridge_message(
                 .get("platforms")
                 .cloned()
                 .unwrap_or_else(|| message.payload.clone());
+            *agent_platforms = serde_json::from_value::<Vec<AgentPlatformInfo>>(platforms)
+                .map_err(|error| format!("invalid agent_platforms payload: {error}"))?;
             match serde_json::from_value::<Vec<AgentPlatformInfo>>(platforms) {
                 Ok(platforms) => {
                     *agent_platforms = platforms;
@@ -3678,6 +3720,8 @@ pub fn DesktopShell() -> Element {
                     daemon_ops_status.set(Some(update));
                     continue;
                 }
+                // `bridge_status` messages carry no state to reduce — they tell
+                // the operator the transport degraded or a call failed.
                 // Durable per-task record. Taken before the status branch so a
                 // later banner reset cannot take the OID with it.
                 if let Some(notice) = GovernedAckNotice::parse(&message) {
@@ -3700,6 +3744,7 @@ pub fn DesktopShell() -> Element {
                 let mut next_mcp_tools = mcp_tools();
                 let mut next_queue = review_queue();
                 let mut next_invocations = last_invocations();
+                if apply_desktop_bridge_message(
                 if let Ok(status_update) = apply_desktop_bridge_message_with_status(
                     DesktopBridgeStateMut::new(
                         &mut next_snapshot,

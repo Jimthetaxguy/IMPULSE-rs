@@ -16,6 +16,7 @@ tags: [worktree, lane, daemon, telemetry, agents, coordination]
 - Owner: Codex
 - Role: Repair the daemon-backed agent-state projection that future lifecycle controls consume.
 - Branch: `codex/agent-truth-parity`
+- Worktree: `/Users/jamespustorino/code/IMPULSE-rs/.worktrees/agent-truth-parity`
 - Worktree: dedicated `agent-truth-parity` worktree for this lane
 - Owned paths:
   - `impulse-rs/src/ops_workbench.rs`

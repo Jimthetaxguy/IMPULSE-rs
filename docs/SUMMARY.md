@@ -1,6 +1,8 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
+version: 2.4
+updated: 2026-07-12
 version: 2.6
 updated: 2026-07-13
 version: 2.8
@@ -14,6 +16,7 @@ schema_version: '1.0'
 
 | Guide | Description | Start Here |
 | ----- | ----------- | ---------- |
+| [VISION.md](../VISION.md) | Living product north star and complete governed vertical slice | ✅ Yes |
 | [VISION.md](../VISION.md) | Living product north star and target governed vertical slice | ✅ Yes |
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative product contract | ✅ Yes |
 | [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) | Rust-first user stories and acceptance criteria | ✅ Yes |
@@ -164,6 +167,9 @@ Historical Ralph loop plans now live under `archive/ralph-plans/` and are proven
 
 | Field | Value |
 | ----- | ----- |
+| Total Documents | 134 |
+| Categories | 8 |
+| Decisions (ADRs) | 9 |
 | Total Documents | 136 |
 | Categories | 9 |
 | Decisions (ADRs) | 10 |

@@ -1,6 +1,10 @@
 # IMPULSE — Feed the impulse to build.
 
 - **Status:** Living product north star
+- **Updated:** 2026-07-12
+- **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
+- **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
+- **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
 - **Updated:** 2026-07-13
 - **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
@@ -59,6 +63,17 @@ Impulse is differentiated by treating those agents as workers inside one governe
 These concepts must stay separate:
 
 ```text
+project / workspace scope
+        |
+        +-- task (assignment + completion criteria)
+        |      |
+        |      +-- agent instance
+        |             +-- role
+        |             +-- runtime
+        |             +-- session(s)
+        |             +-- terminal/API channel
+        |
+        +-- project memory, artifacts, policy, and verification
 project (governance scope) <------> workspace target (execution root)
         |                                      |
         +-- task                               +-- agent process / PTY
@@ -143,6 +158,8 @@ control plane and should share platform services where their capabilities allow 
 
 ## Capability negotiation
 
+Different runtimes support different operations. A future adapter contract must report rather than
+hide those differences. Relevant capabilities include:
 Different runtimes support different operations. A future generalized/dynamic adapter contract must
 report rather than hide those differences. Relevant capabilities include:
 
@@ -307,6 +324,7 @@ needs a reason and an audit path. The user can interrupt, narrow, revoke, review
 - Rust daemon and versioned workbench protocol/read models.
 - PTY spawn/write/resize/focus/exit lifecycle and process cleanup.
 - Dioxus Desktop host/bridge plus ratatui and CLI operator surfaces.
+- Open registry-backed desktop platform identity and launch metadata.
 - Registry-backed desktop platform identity and launch metadata.
 - Explicit product-role/task launch preflight, backend mandatory-capability gate, and typed
   compatibility telemetry.
@@ -334,6 +352,8 @@ needs a reason and an audit path. The user can interrupt, narrow, revoke, review
 - Credential provider abstraction, artifacts, delegations, and verification gates.
 - Ion interactive native coding runtime with direct providers, typed tools, guardrails, and loop bounds.
 
+This contract describes the verified local implementation. Publishing a remote release is a
+separate action and must not be inferred from local branch integration.
 This contract describes the current repository implementation. Inclusion in a tagged release is
 a separate action and must not be inferred from repository state alone.
 
@@ -408,6 +428,18 @@ so step 10 and the complete multi-runtime workflow are not yet closed.
 
 ## Open ADR decisions
 
+The following decisions must be resolved together before schema-specific documents split out:
+
+1. Exact hierarchy/cardinality and durable ids for project, workspace, role, runtime, instance,
+   session, task, pane, and supervisor scope.
+2. Minimum runtime-adapter interface and semantics for optional/emulated operations.
+3. Capability/enforcement-strength vocabulary and launch-blocking rules.
+4. Role contract composition, override, persistence, and migration.
+5. Cross-agent message routing, direct worker communication, acknowledgement, and isolation.
+6. Memory authorship, verification, conflict resolution, correction, forgetting, and inheritance.
+7. Credential grants, revocation, audit, redaction, and cross-project prevention.
+8. Supervisor scheduling, attention summaries, context budget, and intervention priority.
+9. Verification profiles and who has final approval by impact class.
 ADR-0010 accepts only the explicit product-role/task launch-preflight contract. The following
 broader decisions remain open and must be resolved before schema-specific documents split out:
 

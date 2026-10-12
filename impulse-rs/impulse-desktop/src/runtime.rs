@@ -3119,6 +3119,13 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    fn platform_id(value: &str) -> AgentPlatformId {
+        AgentPlatformId::try_new(value).expect("valid test platform id")
+    }
+
     fn spawn_request(rows: u16, cols: u16, command: Option<&str>) -> AgentSpawnRequest {
         AgentSpawnRequest {
             agent_id: Some("agent-1".to_string()),

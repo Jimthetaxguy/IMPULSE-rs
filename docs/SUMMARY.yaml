@@ -1,6 +1,8 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
+version: '2.4'
+updated: '2026-07-12'
 version: '2.6'
 updated: '2026-07-13'
 version: '2.8'
@@ -13,6 +15,10 @@ category: docs
 
 roadmap_contract: >-
   Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only
+
+quick_reference:
+  - name: VISION.md
+    description: Living product north star and complete governed vertical slice
   Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only
 
 quick_reference:
@@ -189,6 +195,9 @@ validation_and_history:
     path: guides/HOOK-VALIDATION-GUIDE.md
 
 metadata:
+  total_documents: 134
+  categories: 8
+  decisions: 9
   total_documents: 136
   categories: 9
   decisions: 10
