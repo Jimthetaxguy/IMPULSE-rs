@@ -13,6 +13,10 @@ use dioxus::prelude::*;
 use impulse_desktop::ui::{
     agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
     apply_desktop_bridge_message_with_status, build_governed_agent_spawn_request,
+    builder_role_assignment, desktop_event_bridge_script, mcp_invoke_bridge_script,
+    review_decision_bridge_script, terminal_asset_paths, workspace_registration_bridge_script,
+    BridgeStatusUpdate, DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut,
+    ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
     builder_role_assignment, desktop_event_bridge_script, governed_task_mutation_bridge_script,
     mcp_invoke_bridge_script, parse_workspace_folder_pick_result, review_decision_bridge_script,
     terminal_asset_paths, workspace_folder_pick_bridge_script, workspace_folder_pick_request,
@@ -120,6 +124,9 @@ fn test_workspace_launcher_renders_required_builder_compatibility_preflight() {
 
     let html = dioxus_ssr::render(&vdom);
     assert!(html.contains("data-field=\"launch-task\""));
+    assert!(html.contains("aria-required=\"true\""));
+    assert!(html.contains(">Task<"));
+    assert!(html.contains(">Builder<"));
     assert!(html.contains("data-field=\"launch-acceptance-criteria\""));
     assert!(html.contains("aria-required=\"true\""));
     assert!(html.contains(">Task<"));
@@ -161,6 +168,11 @@ fn governed_launch(
     build_governed_agent_spawn_request(
         &[governed_workspace()],
         platforms,
+        "/tmp/impulse",
+        selected_platform,
+        "builder-1",
+        "",
+        task,
         GovernedAgentSpawnInput {
             launch_root: "/tmp/impulse",
             selected_platform_id: selected_platform,

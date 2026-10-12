@@ -1,5 +1,6 @@
 # Control-Plane Architecture Boundaries
 
+- **Updated:** 2026-07-13
 - **Updated:** 2026-10-03
 - **Status:** Active boundary map
 - **North star:** [`../VISION.md`](../VISION.md)
@@ -42,6 +43,7 @@ workbench authority.
 | Runtime | Execution engine/integration | external harness code, desktop runtime, Ion REPL/provider loop | Not an agent instance |
 | Agent instance | One running identity and its status | `AgentRuntime`, `AgentRuntimeSnapshot`, desktop runtime record | Not a session |
 | Session | Bounded persisted work history | daemon create/end session + `.impulse/LIVE_STATE.json`/history | Not necessarily process lifetime |
+| Task | Assignment plus acceptance evidence | delegations, `current_task`, Ion harness `Task` | May span sessions |
 | Task | Assignment plus acceptance evidence | daemon-owned `GovernedTaskRun`; delegations, `current_task`, and Ion harness `Task` remain separate carriers | Governed task id is distinct from agent/session ids; current assignment is immutable and resume/reassignment is future work |
 | Pane | View/input attachment | TUI pane manager and desktop terminal ids | Not an authorization boundary |
 | Workspace target | Filesystem root assigned at launch | desktop `WorkspaceTarget`/`WorkspaceRegistry` | Not the same as global cockpit scope |
@@ -55,6 +57,10 @@ generalized role composition, a common runtime-adapter contract, or dynamic capa
 
 | Boundary | Authoritative paths | Current truth | Status |
 | --- | --- | --- | --- |
+| Shared control-plane wire/read models | `impulse-rs/impulse-ops/src/lib.rs` | Versioned daemon requests/responses, workbench snapshots, telemetry, supervisor policy/actions, artifacts | Live |
+| Daemon coordination | `impulse-rs/src/daemon/{mod,protocol,handlers}.rs` | Workbench authority, session operations, managed agent turns, telemetry overlays, supervisor enforcement | Live |
+| PTY/process lifecycle | `impulse-rs/impulse-term/src/backend.rs`, `impulse-rs/impulse-desktop/src/runtime.rs` | Spawn, input, resize, focus, output, exit, and cleanup | Live |
+| Dioxus cockpit | `impulse-rs/impulse-desktop/src/{desktop_host,host_bridge,host_commands,views}.rs` | Renders backend state and dispatches typed host actions; does not own durable truth | Live host/bridge foundation |
 | Shared control-plane wire/read models | `impulse-rs/impulse-ops/src/{lib,governed_task,memory_candidate}.rs` | Versioned daemon requests/responses, workbench snapshots, governed task/evidence/decision types, accepted-run candidate types, telemetry, supervisor policy/actions, artifacts | Live |
 | Daemon coordination | `impulse-rs/src/daemon/{mod,protocol,handlers}.rs`, `src/state/{governed_task,memory_candidate}.rs`, `src/governed_producers.rs` | Workbench authority, persistent governed-task lifecycle, deterministic accepted-run review projection, profiled claim/verification/Supervisor producers, managed agent turns, telemetry overlays | Live |
 | PTY/process lifecycle | `impulse-rs/impulse-term/src/backend.rs`, `impulse-rs/impulse-desktop/src/{runtime,daemon_ops}.rs` | Spawn, input, resize, focus, output, exit, cleanup, pre-PTY governed registration, and durable launch/exit reconciliation | Live |
@@ -66,6 +72,9 @@ generalized role composition, a common runtime-adapter contract, or dynamic capa
 | Ion verification harness contract | `impulse-rs/impulse-ion/src/{lib,pi_adapter}.rs` | Transport-neutral verify/review/summarize contract and external adapter | Live; separate from the interactive Ion runtime |
 | Dynamic tools | `impulse-rs/src/tooling/`, `impulse-rs/src/mcp/` | Typed schemas, deny-by-default capabilities, validation, execution, audit | Live |
 | Desktop MCP tools | `impulse-rs/impulse-desktop/src/mcp.rs` | Agent spawn/write, memory search, project context, staged injection/review | Live; exposure differs from native Ion tools |
+| Memory/context | `impulse-rs/src/{state,memory,retrieval,injection,stewardship}/` | Project-scoped persistence, FTS5/semantic retrieval, review-first injection, context health | Live |
+| Credentials | `impulse-rs/src/credentials/` | Provider abstraction for Keychain, socket, CLI proxy, env, and session memory | Live; per-role credential grants are not generalized |
+| Artifacts/evidence | `ArtifactEnvelope` in `impulse-ops`, daemon artifact handlers, `impulse-rs/src/verify/` | Provenance-bearing outputs and verification gates | Live foundation |
 | Memory/context | `impulse-rs/src/{state,memory,retrieval,injection,stewardship}/` | Project-scoped persistence, deterministic pending accepted-run candidates, FTS5/semantic retrieval, review-first injection, context health | Live; candidate promotion/dismissal is not implemented |
 | Credentials | `impulse-rs/src/credentials/` | Provider abstraction for Keychain, socket, CLI proxy, env, and session memory | Live; per-role credential grants are not generalized |
 | Artifacts/evidence | governed/candidate types and `ArtifactEnvelope` in `impulse-ops`, daemon governed/artifact handlers, `impulse-rs/src/governed_producers.rs` | Separate claims, daemon-observed profiled evidence, strict Supervisor verdicts, operator decisions, deterministic pending memory candidates, and provenance-bearing outputs | Live first producer profile + review-only candidate foundation |
@@ -78,6 +87,33 @@ Impulse can structurally control its own tools, daemon actions, PTY lifecycle, w
 credential exposure, and native Ion loop. For external CLIs it can strongly control launch
 arguments, working directory, environment, process tree, injected files/instructions, supported
 hooks/MCP, and observable outputs.
+
+The current governed desktop launch boundary requires a nonblank task of at most 8,192 UTF-8
+bytes with no NUL byte. It also requires both `workspace.root` and `cwd` to name the same absolute,
+existing canonical directory; that canonical root drives the PTY working directory, trusted
+workspace environment, runtime snapshot, and daemon telemetry. This is launch mediation, not a
+filesystem sandbox.
+
+It cannot promise control over a vendor's hidden system prompt, proprietary reasoning loop,
+internal context compression, or unsupported tool mechanics. The live static preflight therefore
+uses explicit enforcement strengths rather than a boolean "supported" flag; future generalized
+runtime adapters must preserve that honesty while adding discovery and lifecycle semantics.
+
+## Direction that is not implemented yet
+
+The next architecture ADR must settle these together:
+
+1. The exact hierarchy and identifiers for project, workspace, role, runtime, instance, session,
+   task, and pane.
+2. The minimum runtime-adapter operations, optional operations, and emulation rules.
+3. Generalized and dynamic capability negotiation beyond the static desktop preflight, including
+   discovery, attestation freshness, emulation, and post-launch re-evaluation.
+4. Typed message routing and cross-project isolation.
+5. Role-specific credential, context, tool, and verification grants.
+
+Do **not** create separate `ROLES`, `RUNTIMES`, `SUPERVISOR`, or replacement architecture schema
+documents before those decisions land. `VISION.md` and the canonical contract remain the source of
+product intent; the later ADR will authorize schema-level splits.
 
 The current profiled governed desktop launch boundary requires a nonblank task, exact non-empty
 acceptance criteria, `rust_workspace_v1`, and both `workspace.root` and `cwd` naming the same

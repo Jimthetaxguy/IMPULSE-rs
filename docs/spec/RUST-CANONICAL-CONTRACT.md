@@ -1,6 +1,8 @@
 ---
 title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
+version: '1.9'
+updated: 2026-07-13
 version: '2.1'
 updated: 2026-09-14
 type: specification
@@ -88,6 +90,9 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 
 | Stage | Focus | Status |
 | --- | --- | --- |
+| **Now** | Rust control-plane foundation: daemon truth, PTY lifecycle, memory/tools/policy/artifacts, Dioxus cockpit, Ion native runtime | Active |
+| **Next** | Prove one governed supervisor + builder vertical slice and define the hierarchy/enforcement ADR | Active |
+| **Later** | General role contracts, runtime capability negotiation, typed agent messaging, and multi-project supervisor attention | Planned |
 | **Now** | Rust control-plane foundation, daemon-owned governed runtime producers, and deterministic accepted-run review candidates | Active |
 | **Next** | Add stronger same-user actor authorization and one full launched Builder/Supervisor workflow proof | Active |
 | **Later** | Wire candidate promotion/dismissal daemon/UI/runtime surfaces, general role contracts, runtime capability negotiation, typed agent messaging, and multi-project supervisor attention | Planned |
@@ -108,6 +113,10 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 | Runtime | External harness or native engine that executes a role | External agent harness calls, desktop PTY runtime, and Ion native provider/tool loop; no common adapter trait yet |
 | Agent instance | One running identity with runtime, role, scope, process state, and telemetry | `AgentRuntime`/`AgentRuntimeSnapshot` and desktop runtime records |
 | Session | Bounded persisted work history | Daemon session lifecycle and `.impulse/` history/state |
+| Task | Assignment plus acceptance/verification criteria | Governed desktop launches require bounded nonblank task metadata and preserve it in runtime/daemon telemetry; there is not yet one durable task/evidence lifecycle |
+| Pane | Cockpit view/input attachment | TUI panes and desktop terminal ids; never an authority boundary |
+| Workspace target | Explicit filesystem execution root | Desktop `WorkspaceTarget`/`WorkspaceRegistry` |
+| Project | Governance scope for memory, artifacts, policy, and verification | Project-scoped `.impulse/` state and `ProjectOpsSnapshot`; often maps 1:1 to a workspace today |
 | Task | Assignment plus acceptance/verification criteria | `GovernedTaskRun` is a durable daemon-owned identity distinct from agent/session ids; it carries bounded criteria, typed claims/evidence/verdicts/decisions, and independent execution/review state. Reassignment/resume is not implemented |
 | Pane | Cockpit view/input attachment | TUI panes and desktop terminal ids; never an authority boundary |
 | Workspace target | Explicit filesystem execution root | Desktop `WorkspaceTarget`/`WorkspaceRegistry` |
@@ -136,6 +145,10 @@ task, assignment, and compatibility result remain observable through runtime and
 This static preflight does not attest model-internal behavior, and canonical working-directory
 mediation is not a filesystem sandbox.
 
+A future generalized/dynamic adapter contract must still define runtime discovery, optional and
+emulated operations, attestation freshness, and post-launch re-evaluation. General role
+composition, daemon-owned task evidence, supervisor decisions, and verified-memory promotion also
+remain outside this launch-preflight foundation.
 [ADR-0011](../decisions/0011-governed-task-run-lifecycle.md) adds the next narrow operating
 contract. A governed launch proposes a distinct task ID and must receive authoritative daemon
 registration before PTY creation. The daemon persists the run in `.impulse/GOVERNED_TASKS.json`,
@@ -264,6 +277,14 @@ The executable command registry is defined by Clap in `impulse-rs/src/cli.rs` an
   `compute-injection`, `verify`, `search-history`, `search-genome`, `index-memory`,
   `retrieval-status`, `steward`, `swarm`
 - **Agent and platform integration:** `hooks`, `validate-hooks`, `list-providers`,
+  `agent-configure`, `agent-status`, `agent-query`, `guard`, `ion-verify`, `mcp serve`
+- **Tools and content:** `tools`, `tooling-list`, `tooling-describe`, `tooling-run`,
+  `tooling-schema`, `tooling-validate`, `tooling-reload`, `docs`, `model`, `office`,
+  `credentials`, `extract`, `calc`, `exec`
+- **Build and source operations:** `sweep`, `wipe`, `clean-all`, `sccache-setup`, `build-health`,
+  `sem-diff`, `sem-blame`, `sem-impact`, `sem-status`, `analytics`
+- **Machine-readable extension surfaces:** `describe`, `schema`, `plugin-list`, `plugin-invoke`
+
   `agent-configure`, `agent-status`, `agent-query`, `guard`, `ion-verify`, `governed-claim`,
   `governed-verify`, `governed-review`, `governed-promote`, `governed-discard`, `mcp serve`
 
@@ -391,6 +412,7 @@ Daemon overlay rules:
 - Stop overlaying stale telemetry after 10 seconds.
 - Purge telemetry-only state after 60 seconds.
 
+### Daemon IPC Contract (PROTOCOL_VERSION = 3)
 ### Daemon IPC Contract (PROTOCOL_VERSION = 6)
 
 The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec: [`docs/IPC-PROTOCOL.md`](../IPC-PROTOCOL.md).
@@ -496,6 +518,7 @@ Contributor verification before completion remains mandatory even though the ses
 `--verify` optional.
 
 External runtime enforcement is limited to launch conditions, working-directory/project scoping,
+and supported integration seams. Structural filesystem isolation depends on runtime/sandbox support.
 supported integration seams, and the daemon-owned task transition boundary. Structural filesystem
 isolation depends on runtime/sandbox support. The daemon socket directory/socket/PID file are
 restricted to the local user (`0700`/`0600`/`0600`), which protects the OS-user boundary but does
@@ -546,6 +569,7 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 | Tooling | ≥2.0 | ~17.1 | MET |
 | Integration | Every stable CLI command | 26 tests | PARTIAL |
 
+**Workspace totals (2026-07-12 canonical projection):** 1,950 tests across the 5 workspace crates/packages (impulse-rs 1,576, ops 44 including the canonical-checkout archive proof, term 114, desktop 193, ion 23); 9 ignored, 0 failed. The verified isolated worktree without the gitignored reconciliation archive reports 1,949 passed with that one proof explicitly filtered.
 **Workspace totals:** The final `cargo test --workspace` output for the current checkout is the
 authority; record its package-level passed, ignored, and failed totals in commit/PR evidence rather
 than freezing a moving aggregate in this contract. Default tests must depend only on tracked source

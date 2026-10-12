@@ -1,0 +1,13 @@
+{
+  "impulse": {
+    "enabled": true,
+    "hooks": {
+      "file_write": "impulse-rs track-write --file \"$OPENCODE_FILE\" --session-id \"$IMPULSE_SESSION_ID\"",
+      "pre_tool_use": "impulse-rs guard --action \"$INPUT\" --target any",
+      "session_end": "impulse-rs session-end --session-id $IMPULSE_SESSION_ID --summary '$OPENCODE_SESSION_SUMMARY' --verify",
+      "session_start": "impulse-rs session-start -n '$OPENCODE_PROJECT_NAME' -p opencode",
+      "tool_use": "impulse-rs track-tool --tool \"$OPENCODE_TOOL_NAME\" --session-id \"$IMPULSE_SESSION_ID\""
+    },
+    "session_tracking": true
+  }
+}

@@ -1,4 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
+
+pub use impulse_ops::agent_registry::AgentPlatformId;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -31,6 +35,7 @@ use crate::bridge::{
 
 /// Tasks are copied into `IMPULSE_TASK`; keep that environment value bounded
 /// and measure the wire-compatible UTF-8 representation rather than chars.
+const MAX_GOVERNED_TASK_BYTES: usize = 8 * 1024;
 const MAX_GOVERNED_TASK_BYTES: usize = impulse_ops::governed_task::MAX_GOVERNED_TASK_BYTES;
 const GOVERNED_GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const GOVERNED_GIT_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -531,6 +536,9 @@ struct RuntimeState {
     used_agent_ids: HashSet<String>,
 }
 
+struct DesktopRuntimeInner {
+    state: Mutex<RuntimeState>,
+    sink: Arc<dyn DesktopEventSink>,
 #[derive(Default)]
 struct LaunchCallbackGate {
     open: Mutex<bool>,
@@ -582,6 +590,7 @@ impl Drop for DesktopRuntimeInner {
             .map(|(_, record)| record)
             .collect::<Vec<_>>();
         for record in records {
+            record.backend.kill();
             if let Err(error) = record.backend.kill() {
                 let message = format!(
                     "desktop shutdown could not confirm runtime termination for {}: {error}",
@@ -657,6 +666,12 @@ impl DesktopRuntime {
         DesktopRuntimeBuilder {
             sink: Arc::new(NoopEventSink),
             governed_task_gateway: None,
+        }
+    }
+
+    pub fn downgrade(&self) -> WeakDesktopRuntime {
+        WeakDesktopRuntime {
+            inner: Arc::downgrade(&self.inner),
         }
     }
 
@@ -801,6 +816,14 @@ impl DesktopRuntime {
         } else {
             request.mcp_tools.clone()
         };
+        let lifecycle_guard = self
+            .inner
+            .lifecycle_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        {
+            let mut state = self.lock_state();
+            if !state.used_agent_ids.insert(agent_id.clone()) {
         let governed_routing = if request.verification_profile.is_some() {
             Some(
                 self.inner
@@ -934,6 +957,7 @@ impl DesktopRuntime {
                 });
             }
         }
+        let env_pairs = runtime_env(&agent_id, &request, &command, workspace.as_ref());
         let env_pairs = runtime_env(
             &agent_id,
             &request,
@@ -980,6 +1004,10 @@ impl DesktopRuntime {
         });
         let exit_agent_id = agent_id.clone();
         let exit_runtime = Arc::downgrade(&self.inner);
+        let exit_callback = Arc::new(move || {
+            let Some(runtime) = exit_runtime.upgrade() else {
+                return;
+            };
         let exit_launch_gate = Arc::clone(&launch_callback_gate);
         let exit_governed_task = governed_task
             .as_ref()
@@ -1038,6 +1066,21 @@ impl DesktopRuntime {
                     .lifecycle_events
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let removed = runtime
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .agents
+                    .remove(&exit_agent_id);
+                let should_emit = removed.is_some();
+                drop(removed);
+                should_emit
+                    && runtime
+                        .lifecycle_dispatcher
+                        .enqueue(DesktopEvent::TerminalExit {
+                            agent_id: exit_agent_id.clone(),
+                        })
+            };
                 runtime
                     .lifecycle_dispatcher
                     .enqueue(DesktopEvent::TerminalExit {
@@ -1495,6 +1538,7 @@ impl DesktopRuntime {
                 session_id: request.session_id.clone(),
             },
         )?;
+        record.backend.kill();
         let governed_task = record.governed_task.clone();
         if let Err(error) = record.backend.kill() {
             self.lock_state()
@@ -1515,6 +1559,9 @@ impl DesktopRuntime {
             });
         drop(record);
         drop(lifecycle_guard);
+        if should_drain {
+            self.inner.lifecycle_dispatcher.drain();
+        }
         let governed_error = if let (Some(task), Some(gateway)) = (
             governed_task.as_ref(),
             self.inner.governed_task_gateway.as_ref(),
@@ -4045,6 +4092,8 @@ mod tests {
     }
 
     #[test]
+    fn test_compatible_assignment_and_task_survive_canonicalized_spawn_snapshot() {
+        let runtime = DesktopRuntime::default();
     fn test_governed_registration_failure_creates_no_pty_and_reserves_no_agent_id() {
         let gateway = Arc::new(TestGovernedTaskGateway::rejecting());
         let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway;
@@ -4323,6 +4372,7 @@ mod tests {
 
     #[test]
     fn test_optional_gap_allows_spawn_and_preserves_degraded_snapshot() {
+        let runtime = DesktopRuntime::default();
         let (runtime, _) = runtime_with_task_gateway();
         let mut request = spawn_request(24, 80, Some("sh"));
         let _workspace = bind_to_temporary_workspace(&mut request);
@@ -4612,6 +4662,7 @@ mod tests {
             true,
         ));
 
+        let env = runtime_env("agent-1", &request, "sh", None);
         let env = runtime_env("agent-1", &request, "sh", None, None, None);
         assert!(env
             .iter()

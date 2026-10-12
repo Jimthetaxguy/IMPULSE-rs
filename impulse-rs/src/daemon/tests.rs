@@ -14,6 +14,8 @@ mod tests {
     // super::super = daemon module (tests.rs is daemon::tests, inner mod is daemon::tests::tests)
     use super::super::actor_provenance::ConnectionClass;
     use super::super::handlers::{
+        handle_delegation_request, handle_guard_request, handle_ops_request, handle_plugin_request,
+        handle_session_request, handle_status, handle_steward_request,
         handle_delegation_request, handle_governed_task_request, handle_guard_request,
         handle_ops_request, handle_plugin_request, handle_session_request, handle_status,
         handle_steward_request,
