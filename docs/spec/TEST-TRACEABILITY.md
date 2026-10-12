@@ -1,8 +1,8 @@
 ---
 title: Test Traceability Matrix
 description: Story-to-test coverage map for the current Rust Impulse workspace and open validation gaps
-version: '1.3'
-updated: 2026-07-15
+version: '1.2'
+updated: 2026-07-13
 type: specification
 category: testing
 phase: all
@@ -44,7 +44,7 @@ authors:
 | ST-10 Review risky context and stewardship actions explicitly | stewardship modules, guardrail and approval surfaces, integration enhancement coverage | Thin | stewardship command dispatch and operator decision paths need clearer regression tests |
 | ST-11 Enforce verification-before-completion | `impulse-rs/src/validate.rs`, recent invalid-direct-request fixes, session-end verify flows | Strong | manual operator acceptance still matters for claim wording, but automated coverage is present |
 | ST-12 Prove the real hook memory loop before expanding claims | `impulse-rs/tests/hook_validation_session_start.rs`, `hook_validation_precompact.rs`, `hook_validation_extraction_benchmark.rs`, `docs/guides/HOOK-VALIDATION-GUIDE.md` | Manual | the code can generate evidence, but product truth still depends on real external hook runs |
-| ST-13 Complete one governed supervisor-and-builder vertical slice | `impulse-rs/impulse-ops/src/memory_candidate.rs` plus governed contract tests; `impulse-rs/src/{governed_producers.rs,state/{governed_task,memory_candidate}.rs,agent/mod.rs}` plus daemon protocol/handler tests; `impulse-rs/tests/governed_process_flow.rs`; desktop runtime/contract/SSR tests and `impulse-term` process tests | Moderate | state/contract/UI tests prove deterministic pending-candidate staging, replay/startup repair, provenance shape, and no `GENOME`/`HISTORY` mutation; the real daemon/CLI/child-process test still stops at `awaiting_supervisor`. One process must compose launched Builder and Supervisor runtimes through acceptance and candidate observation; semantic promotion/dismissal remains later |
+| ST-13 Complete one governed supervisor-and-builder vertical slice | `impulse-rs/impulse-ops/src/{role_assignment.rs,agent_registry.rs,lib.rs}`, `impulse-rs/impulse-desktop/src/{ui.rs,runtime.rs,daemon_ops.rs,mcp.rs}`, `impulse-rs/impulse-desktop/tests/{runtime.rs,desktop_contract.rs}`, `impulse-rs/src/ops_workbench.rs`, and daemon supervisor/publish-subscribe tests | Moderate | focused tests prove the Builder task/assignment request, static compatibility preview, stale-catalog fail-closed behavior, canonical workspace binding, mandatory rejection before agent-id/PTY creation, optional degradation, and typed telemetry preservation; no single E2E yet binds supervisor and builder governed runs and carries evidence through verification, supervisor judgment, and operator approval |
 
 ## High-Signal Existing Test Surfaces
 
@@ -123,11 +123,8 @@ authors:
 
 These gaps matter because they sit on stable or nearly stable public interfaces:
 
-1. Add one complete launched-runtime governed supervisor-and-builder E2E
-   Reason: the daemon-owned claim/verification/review chain is proven compositionally, and the
-   claim/verification/restart path is proven with real processes. One proof must still launch the
-   Builder through DesktopRuntime, run the configured API Supervisor path in the same workflow,
-   carry evidence into operator acceptance, and observe exactly one deterministic pending candidate.
+1. Add one governed supervisor-and-builder vertical-slice E2E
+   Reason: registry-backed launch, terminal write/focus/close, supervisor permission checks, and daemon-owned telemetry are proven separately; one process-level test must bind two runtime instances to explicit roles and a task, then carry builder output and verification evidence through supervisor review and operator acceptance.
 2. Add a packaged desktop-to-real-daemon E2E
    Reason: Unix client framing, real handler reconciliation, reducer behavior, and browser-host readiness are proven separately; one process-level test must connect those boundaries before calling the full desktop path closed.
 3. Add multi-workspace daemon-routing tests
@@ -155,24 +152,16 @@ These gaps matter because they sit on stable or nearly stable public interfaces:
 
 - the stable CLI contract needs broader regression coverage than it currently has
 - single-project daemon-truth GUI behavior has direct automated evidence; multi-workspace routing remains an active delivery lane
-- daemon-owned profiled claims, detached Rust verification, and strict API Supervisor review are live
-  and directly tested; the broader supervisor/builder claim remains incomplete until one process
-  composes launched runtimes through acceptance and observes exactly one staged candidate
-- accepted-run candidate staging is live and directly tested as a review-only materialized view;
-  explicit promotion/dismissal and curated-memory mutation remain later contracts
+- the governed supervisor/builder claim remains incomplete until one E2E binds the live launch preflight to supervisor policy, evidence, verification, judgment, and approval
 - narrow static product-role launch preflight is live; generalized role composition and dynamic runtime capability negotiation remain target-only and must not be inferred from it
 - validation evidence should continue to gate stronger marketing or architectural claims
 
 ## Recommended Test Expansion Order
 
-1. Add the complete launched-runtime governed supervisor/builder E2E across DesktopRuntime launch,
-   daemon-derived claim/verification, API Supervisor review, operator approval, and exact candidate
-   observation.
+1. Add the governed supervisor/builder E2E across launch, assignment, daemon observation, confirmed intervention, verification evidence, review, and approval.
 2. Add a packaged desktop-to-real-daemon E2E across publish, subscribe, host event, and reducer boundaries.
 3. Add multi-workspace daemon routing and cross-project isolation tests.
 4. Extend daemon client/handler coverage to artifact list/get/action paths.
 5. Add stable CLI mutation tests that assert real `.impulse/*` state transitions.
 6. Add stewardship integration tests with proposal and approval artifact assertions.
 7. Keep hook validation evidence generation automated, but treat real external hook runs as release-gating proof.
-8. After the launched workflow is closed, define and test explicit candidate promotion/dismissal,
-   semantic conflict handling, and the curated-memory audit boundary.

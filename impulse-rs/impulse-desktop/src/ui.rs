@@ -3,20 +3,9 @@ use std::collections::{BTreeMap, HashMap};
 use dioxus::prelude::*;
 use impulse_ops::{
     agent_registry::AgentPlatformInfo,
-    governed_task::{
-        GovernedActor, GovernedActorKind, GovernedPromotion, GovernedPromotionOutcome,
-        GovernedRequestId, GovernedReviewState, GovernedTaskMutation, GovernedTaskMutationRequest,
-        GovernedTaskRun, GovernedVerificationProfile, OperatorDecisionInput, OperatorDecisionKind,
-        PromotionBlockedReason, SupervisorVerdictInput, SupervisorVerdictKind,
-    },
-    governed_wiring::{
-        governed_outcome_is_promotable, staged_worktree_is_discardable,
-        unreferenced_accepted_commit_on_discard, GovernedPromotionRequest,
-        GovernedStagedWorktreeDiscardRequest, StagedConfigRefusalReason,
-    },
     role_assignment::{
-        canonical_governed_builder_assignment, evaluate_role_compatibility, AgentRoleAssignment,
-        EnforcementStrength, RoleAssignmentError,
+        evaluate_role_compatibility, AgentRoleAssignment, AgentRoleId, EnforcementStrength,
+        RoleAssignmentError, RoleCapabilityRequirement, RuntimeCapabilityId,
     },
     ProjectOpsSnapshot,
 };
@@ -714,105 +703,6 @@ pub struct BridgeStatusUpdate {
     pub reason: Option<String>,
 }
 
-/// A promotion acknowledgement carried `pending_rerun_reason`: a crashed
-/// producer's reservation was reconciled and its work is being redone.
-pub const GOVERNED_RERUN_PENDING_STATUS: &str = "governed_promotion_rerun_pending";
-
-/// A discard acknowledgement carried `unreferenced_accepted_commit`: the
-/// checkout that just went away held the only ref to an accepted commit.
-pub const GOVERNED_UNREFERENCED_COMMIT_STATUS: &str = "governed_discard_unreferenced_commit";
-
-/// Which acknowledgement fact a [`GovernedAckNotice`] carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GovernedAckKind {
-    /// A discard dropped the only ref to an accepted commit.
-    DiscardStrandedCommit,
-    /// A promotion is redoing an interrupted producer's work.
-    PromotionRerunPending,
-    /// Promotion refused to run; the task and its revision are unchanged.
-    PromotionRefused,
-}
-
-impl GovernedAckKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::DiscardStrandedCommit => "discard_stranded_commit",
-            Self::PromotionRerunPending => "promotion_rerun_pending",
-            Self::PromotionRefused => "promotion_refused",
-        }
-    }
-}
-
-/// A fact that exists **only** on a governed acknowledgement, held per task
-/// until the operator dismisses it.
-///
-/// Review round 3, P2. These were forwarded through the transient
-/// `bridge_status` slot, which every successfully reduced bridge message
-/// clears. A discard is immediately followed by an `ops_update`, so the only
-/// post-action copy of a stranded commit's OID and its recovery command could
-/// vanish before the operator finished reading the banner — the exact failure
-/// the round-1 fix was meant to prevent, moved one layer out.
-///
-/// So the banner stays as the transient *echo* and this is the durable record:
-/// keyed by task id, rendered on that task's card, cleared only by an explicit
-/// Dismiss, and never touched by `ops_update`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GovernedAckNotice {
-    pub task_id: String,
-    pub kind: GovernedAckKind,
-    /// The stranded commit, when there is one. Kept as its own field rather
-    /// than only inside `detail` so a surface can render it as a selectable
-    /// token instead of prose an operator has to re-type.
-    #[serde(default)]
-    pub commit: Option<String>,
-    #[serde(default)]
-    pub discarded_root: Option<String>,
-    pub detail: String,
-}
-
-impl GovernedAckNotice {
-    /// Extract a governed acknowledgement notice from a bridge message, or
-    /// `None` for any other message kind or a payload missing its identity.
-    ///
-    /// A notice with no task id is dropped: it could not be filed against a
-    /// card, and silently keying it under an empty string would attach one
-    /// task's stranded commit to another's.
-    pub fn parse(message: &DesktopBridgeMessage) -> Option<Self> {
-        if message.kind != "governed_ack" {
-            return None;
-        }
-        let mut notice: Self = serde_json::from_value(message.payload.clone()).ok()?;
-        if notice.kind == GovernedAckKind::PromotionRefused {
-            let reason: StagedConfigRefusalReason =
-                serde_json::from_value(message.payload.get("reason")?.clone()).ok()?;
-            let remedy = message.payload.get("remedy")?.as_str()?;
-            if remedy.trim().is_empty() {
-                return None;
-            }
-            let refusal = staged_config_refusal_notice(&reason, remedy);
-            notice.detail = format!("{}\n{}", refusal.headline, refusal.remedy);
-        }
-        if notice.task_id.trim().is_empty() || notice.detail.trim().is_empty() {
-            return None;
-        }
-        Some(notice)
-    }
-
-    /// Human-facing one-liner for the card.
-    pub fn headline(&self) -> &'static str {
-        match self.kind {
-            GovernedAckKind::DiscardStrandedCommit => {
-                "This discard dropped the only ref to an accepted commit"
-            }
-            GovernedAckKind::PromotionRerunPending => {
-                "This promotion is redoing an interrupted producer's work"
-            }
-            GovernedAckKind::PromotionRefused => "Promotion refused; the task is unchanged",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DaemonOpsStatusUpdate {
     pub connected: bool,
@@ -1160,7 +1050,26 @@ fn McpReadOnlyRow(tool_name: String, on_invoke: EventHandler<McpInvokeRequest>) 
 /// runtime. Structural filesystem scope is requested as an optional capability
 /// so its current absence remains visible without overstating cwd mediation.
 pub fn builder_role_assignment() -> Result<AgentRoleAssignment, RoleAssignmentError> {
-    Ok(canonical_governed_builder_assignment())
+    Ok(AgentRoleAssignment {
+        role: AgentRoleId::try_new("builder")?,
+        requirements: vec![
+            RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::try_new("workspace.target")?,
+                minimum_enforcement: EnforcementStrength::Mediated,
+                mandatory: true,
+            },
+            RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::try_new("process.lifecycle")?,
+                minimum_enforcement: EnforcementStrength::Mediated,
+                mandatory: true,
+            },
+            RoleCapabilityRequirement {
+                capability: RuntimeCapabilityId::try_new("filesystem.scoped")?,
+                minimum_enforcement: EnforcementStrength::Structural,
+                mandatory: false,
+            },
+        ],
+    })
 }
 
 /// Builds the exact governed launch request accepted by the workspace launcher.
@@ -1168,43 +1077,28 @@ pub fn builder_role_assignment() -> Result<AgentRoleAssignment, RoleAssignmentEr
 /// This is also the launch preflight: missing or stale catalog entries,
 /// evaluator errors, blocked role compatibility, blank tasks, and invalid
 /// launch roots all return an error before a request can reach the host bridge.
-pub struct GovernedAgentSpawnInput<'a> {
-    pub launch_root: &'a str,
-    pub selected_platform_id: &'a str,
-    pub agent_id: &'a str,
-    pub command: &'a str,
-    pub task: &'a str,
-    pub acceptance_criteria: &'a str,
-}
-
 pub fn build_governed_agent_spawn_request(
     workspaces: &[WorkspaceEntry],
     platforms: &[AgentPlatformInfo],
-    input: GovernedAgentSpawnInput<'_>,
+    launch_root: &str,
+    selected_platform_id: &str,
+    agent_id: &str,
+    command: &str,
+    task: &str,
 ) -> Result<AgentSpawnRequest, String> {
-    let root = input.launch_root.trim();
+    let root = launch_root.trim();
     if root.is_empty() {
         return Err("a workspace root is required".to_string());
     }
 
-    let task = input.task.trim();
+    let task = task.trim();
     if task.is_empty() {
         return Err("a governed task is required".to_string());
-    }
-    let acceptance_criteria = input
-        .acceptance_criteria
-        .lines()
-        .map(str::trim)
-        .filter(|criterion| !criterion.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if acceptance_criteria.is_empty() {
-        return Err("at least one acceptance criterion is required".to_string());
     }
 
     let descriptor = platforms
         .iter()
-        .find(|candidate| candidate.id.as_str() == input.selected_platform_id)
+        .find(|candidate| candidate.id.as_str() == selected_platform_id)
         .ok_or_else(|| "the selected platform is absent from the current catalog".to_string())?;
     let role_assignment = builder_role_assignment()
         .map_err(|error| format!("invalid Builder role assignment: {error}"))?;
@@ -1218,9 +1112,9 @@ pub fn build_governed_agent_spawn_request(
         return Err("the selected platform is blocked for the Builder role".to_string());
     }
 
-    let platform = AgentPlatformId::try_new(input.selected_platform_id.to_string())
+    let platform = AgentPlatformId::try_new(selected_platform_id.to_string())
         .map_err(|error| format!("invalid selected platform: {error}"))?;
-    let agent_id = optional_text(input.agent_id.to_string());
+    let agent_id = optional_text(agent_id.to_string());
     let session_id = agent_id.as_ref().map(|value| format!("{value}-session"));
     let workspace = workspaces
         .iter()
@@ -1232,7 +1126,7 @@ pub fn build_governed_agent_spawn_request(
         agent_id,
         session_id,
         platform,
-        command: optional_text(input.command.to_string()),
+        command: optional_text(command.to_string()),
         args: Vec::new(),
         cwd: Some(root.to_string()),
         env: HashMap::new(),
@@ -1243,10 +1137,6 @@ pub fn build_governed_agent_spawn_request(
         role: None,
         task: Some(task.to_string()),
         role_assignment: Some(role_assignment),
-        acceptance_criteria,
-        verification_profile: Some(
-            impulse_ops::governed_task::GovernedVerificationProfile::RustWorkspaceV1,
-        ),
         target: None,
     })
 }
@@ -1277,7 +1167,6 @@ fn WorkspaceLaunchPanel(
     let mut agent_id = use_signal(String::new);
     let mut command = use_signal(String::new);
     let mut task = use_signal(String::new);
-    let mut acceptance_criteria = use_signal(String::new);
 
     let first_workspace_root = workspaces
         .first()
@@ -1335,14 +1224,11 @@ fn WorkspaceLaunchPanel(
     let launch_request = build_governed_agent_spawn_request(
         &workspaces,
         &platforms,
-        GovernedAgentSpawnInput {
-            launch_root: &launch_root,
-            selected_platform_id: &selected_platform_id,
-            agent_id: &agent_id(),
-            command: &command(),
-            task: &task(),
-            acceptance_criteria: &acceptance_criteria(),
-        },
+        &launch_root,
+        &selected_platform_id,
+        &agent_id(),
+        &command(),
+        &task(),
     );
     let can_launch = launch_request.is_ok();
     let request_for_launch = launch_request.ok();
@@ -1353,12 +1239,7 @@ fn WorkspaceLaunchPanel(
             header { class: "section-header",
                 div {
                     h2 { "Workspace Launcher" }
-                    p { "Register a Rust workspace, then launch a governed Builder from the runtime registry inside it." }
-                }
-                span {
-                    class: "workspace-launch-badge",
-                    "data-verification-profile": "rust_workspace_v1",
-                    "MCP audited · Rust-only · rust_workspace_v1"
+                    p { "Register a folder, then launch any agent from the runtime registry inside it." }
                 }
             }
             div { class: "workspace-launch-grid",
@@ -1495,18 +1376,6 @@ fn WorkspaceLaunchPanel(
                         placeholder: "Describe the explicit assignment",
                         value: "{task}",
                         oninput: move |evt| task.set(evt.value()),
-                    }
-                }
-                label {
-                    class: "workspace-field wide",
-                    "data-field": "launch-acceptance-criteria",
-                    span { "Acceptance criteria" }
-                    textarea {
-                        required: true,
-                        "aria-required": "true",
-                        placeholder: "One verifiable criterion per line",
-                        value: "{acceptance_criteria}",
-                        oninput: move |evt| acceptance_criteria.set(evt.value()),
                     }
                 }
                 div {
@@ -3138,12 +3007,6 @@ pub fn DesktopShellWithSnapshot(
     #[props(default)] review_queue: Vec<ReviewQueueItem>,
     #[props(default)] bridge_status: Option<BridgeStatusUpdate>,
     #[props(default)] daemon_ops_status: Option<DaemonOpsStatusUpdate>,
-    /// Acknowledgement facts held per task until the operator dismisses them
-    /// (review round 3, P2). Deliberately separate from `bridge_status`: that
-    /// slot is transient and every reduced bridge message clears it.
-    #[props(default)]
-    governed_acks: BTreeMap<String, GovernedAckNotice>,
-    #[props(default)] on_dismiss_governed_ack: Option<EventHandler<String>>,
     #[props(default = DesktopView::Terminal)] initial_view: DesktopView,
 ) -> Element {
     let context = &snapshot.context;
@@ -3168,10 +3031,6 @@ pub fn DesktopShellWithSnapshot(
     let daemon_publish_degraded = daemon_ops_status
         .as_ref()
         .is_some_and(|status| status.connected && status.error.is_some());
-    let daemon_publish_error = daemon_ops_status
-        .as_ref()
-        .and_then(|status| status.error.as_deref())
-        .unwrap_or("a daemon-owned lifecycle write was not acknowledged");
     let daemon_label = if daemon_publish_degraded {
         "online · publish degraded"
     } else if daemon_online {
@@ -3344,8 +3203,8 @@ pub fn DesktopShellWithSnapshot(
                     class: "bridge-status-banner",
                     "data-daemon-status": "publish-degraded",
                     role: "status",
-                    strong { "Lifecycle synchronization degraded" }
-                    span { "{daemon_publish_error}. Daemon snapshot reads remain live; reconcile daemon-owned task state before deciding." }
+                    strong { "Telemetry publish degraded" }
+                    span { "Daemon snapshot reads remain live; desktop lifecycle writes will retry." }
                 }
             }
             div { class: "workspace-grid",
@@ -3605,10 +3464,6 @@ pub fn DesktopShell() -> Element {
     let mut last_invocations = use_signal(Vec::<McpInvocation>::new);
     let mut bridge_status = use_signal(|| None::<BridgeStatusUpdate>);
     let mut daemon_ops_status = use_signal(|| None::<DaemonOpsStatusUpdate>);
-    // Acknowledgement facts, per task, cleared only by an explicit Dismiss.
-    // Deliberately not folded into `bridge_status`, which every successfully
-    // reduced message resets (review round 3, P2).
-    let mut governed_acks = use_signal(BTreeMap::<String, GovernedAckNotice>::new);
 
     use_effect(move || {
         let _agent_mount_count = runtime_agents().len();
@@ -3623,12 +3478,6 @@ pub fn DesktopShell() -> Element {
             while let Ok(message) = eval.recv::<DesktopBridgeMessage>().await {
                 if let Some(update) = DaemonOpsStatusUpdate::parse(&message) {
                     daemon_ops_status.set(Some(update));
-                    continue;
-                }
-                // Durable per-task record. Taken before the status branch so a
-                // later banner reset cannot take the OID with it.
-                if let Some(notice) = GovernedAckNotice::parse(&message) {
-                    governed_acks.write().insert(notice.task_id.clone(), notice);
                     continue;
                 }
                 // Status messages update the operator banner. A platform
@@ -3686,10 +3535,6 @@ pub fn DesktopShell() -> Element {
             last_invocations: last_invocations(),
             bridge_status: bridge_status(),
             daemon_ops_status: daemon_ops_status(),
-            governed_acks: governed_acks(),
-            on_dismiss_governed_ack: move |task_id: String| {
-                governed_acks.write().remove(&task_id);
-            },
         }
     }
 }

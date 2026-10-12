@@ -43,5 +43,6 @@ cd impulse-rs/impulse-ops
 cargo build && cargo test && cargo clippy -- -D warnings
 ```
 
-The default suite uses tracked source and fixtures, so fresh clones, linked worktrees, and CI run the
-same contract proof. It is also part of the workspace gate (`cd impulse-rs && cargo test`).
+Current canonical projection: 44 passing tests, 0 ignored, 0 failed. A linked worktree without the
+gitignored reconciliation archive runs 43 and filters the one checkout-relative archive proof.
+Part of the workspace gate (`cd impulse-rs && cargo test`).

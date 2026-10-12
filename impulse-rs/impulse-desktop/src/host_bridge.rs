@@ -32,12 +32,10 @@ use tokio::sync::mpsc::{
 use crate::host_commands::{
     self, DesktopShellState, AGENT_CLOSE_COMMAND, AGENT_FOCUS_COMMAND, AGENT_PLATFORMS_COMMAND,
     AGENT_RESIZE_COMMAND, AGENT_SNAPSHOT_COMMAND, AGENT_SPAWN_COMMAND, AGENT_WRITE_COMMAND,
-    GOVERNED_OUTCOME_PROMOTE_COMMAND, GOVERNED_STAGED_WORKTREE_DISCARD_COMMAND,
-    GOVERNED_TASK_MUTATE_COMMAND, LIST_WORKSPACES_COMMAND, MCP_DESCRIPTORS_COMMAND,
-    MCP_INVOKE_COMMAND, NATIVE_ISLAND_REQUEST_COMMAND, REGISTER_WORKSPACE_COMMAND,
-    REVIEW_DECISION_COMMAND, REVIEW_QUEUE_COMMAND, SUPERVISOR_LOCAL_ACTION_COMMAND,
-    TERMINAL_CLOSE_COMMAND, TERMINAL_FOCUS_COMMAND, TERMINAL_OPEN_COMMAND, TERMINAL_RESIZE_COMMAND,
-    TERMINAL_WRITE_COMMAND,
+    LIST_WORKSPACES_COMMAND, MCP_DESCRIPTORS_COMMAND, MCP_INVOKE_COMMAND,
+    NATIVE_ISLAND_REQUEST_COMMAND, REGISTER_WORKSPACE_COMMAND, REVIEW_DECISION_COMMAND,
+    REVIEW_QUEUE_COMMAND, SUPERVISOR_LOCAL_ACTION_COMMAND, TERMINAL_CLOSE_COMMAND,
+    TERMINAL_FOCUS_COMMAND, TERMINAL_OPEN_COMMAND, TERMINAL_RESIZE_COMMAND, TERMINAL_WRITE_COMMAND,
 };
 use crate::runtime::{DesktopEvent, DesktopEventSink};
 
@@ -450,9 +448,7 @@ pub fn LiveDesktopApp() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::{
-        AgentPlatformId, DesktopRuntime, GovernedTaskGateway, LocalSupervisorAction,
-    };
+    use crate::runtime::{AgentPlatformId, DesktopRuntime, LocalSupervisorAction};
     use crate::workspace::WorkspaceRegistry;
     use crate::McpToolRegistry;
     use serde_json::json;
@@ -778,69 +774,6 @@ setImmediate(async () => {{
             .filter_map(|value| value.get("id").and_then(Value::as_str))
             .collect::<Vec<_>>();
         assert!(ids.contains(&"ion"), "missing Ion platform: {ids:?}");
-    }
-
-    #[tokio::test]
-    async fn dispatch_governed_task_mutation_returns_daemon_acknowledgment() {
-        let task: impulse_ops::governed_task::GovernedTaskRun = serde_json::from_value(json!({
-            "id": "task-host-dispatch",
-            "revision": 0,
-            "project_id": "impulse-rs",
-            "workspace_root": "/tmp/impulse-rs",
-            "task": "Exercise the live host governed-task route",
-            "runtime_id": "codex",
-            "agent_id": "codex-live",
-            "execution_state": "running",
-            "review_state": "awaiting_claim",
-            "claims": [],
-            "verifications": [],
-            "supervisor_verdicts": [],
-            "operator_decisions": [],
-            "events": [],
-            "created_at": "2026-07-13T20:00:00Z",
-            "updated_at": "2026-07-13T20:00:00Z"
-        }))
-        .unwrap();
-        let gateway = Arc::new(AcknowledgingGovernedGateway {
-            task,
-            mutations: Mutex::new(Vec::new()),
-        });
-        let state = test_state_with_governed_gateway(gateway.clone());
-        let response = dispatch_host_invoke(
-            &state,
-            HostInvokeRequest {
-                id: "governed-host".to_string(),
-                command: GOVERNED_TASK_MUTATE_COMMAND.to_string(),
-                payload: json!({
-                    "request": {
-                        "request_id": "req-host-dispatch",
-                        "project_id": "impulse-rs",
-                        "task_id": "task-host-dispatch",
-                        "expected_revision": 0,
-                        "mutation": {
-                            "kind": "mark_runtime_exited",
-                            "data": {
-                                "actor": { "kind": "system", "id": "desktop-runtime" },
-                                "reason": "test exit"
-                            }
-                        }
-                    }
-                }),
-            },
-        )
-        .await;
-
-        assert!(response.ok, "{:?}", response.error);
-        assert_eq!(response.result["id"], "task-host-dispatch");
-        assert_eq!(response.result["revision"], 1);
-        assert_eq!(
-            gateway
-                .mutations
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .len(),
-            1
-        );
     }
 
     #[tokio::test]

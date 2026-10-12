@@ -394,11 +394,7 @@ impl ImpulseAgent {
             config: ImpulseAgentConfig {
                 mode: AgentMode::Api {
                     provider: ImpulseProvider::Anthropic,
-                    // Keep the raw configuration unresolved so governed
-                    // provenance tests exercise the production `model=None`
-                    // path. `Agent::new` owns the resolved model actually sent
-                    // to the provider.
-                    model: None,
+                    model: Some(model.clone()),
                 },
                 ..ImpulseAgentConfig::default()
             },
@@ -422,11 +418,6 @@ impl ImpulseAgent {
     fn with_test_harness_command(mut self, command: impl Into<std::path::PathBuf>) -> Self {
         self.harness_command_override = Some(command.into());
         self
-    }
-
-    #[cfg(test)]
-    fn inner_agent_mut(&mut self) -> Option<&mut Agent> {
-        self.inner.as_mut()
     }
 
     fn resolve_harness_command(&self, harness: ImpulseHarness) -> std::path::PathBuf {
@@ -1759,13 +1750,12 @@ mod tests {
         );
     }
 
-    /// Writes an executable wrapper script that backgrounds a `sleep`
-    /// grandchild, publishes `"$$\n$child\n"` (wrapper pid, grandchild pid)
-    /// to `pid_file`, then blocks in `wait` like a hung harness CLI. The
-    /// pids let the proofs below observe only processes this test owns.
+    #[tokio::test]
     #[cfg(unix)]
-    fn write_pid_publishing_fake_harness(
-    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    async fn test_harness_query_kills_hung_child_instead_of_orphaning() {
+        // Regression test for full process-group cleanup on the explicit
+        // timeout path. The fake wrapper publishes its own PID and its sleep
+        // child's PID so the proof observes only processes this test owns.
         let dir = tempfile::tempdir().expect("tempdir");
         let script_path = dir.path().join("claude");
         let pid_file = dir.path().join("harness-pids");
@@ -1785,98 +1775,33 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
         }
-        (dir, script_path, pid_file)
-    }
-
-    /// Polls until the fake harness has published both pids. The bound is a
-    /// liveness guard for a starved machine, not a timing assumption: the
-    /// callers below do nothing to the child until this has returned.
-    #[cfg(unix)]
-    async fn wait_for_published_pids(pid_file: &std::path::Path) -> Vec<u32> {
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                // The wrapper writes both lines in one `printf`; requiring the
-                // trailing newline rejects a torn read of the second pid.
-                if let Some(contents) = std::fs::read_to_string(pid_file)
-                    .ok()
-                    .filter(|contents| contents.ends_with('\n'))
-                {
-                    let pids = contents
-                        .lines()
-                        .filter_map(|line| line.parse::<u32>().ok())
-                        .collect::<Vec<_>>();
-                    if pids.len() == 2 {
-                        break pids;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("fake harness did not publish its wrapper and grandchild pids")
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_harness_query_kills_hung_child_instead_of_orphaning() {
-        // Regression test for full process-group cleanup on the explicit
-        // timeout path.
-        //
-        // Ordering is controlled rather than bet on. The query runs with an
-        // effectively infinite timeout while the test waits (bounded) for the
-        // pid file, then pauses tokio's clock and advances it past the
-        // deadline explicitly, so the `HarnessTimedOut` branch fires on the
-        // next runtime turn -- and only after both pids are known. The
-        // explicit `advance` is deliberate: the paused clock's *auto*-advance
-        // is suppressed while any blocking task is alive on the runtime, which
-        // would turn a future `spawn_blocking`/`tokio::fs` call in this code
-        // path into a silent one-hour hang instead of a failure. The previous
-        // shape passed a fixed 2 s timeout and read the pid file afterwards;
-        // under load (six concurrent cargo gates on 10 cores) `sh` had not
-        // reached its `printf` when the group was killed, and the test failed
-        // on its own precondition ("fake harness must publish ... before
-        // timeout: NotFound") rather than on the property under test.
-        const HARNESS_BUDGET: Duration = Duration::from_secs(3600);
-        let (_dir, script_path, pid_file) = write_pid_publishing_fake_harness();
         let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
         let agent = ImpulseAgent::new(config)
             .expect("harness agent should construct")
-            .with_test_harness_command(script_path);
-        let task = tokio::spawn(async move {
-            agent
-                .harness_query_structured_with_timeout("system", "hello", &[], None, HARNESS_BUDGET)
-                .await
-        });
+            .with_test_harness_command(script_path.clone());
 
-        let pids = wait_for_published_pids(&pid_file).await;
+        let result = agent
+            .harness_query_structured_with_timeout(
+                "system",
+                "hello",
+                &[],
+                None,
+                Duration::from_secs(2),
+            )
+            .await;
+        assert!(matches!(result, Err(AgentError::HarnessTimedOut { .. })));
 
-        tokio::time::pause();
-        tokio::time::advance(HARNESS_BUDGET).await;
-        let result = task.await.expect("harness query task must not panic");
-        tokio::time::resume();
-        match result {
-            Err(AgentError::HarnessTimedOut { command, seconds }) => {
-                assert!(
-                    command.ends_with("claude"),
-                    "timeout must identify the injected harness executable: {command}"
-                );
-                assert_eq!(
-                    seconds,
-                    HARNESS_BUDGET.as_secs(),
-                    "timeout must report the configured budget"
-                );
-            }
-            other => panic!("expected HarnessTimedOut, got: {other:?}"),
-        }
+        let contents = std::fs::read_to_string(&pid_file)
+            .expect("fake harness must publish wrapper and child pids before timeout");
+        let pids = contents
+            .lines()
+            .map(|line| line.parse::<u32>().expect("pid file must contain integers"))
+            .collect::<Vec<_>>();
+        assert_eq!(pids.len(), 2, "pid file must identify wrapper and child");
 
         if let Err(stray) =
             crate::test_support::wait_for_pids_to_exit(&pids, Duration::from_secs(10)).await
         {
-            let _ = tokio::process::Command::new("kill")
-                .arg("-KILL")
-                .args(pids.iter().map(u32::to_string))
-                .status()
-                .await;
             panic!("expected no orphaned harness processes after timeout; survivors: {stray}");
         }
     }
@@ -1884,11 +1809,29 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn test_aborting_harness_query_kills_the_whole_process_group() {
-        let (_dir, script_path, pid_file) = write_pid_publishing_fake_harness();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("claude");
+        let pid_file = dir.path().join("harness-pids");
+        std::fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nsleep 60 &\nchild=$!\nprintf '%s\\n%s\\n' \"$$\" \"$child\" > \"{}\"\nwait\n",
+                pid_file.display()
+            ),
+        )
+        .expect("write fake harness script");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("stat fake harness script")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
+        }
         let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
         let agent = ImpulseAgent::new(config)
             .expect("harness agent should construct")
-            .with_test_harness_command(script_path);
+            .with_test_harness_command(script_path.clone());
         let task = tokio::spawn(async move {
             agent
                 .harness_query_structured_with_timeout(
@@ -1901,7 +1844,22 @@ mod tests {
                 .await
         });
 
-        let pids = wait_for_published_pids(&pid_file).await;
+        let pids = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+                    let pids = contents
+                        .lines()
+                        .filter_map(|line| line.parse::<u32>().ok())
+                        .collect::<Vec<_>>();
+                    if pids.len() == 2 {
+                        break pids;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fake harness grandchild did not start");
 
         task.abort();
         let _ = task.await;

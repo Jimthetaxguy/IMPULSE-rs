@@ -6,25 +6,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod agent_registry;
-pub mod governed_task;
-pub mod governed_wiring;
-pub mod memory_candidate;
-/// ADR-0020 promotion/dismissal wire contract (request types only).
-pub mod memory_wiring;
-pub mod operator_capability;
 pub mod role_assignment;
 
 /// Shared daemon protocol version for GUI/operator workbench compatibility.
-///
-/// v7 (ADR-0018) adds the connection-scoped `PresentOperatorCapability`
-/// request and the operator-class requirement on `RecordOperatorDecision`.
-/// v8 (ADR-0019) adds the staged-worktree and promotion mutations plus the
-/// `world_scope` registration field.
-/// v9 (this lane) adds the `PromoteGovernedOutcome` and
-/// `DiscardGovernedStagedWorktree` requests, staged materialization inside
-/// `RegisterGovernedTask`, and the flattened producer acknowledgements that
-/// carry `replayed` plus a reservation's `pending_rerun_reason`.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 9;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {

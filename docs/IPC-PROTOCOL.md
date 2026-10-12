@@ -1,7 +1,7 @@
 # Impulse IPC Protocol
 
 > Unix domain socket protocol between Impulse daemon and clients (GUI, CLI `--daemon` mode).
-> **Protocol version: 9** — see [Version section](#protocol-version) for upgrade notes.
+> **Protocol version: 3** — see [Version section](#protocol-version) for upgrade notes.
 
 ---
 
@@ -52,55 +52,13 @@ The daemon reports `protocol_version` in `Ping`/`Status` results.
 
 | Constant | Value | Location |
 |----------|-------|----------|
-| `DAEMON_PROTOCOL_VERSION` / `PROTOCOL_VERSION` | **9** | Shared ops contract / daemon protocol |
+| `EXPECTED_PROTOCOL_VERSION` | **3** | GUI client |
+| `PROTOCOL_VERSION` | **3** | Daemon (`src/daemon/protocol.rs`) |
 
 Current clients do **not** perform a version handshake or preflight-reject a mismatched daemon, and
 the protocol does not negotiate a downgrade. Known variants continue through normal JSON-line
 request/response decoding; an unknown request or response variant fails through the ordinary Serde
 or client error path. The reported number is observability, not negotiated compatibility.
-
-**Upgrading from v6:** v7 adds the connection-scoped `PresentOperatorCapability` request and makes
-`accepted` provenance-enforced (ADR-0018). Every accepted connection starts non-operator; presenting
-this daemon run's capability from a peer uid matching the daemon's raises that one connection to
-operator class. `MutateGovernedTask` with `RecordOperatorDecision` — and, for a task with a
-verification profile, `MarkRunning`/`MarkLaunchFailed`/`MarkRuntimeExited` — is rejected from a
-non-operator connection with a typed error, before the idempotency receipt is read, leaving the task
-revision unchanged. An old client keeps working for every other request. The accepted-run candidate
-derivation version moves to 2 and gains the `daemon_profiled_evidence_authenticated_operator`
-assurance; a `MEMORY_CANDIDATES.json` written at version 1 is pruned and re-derived on load.
-
-**Upgrading from v8:** v9 makes ADR-0019's staged producers reachable. `RegisterGovernedTask`
-materializes the staged worktree when `registration.world_scope` is `staged_authoritative`, before
-the response returns and therefore before any PTY launch; that registration requires an
-operator-class connection and, if materialization fails, records no task at all. Two new
-operator-class requests are added: `PromoteGovernedOutcome` and `DiscardGovernedStagedWorktree`.
-Every daemon-owned producer request now answers with an acknowledgement object that *flattens* the
-governed task and adds `replayed` plus an optional `pending_rerun_reason`, so a v5-era client
-deserializing a bare `GovernedTaskRun` keeps working unchanged; the discard acknowledgement adds
-`discarded_root` and an optional `unreferenced_accepted_commit`.
-
-**Upgrading from v7:** v8 (ADR-0019) added the `world_scope` registration field (serde-defaulted
-`authoritative`) and the `MaterializeStagedWorktree`, `DiscardStagedWorktree`, and `RecordPromotion`
-mutations with the promotion outcome they carry. All three are operator-class. No new request
-variant was added at v8; the endpoints arrive at v9.
-
-**Upgrading from v5:** v6 additively exposes the serde-defaulted
-`ProjectOpsSnapshot.memory_candidates` collection. Each entry is a deterministic, pending-review
-projection of an accepted governed run with record/artifact/command provenance and explicit source
-assurance. V6 adds no candidate mutation request, and candidate visibility does not imply a write to
-`GENOME.md` or `HISTORY.jsonl`.
-
-**Upgrading from v4:** v5 adds specialized `SubmitGovernedClaim`,
-`RunGovernedVerification`, and `RunGovernedSupervisorReview` requests. Their DTOs intentionally
-omit actor/subject, commands/evidence, and verdict fields so the daemon derives automatic producer
-truth. Profiled registrations add `verification_profile: "rust_workspace_v1"`, exact acceptance
-criteria, and an initial clean Git OID. The generic mutation endpoint rejects automatic
-claim/evidence/Supervisor payloads for these tasks; explicit operator decisions remain generic.
-
-**Upgrading from v3:** v4 added daemon-owned governed tasks:
-`RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, and `MutateGovernedTask`, plus the
-serde-defaulted `ProjectOpsSnapshot.governed_tasks` collection. Mutations carry an expected revision
-and idempotency request ID; process exit and review/acceptance remain independent.
 
 **Upgrading from v2:** v3 adds the typed `Busy` response. Agent-backed requests return `resource: "agent_turn"` with a retry hint when another logical turn owns the cached agent; busy requests never reach a provider or mutate conversation state.
 
@@ -492,7 +450,7 @@ Returns `AgentAssistResult` with sessions organized by agent role.
 
 ### Search & Retrieval
 
-Protocol v6 does not define daemon request variants for retrieval. `search-history`,
+Protocol v3 does not define daemon request variants for retrieval. `search-history`,
 `search-genome`, `index-memory`, and `retrieval-status` are direct-mode CLI operations; the
 `--daemon` dispatcher tells callers to retry without the flag.
 
@@ -513,7 +471,7 @@ All responses use the `DaemonResponse` enum.
 Contains the result as a JSON value. The structure depends on the request.
 
 ```json
-{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 9}}}
+{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 3}}}
 ```
 
 ### Error
@@ -608,96 +566,6 @@ the supplied role compatibility from the daemon-owned runtime registry and rejec
 ---
 
 ## Changelog
-
-### v9 — Daemon governed wiring
-
-Added 2026-09-12 (ADR-0012 amendment, ADR-0019):
-
-- `PromoteGovernedOutcome` and `DiscardGovernedStagedWorktree` requests, both operator-class and
-  both checked before any state read or side effect.
-- `RegisterGovernedTask` materializes the staged worktree when the registration declares
-  `world_scope: "staged_authoritative"`; that registration is operator-class, and a failed
-  materialization records no task.
-- Producer acknowledgements flatten the governed task and add `replayed` plus an optional
-  `pending_rerun_reason`; the discard acknowledgement adds `discarded_root` and an optional
-  `unreferenced_accepted_commit`. Older clients reading a bare `GovernedTaskRun` are unaffected.
-- `RunGovernedVerification`, `RunGovernedSupervisorReview`, and `PromoteGovernedOutcome` wrap their
-  side effect and its receipt in `State::with_reservation`, so a crash between the two is
-  reconciled to `needs_rerun` and surfaced rather than silently repeated. A same-revision duplicate
-  is refused with the journal's typed error. The wrapper is not panic-safe: an in-process panic is
-  treated exactly like a crash.
-- CLI `impulse-rs --daemon governed-promote` and `impulse-rs --daemon governed-discard`.
-- A blocked promotion is a successful response carrying the typed outcome, never an error.
-- A staged run whose pinned shared repository configuration drifted is refused by
-  `SubmitGovernedClaim` and `RunGovernedVerification` before any Git process is spawned, answered as
-  a successful-shape acknowledgement carrying `refused`, a typed `reason`, and a `remedy`. Additive
-  within v9: it adds a response shape to two existing requests and no request variant.
-- 2026-09-12 follow-up, additive within v9: `PromoteGovernedOutcome` answers the same refusal
-  acknowledgement (`unsupported_submodules`) where it previously fell through to a plain `Error`
-  string; its reservation is released and the task is unchanged, as for the other two. A drifted pin
-  at promotion stays the recorded `promotion_blocked` outcome (ADR-0019 rule 6).
-
-### v8 — Builder staged-worktree world scope
-
-Added 2026-09-03 (ADR-0019), state and producer layer only — no request variant:
-
-- `world_scope` on governed registrations and records, serde-defaulted `authoritative`, with
-  `read_only_snapshot` and `disposable_scratch` declared but refused as unmaterializable.
-- `MaterializeStagedWorktree`, `DiscardStagedWorktree`, and `RecordPromotion` mutations, all
-  operator-class, plus the `StagedWorktree` record, its shared-repository-configuration pin, and the
-  `GovernedPromotion` outcome.
-- Loop-contract evidence on staged claims (`loop_report_digest` and `loop_report_version`).
-
-### v7 — Socket actor provenance
-
-Added 2026-09-02 (ADR-0018):
-
-- `PresentOperatorCapability` request; per-connection `operator`/`non_operator` classes decided from
-  peer credentials plus a per-daemon-run 0600 capability published beside the socket.
-- `RecordOperatorDecision`, and a profiled task's `MarkRunning`/`MarkLaunchFailed`/
-  `MarkRuntimeExited`, rejected from non-operator connections with a typed error and no revision
-  change.
-- `OperatorDecision.authentication` (serde-defaulted `declared`), stamped by the daemon.
-- `AcceptedRunSourceAssurance::daemon_profiled_evidence_authenticated_operator` and
-  accepted-run memory derivation version 2, with superseded ledger entries re-derived on load.
-
-### v6 — Deterministic accepted-run memory candidates
-
-Added 2026-07-15:
-
-- `ProjectOpsSnapshot.memory_candidates` as a serde-defaulted additive read-model field.
-- Versioned pending candidates derived from accepted governed-task evidence, including source
-  assurance, source digest, task/criteria, subject, record/artifact references, and successful
-  command evidence.
-- Owner-only `MEMORY_CANDIDATES.json` projection repaired by acceptance replay or daemon startup;
-  orphaned or source-mismatched records fail closed.
-- Read-only Dioxus Memory rendering with no promotion, edit, or dismissal request. V6 never mutates
-  `GENOME.md` or `HISTORY.jsonl` through candidate staging.
-
-### v5 — Daemon-owned governed producers
-
-Added 2026-07-13:
-
-- `SubmitGovernedClaim`, `RunGovernedVerification`, and `RunGovernedSupervisorReview` request
-  variants whose callers cannot supply derived producer truth.
-- Optional `rust_workspace_v1` profile, exact acceptance criteria, and daemon-attested initial Git
-  subject on governed task registrations.
-- Detached fixed Rust verification plus strict acceptance-criteria-digest-bound, stateless,
-  tool-free API Supervisor review.
-- Env-routed `"$IMPULSE_CONTROL_CLI" --daemon governed-*` commands and Ion claim bridge; the packaged
-  executable is `impulse-rs`. Same-user actor authorization and any accepted-run memory projection
-  or promotion remain outside v5.
-- One per-task lock serializes producer and lifecycle mutations, and persisted receipts deduplicate
-  replay. Crash-safe exactly-once producer execution remains outside v5 until a durable pre-side-effect
-  reservation journal exists.
-
-### v4 — Daemon-owned governed tasks
-
-Added 2026-07-13:
-
-- `RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, and `MutateGovernedTask` request variants.
-- `ProjectOpsSnapshot.governed_tasks` plus governed-task provenance on `AgentRuntime`.
-- Expected-revision/idempotency-key mutations with execution state independent from review and acceptance.
 
 ### v3 — Managed-agent backpressure
 

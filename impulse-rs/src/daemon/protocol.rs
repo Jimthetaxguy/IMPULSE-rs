@@ -346,40 +346,8 @@ mod tests {
     // ── PROTOCOL_VERSION ───────────────────────────────────────────────
 
     #[test]
-    fn test_protocol_version_is_nine() {
-        // v7 (ADR-0018) adds PresentOperatorCapability and the operator-class
-        // requirement on RecordOperatorDecision. v8 (ADR-0019) adds the
-        // staged-worktree world scope: the MaterializeStagedWorktree /
-        // DiscardStagedWorktree / RecordPromotion mutations and the promotion
-        // outcome they carry. v9 makes those reachable over the socket:
-        // PromoteGovernedOutcome, DiscardGovernedStagedWorktree, staged
-        // materialization inside RegisterGovernedTask, and the flattened
-        // producer acknowledgements carrying `replayed` plus a reservation's
-        // `pending_rerun_reason`.
-        assert_eq!(PROTOCOL_VERSION, 9);
-    }
-
-    #[test]
-    fn test_present_operator_capability_round_trips_and_never_leaks_into_the_type_name() {
-        let request = DaemonRequest::PresentOperatorCapability(
-            impulse_ops::operator_capability::OperatorCapabilityPresentation {
-                token: "a".repeat(64),
-            },
-        );
-        let json = serde_json::to_string(&request).unwrap();
-        // The newtype variant keeps the struct-variant wire shape exactly.
-        assert!(json.contains(r#""data":{"token":"#));
-        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
-        assert!(matches!(
-            parsed,
-            DaemonRequest::PresentOperatorCapability(ref presentation)
-                if presentation.token == "a".repeat(64)
-        ));
-        assert_eq!(
-            request_type_name(&request),
-            "PresentOperatorCapability",
-            "the traced request name must never carry the token"
-        );
+    fn test_protocol_version_is_three() {
+        assert_eq!(PROTOCOL_VERSION, 3);
     }
 
     // ── request_type_name ───────────────────────────────────────────────

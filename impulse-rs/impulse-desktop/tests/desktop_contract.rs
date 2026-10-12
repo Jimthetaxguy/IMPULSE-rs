@@ -13,12 +13,10 @@ use dioxus::prelude::*;
 use impulse_desktop::ui::{
     agent_focus_bridge_script, agent_launch_bridge_script, apply_desktop_bridge_message,
     apply_desktop_bridge_message_with_status, build_governed_agent_spawn_request,
-    builder_role_assignment, desktop_event_bridge_script, governed_task_mutation_bridge_script,
-    mcp_invoke_bridge_script, parse_workspace_folder_pick_result, review_decision_bridge_script,
-    terminal_asset_paths, workspace_folder_pick_bridge_script, workspace_folder_pick_request,
-    workspace_registration_bridge_script, BridgeStatusUpdate, DaemonOpsStatusUpdate,
-    DesktopBridgeMessage, DesktopBridgeStateMut, GovernedAgentSpawnInput, ReviewDecisionUiRequest,
-    XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
+    builder_role_assignment, desktop_event_bridge_script, mcp_invoke_bridge_script,
+    review_decision_bridge_script, terminal_asset_paths, workspace_registration_bridge_script,
+    BridgeStatusUpdate, DaemonOpsStatusUpdate, DesktopBridgeMessage, DesktopBridgeStateMut,
+    ReviewDecisionUiRequest, XTERM_CSS_PATH, XTERM_FIT_JS_PATH, XTERM_JS_PATH,
 };
 use impulse_desktop::{
     default_builtin_mcp_tools, format_count, status_dot_class, status_label, AgentPlatformId,
@@ -111,8 +109,6 @@ fn test_workspace_launcher_renders_required_builder_compatibility_preflight() {
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
-            governed_acks: Default::default(),
-            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -120,13 +116,9 @@ fn test_workspace_launcher_renders_required_builder_compatibility_preflight() {
 
     let html = dioxus_ssr::render(&vdom);
     assert!(html.contains("data-field=\"launch-task\""));
-    assert!(html.contains("data-field=\"launch-acceptance-criteria\""));
     assert!(html.contains("aria-required=\"true\""));
     assert!(html.contains(">Task<"));
     assert!(html.contains(">Builder<"));
-    assert!(html.contains("data-verification-profile=\"rust_workspace_v1\""));
-    assert!(html.contains("Rust-only · rust_workspace_v1"));
-    assert!(!html.contains("launch any agent"));
     assert!(html.contains("degraded"));
     assert!(html.contains("workspace.target"));
     assert!(html.contains("process.lifecycle"));
@@ -161,14 +153,11 @@ fn governed_launch(
     build_governed_agent_spawn_request(
         &[governed_workspace()],
         platforms,
-        GovernedAgentSpawnInput {
-            launch_root: "/tmp/impulse",
-            selected_platform_id: selected_platform,
-            agent_id: "builder-1",
-            command: "",
-            task,
-            acceptance_criteria: "workspace tests pass",
-        },
+        "/tmp/impulse",
+        selected_platform,
+        "builder-1",
+        "",
+        task,
     )
 }
 
@@ -250,11 +239,6 @@ fn test_governed_request_builder_emits_trimmed_task_builder_assignment_and_legac
         Some(builder_role_assignment().expect("static Builder role profile"))
     );
     assert_eq!(request.role, None);
-    assert_eq!(request.acceptance_criteria, ["workspace tests pass"]);
-    assert_eq!(
-        request.verification_profile,
-        Some(impulse_ops::governed_task::GovernedVerificationProfile::RustWorkspaceV1)
-    );
 }
 
 #[derive(Clone, Default)]
@@ -1014,8 +998,6 @@ fn test_retro_shell_binds_project_ops_snapshot() {
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
-            governed_acks: Default::default(),
-            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1053,8 +1035,6 @@ fn test_workspace_launcher_renders_registry_platforms_including_ion_and_custom()
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
-            governed_acks: Default::default(),
-            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -1733,10 +1713,6 @@ fn test_agent_launch_bridge_script_routes_through_audited_mcp_spawn() {
         role: None,
         task: Some("Implement the governed launcher".to_string()),
         role_assignment: Some(role_assignment),
-        acceptance_criteria: vec!["workspace tests pass".to_string()],
-        verification_profile: Some(
-            impulse_ops::governed_task::GovernedVerificationProfile::RustWorkspaceV1,
-        ),
         target: None,
     });
 
@@ -1761,47 +1737,6 @@ fn test_host_manifest_exposes_registry_platform_catalog() {
         impulse_desktop::host_commands::HOST_INVOKE_COMMANDS.contains(&"agent_platforms"),
         "the launcher must load platform choices from the runtime registry"
     );
-}
-
-#[test]
-fn test_host_manifest_and_bridge_expose_acknowledged_governed_task_mutation() {
-    use impulse_ops::governed_task::{
-        GovernedActor, GovernedActorKind, GovernedRequestId, GovernedTaskId, GovernedTaskMutation,
-        GovernedTaskMutationRequest, SupervisorVerdictInput, SupervisorVerdictKind,
-    };
-
-    assert!(
-        impulse_desktop::host_commands::HOST_INVOKE_COMMANDS
-            .contains(&impulse_desktop::host_commands::GOVERNED_TASK_MUTATE_COMMAND),
-        "the live host must expose the acknowledged governed-task command"
-    );
-
-    let request = GovernedTaskMutationRequest {
-        request_id: GovernedRequestId::try_new("req-ui-supervisor").unwrap(),
-        project_id: "impulse-rs".to_string(),
-        task_id: GovernedTaskId::try_new("task-ui-supervisor").unwrap(),
-        expected_revision: 7,
-        mutation: GovernedTaskMutation::RecordSupervisorVerdict {
-            verdict: SupervisorVerdictInput {
-                actor: GovernedActor {
-                    kind: GovernedActorKind::Supervisor,
-                    id: "supervisor-ui".to_string(),
-                },
-                verification_id: impulse_ops::governed_task::GovernedRecordId::try_new(
-                    "verification-ui",
-                )
-                .unwrap(),
-                verdict: SupervisorVerdictKind::RecommendAccept,
-                rationale: "Evidence satisfies the acceptance criteria".to_string(),
-            },
-        },
-    };
-    let script = governed_task_mutation_bridge_script(&request);
-
-    assert!(script.contains("mutateGovernedTask"));
-    assert!(script.contains(r#""expected_revision":7"#));
-    assert!(script.contains(r#""recommend_accept""#));
-    assert!(!script.contains("confirmed"));
 }
 
 #[test]
@@ -2486,8 +2421,6 @@ fn test_shell_render_accepts_live_agents_workspaces_and_tools() {
             }],
             bridge_status: None,
             daemon_ops_status: None,
-            governed_acks: Default::default(),
-            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -2535,8 +2468,6 @@ fn test_shell_review_route_gates_review_console() {
             }],
             bridge_status: None,
             daemon_ops_status: None,
-            governed_acks: Default::default(),
-            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Review,
         },
     );
@@ -2576,8 +2507,6 @@ fn test_shell_supervisor_route_gates_operator_board() {
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
-            governed_acks: Default::default(),
-            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Supervisor,
         },
     );
@@ -3118,8 +3047,6 @@ fn test_shell_renders_bridge_status_banner_when_degraded() {
                 reason: Some("host event API unavailable".to_string()),
             }),
             daemon_ops_status: None,
-            governed_acks: Default::default(),
-            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3148,8 +3075,6 @@ fn test_shell_hides_bridge_status_banner_when_healthy() {
             review_queue: Vec::new(),
             bridge_status: None,
             daemon_ops_status: None,
-            governed_acks: Default::default(),
-            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3178,8 +3103,6 @@ fn test_footer_stream_health_reflects_live_agent() {
                 connected: true,
                 error: None,
             }),
-            governed_acks: Default::default(),
-            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3221,8 +3144,6 @@ fn test_publish_only_degradation_keeps_subscribed_snapshot_current() {
                 connected: true,
                 error: Some("publish: temporary failure".to_string()),
             }),
-            governed_acks: Default::default(),
-            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );
@@ -3258,8 +3179,6 @@ fn test_footer_stream_health_reads_down_when_transport_degraded() {
                 connected: false,
                 error: Some("daemon unavailable".to_string()),
             }),
-            governed_acks: Default::default(),
-            on_dismiss_governed_ack: None,
             initial_view: DesktopView::Terminal,
         },
     );

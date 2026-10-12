@@ -31,100 +31,6 @@ fn bounded_request(request: RequestBuilder) -> RequestBuilder {
     request.timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
 }
 
-/// Canonical API origins. Each provider appends its own request path, so these
-/// are scheme + host only — never a full endpoint.
-const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
-const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com";
-const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimax.chat";
-
-/// MiniMax's `chatcompletion_v2` endpoint expects `max_tokens` on every
-/// request, so a request that does not set one still sends this fallback.
-const MINIMAX_DEFAULT_MAX_TOKENS: u32 = 4096;
-
-/// Env vars that redirect a provider at a different origin. The override exists
-/// so an eval harness or local proxy can intercept provider traffic without a
-/// rebuild; it is deliberately origin-only so a redirect cannot rewrite the
-/// request path.
-const ANTHROPIC_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
-const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
-const MINIMAX_BASE_URL_ENV: &str = "MINIMAX_BASE_URL";
-
-/// Resolve a base URL from, in precedence order: explicit config, environment
-/// override, canonical default. An override that is blank or carries no
-/// `http(s)` scheme is discarded rather than used, so a typo degrades to the
-/// real API instead of to an unresolvable endpoint.
-fn select_base_url(explicit: Option<&str>, from_env: Option<&str>, default: &str) -> String {
-    explicit
-        .or(from_env)
-        .map(str::trim)
-        .filter(|candidate| candidate.starts_with("http://") || candidate.starts_with("https://"))
-        .unwrap_or(default)
-        .trim_end_matches('/')
-        .to_string()
-}
-
-/// How a resolved origin relates to the provider's canonical default.
-///
-/// Any `http(s)` origin is accepted today — there is no host allowlist. The
-/// classification exists so an active override is observable (never the API
-/// key) and so cleartext HTTP to a non-loopback host is a warning, not silent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BaseUrlKind {
-    Canonical,
-    OverrideHttps,
-    OverrideLoopbackHttp,
-    OverrideCleartextHttp,
-}
-
-fn origin_host(origin: &str) -> Option<&str> {
-    let rest = origin.split_once("://")?.1;
-    if let Some(rest) = rest.strip_prefix('[') {
-        return rest.split(']').next();
-    }
-    rest.split([':', '/']).next()
-}
-
-fn host_is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
-}
-
-fn classify_base_url(resolved: &str, default: &str) -> BaseUrlKind {
-    let canonical = default.trim_end_matches('/');
-    if resolved == canonical {
-        return BaseUrlKind::Canonical;
-    }
-    if resolved.starts_with("https://") {
-        return BaseUrlKind::OverrideHttps;
-    }
-    if resolved.starts_with("http://") {
-        if origin_host(resolved).is_some_and(host_is_loopback) {
-            return BaseUrlKind::OverrideLoopbackHttp;
-        }
-        return BaseUrlKind::OverrideCleartextHttp;
-    }
-    BaseUrlKind::Canonical
-}
-
-fn log_base_url_override(provider_name: &str, origin: &str, kind: BaseUrlKind) {
-    match kind {
-        BaseUrlKind::Canonical => {}
-        BaseUrlKind::OverrideHttps | BaseUrlKind::OverrideLoopbackHttp => {
-            tracing::info!(
-                provider = provider_name,
-                origin,
-                "LLM provider base-URL override active"
-            );
-        }
-        BaseUrlKind::OverrideCleartextHttp => {
-            tracing::warn!(
-                provider = provider_name,
-                origin,
-                "LLM provider base-URL override uses cleartext HTTP to a non-loopback origin"
-            );
-        }
-    }
-}
-
 /// Common provider structure - shared by all LLM providers
 pub struct BaseProvider {
     api_key: String,
@@ -688,14 +594,36 @@ impl LlmProvider for AnthropicProvider {
 
         let body = build_anthropic_body(&request, self.cache_system_and_tools)?;
 
-        let response = bounded_request(self.base.http_client().post(self.endpoint()))
-            .header("x-api-key", self.base.api_key())
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
+        let system = system_msgs.into_iter().next().map(|m| m.content);
+
+        let mut body = serde_json::json!({
+            "model": request.model,
+            "max_tokens": request.max_tokens.unwrap_or(4096),
+            "temperature": request.temperature,
+            "messages": format_anthropic_messages(&non_system),
+        });
+
+        if let Some(sys) = system {
+            body["system"] = serde_json::Value::String(sys);
+        }
+
+        if !request.tools.is_empty() {
+            body["tools"] = serde_json::to_value(&request.tools)
+                .map_err(|e| AgentError::InvalidRequest(format!("failed to encode tools: {e}")))?;
+        }
+
+        let response = bounded_request(
+            self.0
+                .http_client()
+                .post("https://api.anthropic.com/v1/messages"),
+        )
+        .header("x-api-key", self.0.api_key())
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
 
         // Check status and get error details if failed
         if !response.status().is_success() {
@@ -954,13 +882,21 @@ impl LlmProvider for OpenAiProvider {
 
         let body = build_openai_style_body(&request, None);
 
-        let response = bounded_request(self.0.http_client().post(self.endpoint()))
-            .header("Authorization", format!("Bearer {}", self.0.api_key()))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
+        if let Some(max_tokens) = request.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+
+        let response = bounded_request(
+            self.0
+                .http_client()
+                .post("https://api.openai.com/v1/chat/completions"),
+        )
+        .header("Authorization", format!("Bearer {}", self.0.api_key()))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1033,13 +969,17 @@ impl LlmProvider for MinimaxProvider {
 
         let body = build_openai_style_body(&request, Some(MINIMAX_DEFAULT_MAX_TOKENS));
 
-        let response = bounded_request(self.0.http_client().post(self.endpoint()))
-            .header("Authorization", format!("Bearer {}", self.0.api_key()))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
+        let response = bounded_request(
+            self.0
+                .http_client()
+                .post("https://api.minimax.chat/v1/text/chatcompletion_v2"),
+        )
+        .header("Authorization", format!("Bearer {}", self.0.api_key()))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
 
         if !response.status().is_success() {
             let status = response.status();

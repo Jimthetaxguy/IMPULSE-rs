@@ -1,23 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, Weak};
-use std::thread;
-use std::time::{Duration, Instant};
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 pub use impulse_ops::agent_registry::AgentPlatformId;
-use impulse_ops::governed_task::{
-    GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration, GovernedTaskRun,
-    GovernedVerificationProfile,
-};
-use impulse_ops::governed_wiring::{
-    GovernedProducerAck, GovernedPromotionRequest, GovernedStagedConfigRefusalAck,
-    GovernedStagedWorktreeDiscardAck, GovernedStagedWorktreeDiscardRequest,
-};
 use impulse_ops::role_assignment::{AgentRoleAssignment, EnforcementStrength, RoleCompatibility};
 use impulse_ops::{AgentRole, AgentStatus, ContextHealthSummary, MachineTarget};
 use impulse_term::TerminalBackend;
@@ -31,73 +16,7 @@ use crate::bridge::{
 
 /// Tasks are copied into `IMPULSE_TASK`; keep that environment value bounded
 /// and measure the wire-compatible UTF-8 representation rather than chars.
-const MAX_GOVERNED_TASK_BYTES: usize = impulse_ops::governed_task::MAX_GOVERNED_TASK_BYTES;
-const GOVERNED_GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-const GOVERNED_GIT_OUTPUT_LIMIT: usize = 64 * 1024;
-const GOVERNED_GIT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Promotion either records a mutation or refuses without changing the task.
-/// Untagged serialization preserves the daemon's existing flattened wire shapes.
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum GovernedPromotionResponse {
-    Recorded(GovernedProducerAck),
-    StagedConfigRefused(GovernedStagedConfigRefusalAck),
-}
-
-/// Acknowledged daemon command seam used by the synchronous pre-PTY gate.
-/// Implementations must return daemon-owned task state, never optimistic UI state.
-pub trait GovernedTaskGateway: Send + Sync {
-    fn register(&self, registration: GovernedTaskRegistration) -> Result<GovernedTaskRun, String>;
-
-    fn mutate(&self, request: GovernedTaskMutationRequest) -> Result<GovernedTaskRun, String>;
-
-    fn mutate_current(
-        &self,
-        project_id: &str,
-        task_id: &impulse_ops::governed_task::GovernedTaskId,
-        request_id: impulse_ops::governed_task::GovernedRequestId,
-        mutation: GovernedTaskMutation,
-    ) -> Result<GovernedTaskRun, String>;
-
-    /// Fast-forward the canonical branch onto an accepted staged outcome
-    /// (ADR-0019 rule 5, protocol v9).
-    ///
-    /// A *blocked* promotion comes back as `Ok`: the acknowledged task carries
-    /// `GovernedPromotionOutcome::PromotionBlocked`, the run stays accepted, and
-    /// the staged worktree stays active. A staged-configuration refusal is a
-    /// separate successful response carrying an unchanged task. `Err` means the
-    /// request failed or its response was invalid. Defaulted so a gateway that predates protocol v9 — every test
-    /// double in this workspace — keeps compiling and fails closed.
-    fn promote_outcome(
-        &self,
-        _request: GovernedPromotionRequest,
-    ) -> Result<GovernedPromotionResponse, String> {
-        Err("this governed task gateway does not implement staged-outcome promotion".to_string())
-    }
-
-    /// Reclaim a finished staged worktree (ADR-0019 rule 7, protocol v9).
-    ///
-    /// The acknowledgement names the removed checkout and, when the discard
-    /// dropped the only ref to an accepted-but-blocked commit, that commit's
-    /// OID.
-    fn discard_staged_worktree(
-        &self,
-        _request: GovernedStagedWorktreeDiscardRequest,
-    ) -> Result<GovernedStagedWorktreeDiscardAck, String> {
-        Err("this governed task gateway does not implement staged-worktree discard".to_string())
-    }
-
-    fn routing_metadata(&self) -> Option<GovernedRoutingMetadata> {
-        None
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GovernedRoutingMetadata {
-    pub socket_path: String,
-    pub control_cli: String,
-}
+const MAX_GOVERNED_TASK_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceTarget {
@@ -227,10 +146,6 @@ pub struct AgentSpawnRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_assignment: Option<AgentRoleAssignment>,
     #[serde(default)]
-    pub acceptance_criteria: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification_profile: Option<GovernedVerificationProfile>,
-    #[serde(default)]
     pub target: Option<MachineTarget>,
 }
 
@@ -259,8 +174,6 @@ impl AgentSpawnRequest {
             role: None,
             task: None,
             role_assignment: None,
-            acceptance_criteria: Vec::new(),
-            verification_profile: None,
             target: None,
         }
     }
@@ -472,7 +385,6 @@ struct RuntimeRecord {
     cwd: Option<PathBuf>,
     workspace: Option<WorkspaceTarget>,
     session_id: Option<String>,
-    governed_task: Option<GovernedTaskRun>,
     current_task: Option<String>,
     role: Option<AgentRole>,
     role_assignment: Option<AgentRoleAssignment>,
@@ -531,38 +443,9 @@ struct RuntimeState {
     used_agent_ids: HashSet<String>,
 }
 
-#[derive(Default)]
-struct LaunchCallbackGate {
-    open: Mutex<bool>,
-    ready: Condvar,
-}
-
-impl LaunchCallbackGate {
-    fn wait(&self) {
-        let open = self
-            .open
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _open = self
-            .ready
-            .wait_while(open, |is_open| !*is_open)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-    }
-
-    fn open(&self) {
-        let mut open = self
-            .open
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *open = true;
-        self.ready.notify_all();
-    }
-}
-
 struct DesktopRuntimeInner {
     state: Mutex<RuntimeState>,
     sink: Arc<dyn DesktopEventSink>,
-    governed_task_gateway: Option<Arc<dyn GovernedTaskGateway>>,
     /// Serializes lifecycle publication with the PTY reader's exit callback.
     /// A snapshot is always captured while this lock is held, so a stored
     /// `alive=false` cannot be followed by an older `alive=true` event.
@@ -582,47 +465,7 @@ impl Drop for DesktopRuntimeInner {
             .map(|(_, record)| record)
             .collect::<Vec<_>>();
         for record in records {
-            if let Err(error) = record.backend.kill() {
-                let message = format!(
-                    "desktop shutdown could not confirm runtime termination for {}: {error}",
-                    record
-                        .governed_task
-                        .as_ref()
-                        .map(|task| task.id.as_str())
-                        .unwrap_or(&record.command)
-                );
-                eprintln!("{message}");
-                self.sink.emit(DesktopEvent::OpsConnectionUpdate {
-                    connected: true,
-                    error: Some(message),
-                });
-                continue;
-            }
-            if let (Some(task), Some(gateway)) =
-                (record.governed_task.as_ref(), &self.governed_task_gateway)
-            {
-                if let Err(error) = gateway.mutate_current(
-                    &task.project_id,
-                    &task.id,
-                    new_governed_request_id("runtime-drop"),
-                    GovernedTaskMutation::MarkRuntimeExited {
-                        actor: governed_system_actor("desktop-runtime"),
-                        reason: Some("desktop runtime shut down".to_string()),
-                    },
-                ) {
-                    eprintln!(
-                        "failed to record governed runtime shutdown for {}: {error}",
-                        task.id
-                    );
-                    self.sink.emit(DesktopEvent::OpsConnectionUpdate {
-                        connected: true,
-                        error: Some(format!(
-                            "governed task {} runtime shutdown was not durably recorded: {error}",
-                            task.id
-                        )),
-                    });
-                }
-            }
+            record.backend.kill();
         }
     }
 }
@@ -666,28 +509,17 @@ impl DesktopRuntime {
         }
     }
 
+    pub fn downgrade(&self) -> WeakDesktopRuntime {
+        WeakDesktopRuntime {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     pub fn spawn_agent(
         &self,
         request: AgentSpawnRequest,
     ) -> Result<AgentRuntimeSnapshot, DesktopBridgeError> {
         let mut request = request;
-        if request.verification_profile.is_some() || !request.acceptance_criteria.is_empty() {
-            let assignment = request.role_assignment.as_ref().ok_or_else(|| {
-                DesktopBridgeError::InvalidTerminalRequest {
-                    message:
-                        "verification profiles and acceptance criteria require the governed Builder role"
-                            .to_string(),
-                }
-            })?;
-            if assignment.role.as_str() != "builder" {
-                return Err(DesktopBridgeError::InvalidTerminalRequest {
-                    message: format!(
-                        "verification profiles and acceptance criteria require role `builder`, not `{}`",
-                        assignment.role
-                    ),
-                });
-            }
-        }
         if request.role_assignment.is_some() {
             let task = request.task.as_deref().ok_or_else(|| {
                 DesktopBridgeError::InvalidTerminalRequest {
@@ -709,19 +541,6 @@ impl DesktopRuntime {
                     message: format!(
                         "governed task must be at most {MAX_GOVERNED_TASK_BYTES} UTF-8 bytes"
                     ),
-                });
-            }
-            if request.verification_profile.is_some() && request.acceptance_criteria.is_empty() {
-                return Err(DesktopBridgeError::InvalidTerminalRequest {
-                    message:
-                        "closed-loop governed launch requires at least one acceptance criterion"
-                            .to_string(),
-                });
-            }
-            if request.verification_profile.is_none() && !request.acceptance_criteria.is_empty() {
-                return Err(DesktopBridgeError::InvalidTerminalRequest {
-                    message: "acceptance criteria require an explicit verification profile"
-                        .to_string(),
                 });
             }
         }
@@ -801,132 +620,14 @@ impl DesktopRuntime {
         } else {
             request.mcp_tools.clone()
         };
-        let governed_routing = if request.verification_profile.is_some() {
-            Some(
-                self.inner
-                    .governed_task_gateway
-                    .as_ref()
-                    .and_then(|gateway| gateway.routing_metadata())
-                    .ok_or_else(|| DesktopBridgeError::GovernedTaskFailed {
-                        message: "profiled governed launch requires an executable Impulse control CLI; configure IMPULSE_CONTROL_CLI with an executable path or make impulse-rs available beside the Desktop binary or on PATH"
-                            .to_string(),
-                    })?,
-            )
-        } else {
-            None
-        };
-        let mut governed_task = if let Some(role_assignment) = request.role_assignment.as_ref() {
-            let gateway = self.inner.governed_task_gateway.as_ref().ok_or_else(|| {
-                DesktopBridgeError::GovernedTaskFailed {
-                    message: "governed launch requires an acknowledged daemon task gateway"
-                        .to_string(),
-                }
-            })?;
-            let workspace_root = workspace
-                .as_ref()
-                .map(|target| target.root.clone())
-                .ok_or_else(|| DesktopBridgeError::GovernedTaskFailed {
-                    message: "governed launch lost its canonical workspace binding".to_string(),
-                })?;
-            let project_id = governed_project_id(&workspace_root)?;
-            let task =
-                request
-                    .task
-                    .clone()
-                    .ok_or_else(|| DesktopBridgeError::GovernedTaskFailed {
-                        message: "governed launch lost its validated task description".to_string(),
-                    })?;
-            let task_id = new_governed_task_id();
-            let initial_subject_revision = request
-                .verification_profile
-                .map(|_| observe_clean_git_head(&workspace_root))
-                .transpose()?;
-            let mut registration = GovernedTaskRegistration::builder(
-                new_governed_request_id("register").to_string(),
-                task_id.to_string(),
-                project_id.clone(),
-                workspace_root.clone(),
-                task.clone(),
-                agent_id.clone(),
-                request.platform.as_str(),
-            )
-            .role_assignment(role_assignment.clone());
-            if let Some(profile) = request.verification_profile {
-                registration = registration
-                    .verification_profile(profile)
-                    .acceptance_criteria(request.acceptance_criteria.clone())
-                    .initial_subject_revision(
-                        initial_subject_revision
-                            .as_deref()
-                            .expect("profiled launch must observe a Git subject"),
-                    );
-            }
-            if let Some(compatibility) = role_compatibility.clone() {
-                registration = registration.role_compatibility(compatibility);
-            }
-            if let Some(session_id) = request.session_id.clone() {
-                registration = registration.session_id(session_id);
-            }
-            let registration =
-                registration
-                    .build()
-                    .map_err(|error| DesktopBridgeError::GovernedTaskFailed {
-                        message: format!("build daemon registration: {error}"),
-                    })?;
-            let registered = match gateway.register(registration.clone()) {
-                Ok(registered) => registered,
-                Err(error) => {
-                    let cleanup = record_launch_abort_bound(
-                        gateway.as_ref(),
-                        &project_id,
-                        &task_id,
-                        "registration acknowledgment failed before PTY creation",
-                    )
-                    .err();
-                    return Err(DesktopBridgeError::GovernedTaskFailed {
-                        message: match cleanup {
-                            Some(cleanup) => format!(
-                                "register before PTY creation: {error}; registration cleanup: {cleanup}"
-                            ),
-                            None => format!("register before PTY creation: {error}"),
-                        },
-                    });
-                }
-            };
-            if let Err(validation_error) = validate_registered_task(&registered, &registration) {
-                let abort_error = record_launch_abort_bound(
-                    gateway.as_ref(),
-                    &project_id,
-                    &task_id,
-                    "daemon returned an invalid registration acknowledgment",
-                )
-                .err();
-                return Err(DesktopBridgeError::GovernedTaskFailed {
-                    message: match abort_error {
-                        Some(abort_error) => format!(
-                            "{validation_error}; additionally failed to record launch rejection: {abort_error}"
-                        ),
-                        None => validation_error.to_string(),
-                    },
-                });
-            }
-            Some(registered)
-        } else {
-            None
-        };
+        let lifecycle_guard = self
+            .inner
+            .lifecycle_events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         {
             let mut state = self.lock_state();
             if !state.used_agent_ids.insert(agent_id.clone()) {
-                if let (Some(task), Some(gateway)) = (
-                    governed_task.as_ref(),
-                    self.inner.governed_task_gateway.as_ref(),
-                ) {
-                    let _ = record_launch_abort(
-                        gateway.as_ref(),
-                        task,
-                        "agent id was already used before PTY creation",
-                    );
-                }
                 return Err(DesktopBridgeError::InvalidTerminalRequest {
                     message: format!(
                         "agent id `{agent_id}` has already been used by this runtime; choose a new id"
@@ -934,24 +635,11 @@ impl DesktopRuntime {
                 });
             }
         }
-        let env_pairs = runtime_env(
-            &agent_id,
-            &request,
-            &command,
-            workspace.as_ref(),
-            governed_task.as_ref(),
-            governed_routing.as_ref(),
-        );
-        // PTY callbacks are per-launch gated until the daemon acknowledges
-        // Running and the runtime record is installed. This keeps one slow
-        // daemon round-trip from blocking lifecycle/output delivery for every
-        // other agent behind the global ordering lock.
-        let launch_callback_gate = Arc::new(LaunchCallbackGate::default());
+        let env_pairs = runtime_env(&agent_id, &request, &command, workspace.as_ref());
         let output_runtime = Arc::downgrade(&self.inner);
         let output_agent_id = agent_id.clone();
         let output_launch_gate = Arc::clone(&launch_callback_gate);
         let output_callback = Arc::new(move |data: &[u8]| {
-            output_launch_gate.wait();
             let Some(runtime) = output_runtime.upgrade() else {
                 return;
             };
@@ -980,97 +668,30 @@ impl DesktopRuntime {
         });
         let exit_agent_id = agent_id.clone();
         let exit_runtime = Arc::downgrade(&self.inner);
-        let exit_launch_gate = Arc::clone(&launch_callback_gate);
-        let exit_governed_task = governed_task
-            .as_ref()
-            .map(|task| (task.project_id.clone(), task.id.clone()));
-        let exit_governed_gateway = self.inner.governed_task_gateway.clone();
         let exit_callback = Arc::new(move || {
-            exit_launch_gate.wait();
             let Some(runtime) = exit_runtime.upgrade() else {
                 return;
             };
-            let removed = {
-                let _lifecycle_guard = runtime
-                    .lifecycle_events
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                runtime
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .agents
-                    .remove(&exit_agent_id)
-            };
-            let Some(record) = removed else {
-                return;
-            };
-            if let Err(error) = record.backend.kill() {
-                let message = format!(
-                    "terminal EOF observed for {exit_agent_id}, but its process could not be confirmed terminated: {error}"
-                );
-                let should_drain = {
-                    let _lifecycle_guard = runtime
-                        .lifecycle_events
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    runtime
-                        .state
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .agents
-                        .insert(exit_agent_id.clone(), record);
-                    runtime
-                        .lifecycle_dispatcher
-                        .enqueue(DesktopEvent::OpsConnectionUpdate {
-                            connected: true,
-                            error: Some(message),
-                        })
-                };
-                if should_drain {
-                    runtime.lifecycle_dispatcher.drain();
-                }
-                return;
-            }
-
             let should_drain = {
                 let _lifecycle_guard = runtime
                     .lifecycle_events
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                runtime
-                    .lifecycle_dispatcher
-                    .enqueue(DesktopEvent::TerminalExit {
-                        agent_id: exit_agent_id.clone(),
-                    })
-            };
-            drop(record);
-            if let (Some((project_id, task_id)), Some(gateway)) =
-                (&exit_governed_task, &exit_governed_gateway)
-            {
-                if let Err(error) = gateway.mutate_current(
-                    project_id,
-                    task_id,
-                    new_governed_request_id("runtime-exit"),
-                    GovernedTaskMutation::MarkRuntimeExited {
-                        actor: governed_system_actor("desktop-runtime"),
-                        reason: None,
-                    },
-                ) {
-                    eprintln!(
-                        "failed to record governed runtime exit for {}: {error}",
-                        task_id
-                    );
-                    runtime
+                let removed = runtime
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .agents
+                    .remove(&exit_agent_id);
+                let should_emit = removed.is_some();
+                drop(removed);
+                should_emit
+                    && runtime
                         .lifecycle_dispatcher
-                        .enqueue(DesktopEvent::OpsConnectionUpdate {
-                            connected: true,
-                            error: Some(format!(
-                                "governed task {task_id} runtime exit was not durably recorded: {error}"
-                            )),
-                        });
-                }
-            }
+                        .enqueue(DesktopEvent::TerminalExit {
+                            agent_id: exit_agent_id.clone(),
+                        })
+            };
             if should_drain {
                 runtime.lifecycle_dispatcher.drain();
             }
@@ -1090,96 +711,11 @@ impl DesktopRuntime {
             Ok(backend) => backend,
             Err(error) => {
                 self.lock_state().used_agent_ids.remove(&agent_id);
-                launch_callback_gate.open();
-                if let (Some(task), Some(gateway)) = (
-                    governed_task.as_ref(),
-                    self.inner.governed_task_gateway.as_ref(),
-                ) {
-                    if let Err(record_error) =
-                        record_launch_abort(gateway.as_ref(), task, &error.to_string())
-                    {
-                        return Err(DesktopBridgeError::TerminalSpawnFailed {
-                            message: format!(
-                                "{error}; additionally failed to record governed launch failure: {record_error}"
-                            ),
-                        });
-                    }
-                }
                 return Err(DesktopBridgeError::TerminalSpawnFailed {
                     message: error.to_string(),
                 });
             }
         };
-
-        if let (Some(task), Some(gateway)) = (
-            governed_task.as_ref(),
-            self.inner.governed_task_gateway.as_ref(),
-        ) {
-            let running = gateway.mutate(GovernedTaskMutationRequest {
-                request_id: new_governed_request_id("running"),
-                project_id: task.project_id.clone(),
-                task_id: task.id.clone(),
-                expected_revision: task.revision,
-                mutation: GovernedTaskMutation::MarkRunning {
-                    actor: governed_system_actor("desktop-runtime"),
-                },
-            });
-            match running {
-                Ok(updated) => {
-                    if let Err(validation_error) = validate_running_task(&updated, task) {
-                        if let Err(termination_error) = backend.kill() {
-                            launch_callback_gate.open();
-                            return Err(DesktopBridgeError::GovernedTaskFailed {
-                                message: format!(
-                                    "{validation_error}; PTY termination could not be confirmed, so no exit state was recorded: {termination_error}"
-                                ),
-                            });
-                        }
-                        let abort_error = record_launch_abort(
-                            gateway.as_ref(),
-                            task,
-                            "daemon returned an invalid running acknowledgment",
-                        )
-                        .err();
-                        launch_callback_gate.open();
-                        return Err(DesktopBridgeError::GovernedTaskFailed {
-                            message: match abort_error {
-                                Some(abort_error) => format!(
-                                    "{validation_error}; additionally failed to record runtime abort: {abort_error}"
-                                ),
-                                None => validation_error.to_string(),
-                            },
-                        });
-                    }
-                    governed_task = Some(updated);
-                }
-                Err(error) => {
-                    if let Err(termination_error) = backend.kill() {
-                        launch_callback_gate.open();
-                        return Err(DesktopBridgeError::GovernedTaskFailed {
-                            message: format!(
-                                "mark task running after PTY creation: {error}; PTY termination could not be confirmed, so no exit state was recorded: {termination_error}"
-                            ),
-                        });
-                    }
-                    let abort_error = record_launch_abort(
-                        gateway.as_ref(),
-                        task,
-                        "runtime started but daemon running acknowledgment failed",
-                    )
-                    .err();
-                    launch_callback_gate.open();
-                    return Err(DesktopBridgeError::GovernedTaskFailed {
-                        message: match abort_error {
-                            Some(abort_error) => format!(
-                                "mark task running after PTY creation: {error}; abort record also failed: {abort_error}"
-                            ),
-                            None => format!("mark task running after PTY creation: {error}"),
-                        },
-                    });
-                }
-            }
-        }
 
         let record = RuntimeRecord {
             platform: request.platform.clone(),
@@ -1189,7 +725,6 @@ impl DesktopRuntime {
             cwd,
             workspace,
             session_id: request.session_id,
-            governed_task,
             current_task: request.task,
             role: request.role,
             role_assignment: request.role_assignment,
@@ -1200,11 +735,6 @@ impl DesktopRuntime {
             status: AgentStatus::Starting,
             backend,
         };
-        let lifecycle_guard = self
-            .inner
-            .lifecycle_events
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let snapshot = {
             let mut state = self.lock_state();
             let replaced = state.agents.insert(agent_id.clone(), record);
@@ -1221,7 +751,6 @@ impl DesktopRuntime {
                 .enqueue(DesktopEvent::AgentRuntimeUpdate {
                     snapshot: Box::new(snapshot.clone()),
                 });
-        launch_callback_gate.open();
         drop(lifecycle_guard);
         if should_drain {
             self.inner.lifecycle_dispatcher.drain();
@@ -1495,18 +1024,7 @@ impl DesktopRuntime {
                 session_id: request.session_id.clone(),
             },
         )?;
-        let governed_task = record.governed_task.clone();
-        if let Err(error) = record.backend.kill() {
-            self.lock_state()
-                .agents
-                .insert(request.session_id.clone(), record);
-            return Err(DesktopBridgeError::TerminalTerminationFailed {
-                message: format!(
-                    "session {} remains managed because process termination was not confirmed: {error}",
-                    request.session_id
-                ),
-            });
-        }
+        record.backend.kill();
         let should_drain = self
             .inner
             .lifecycle_dispatcher
@@ -1515,31 +1033,8 @@ impl DesktopRuntime {
             });
         drop(record);
         drop(lifecycle_guard);
-        let governed_error = if let (Some(task), Some(gateway)) = (
-            governed_task.as_ref(),
-            self.inner.governed_task_gateway.as_ref(),
-        ) {
-            gateway
-                .mutate_current(
-                    &task.project_id,
-                    &task.id,
-                    new_governed_request_id("runtime-close"),
-                    GovernedTaskMutation::MarkRuntimeExited {
-                        actor: governed_system_actor("desktop-runtime"),
-                        reason: Some("operator closed runtime".to_string()),
-                    },
-                )
-                .err()
-        } else {
-            None
-        };
         if should_drain {
             self.inner.lifecycle_dispatcher.drain();
-        }
-        if let Some(error) = governed_error {
-            return Err(DesktopBridgeError::GovernedTaskFailed {
-                message: format!("runtime closed but durable exit recording failed: {error}"),
-            });
         }
         Ok(())
     }
@@ -1663,8 +1158,6 @@ impl TerminalBridge for DesktopRuntime {
             role: None,
             task: None,
             role_assignment: None,
-            acceptance_criteria: Vec::new(),
-            verification_profile: None,
             target: None,
         })?;
         Ok(TerminalSessionResponse {
@@ -1717,7 +1210,6 @@ impl DesktopRuntimeBuilder {
                 state: Mutex::new(RuntimeState::default()),
                 lifecycle_dispatcher: LifecycleEventDispatcher::new(Arc::clone(&self.sink)),
                 sink: self.sink,
-                governed_task_gateway: self.governed_task_gateway,
                 lifecycle_events: Mutex::new(()),
             }),
         }
@@ -2759,22 +2251,6 @@ fn runtime_env(
     if let Some(task) = &request.task {
         env.push(("IMPULSE_TASK", task.clone()));
     }
-    if let Some(task) = governed_task {
-        env.push(("IMPULSE_GOVERNED_TASK_ID", task.id.to_string()));
-        env.push(("IMPULSE_PROJECT_ID", task.project_id.clone()));
-        if let Some(profile) = task.verification_profile {
-            let profile = match profile {
-                GovernedVerificationProfile::RustWorkspaceV1 => "rust_workspace_v1",
-            };
-            env.push(("IMPULSE_GOVERNED_VERIFICATION_PROFILE", profile.to_string()));
-        }
-    }
-    if governed_task.is_some_and(|task| task.verification_profile.is_some()) {
-        if let Some(routing) = governed_routing {
-            env.push(("IMPULSE_SOCKET_PATH", routing.socket_path.clone()));
-            env.push(("IMPULSE_CONTROL_CLI", routing.control_cli.clone()));
-        }
-    }
     if let Some(assignment) = &request.role_assignment {
         env.push(("IMPULSE_ROLE_ID", assignment.role.to_string()));
     }
@@ -2855,9 +2331,6 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use impulse_ops::governed_task::{
-        ApprovalPolicy, GovernedExecutionState, GovernedReviewState, GovernedTaskId,
-    };
     use impulse_ops::role_assignment::{
         AgentRoleAssignment, AgentRoleId, EnforcementStrength, RoleCapabilityRequirement,
         RuntimeCapabilityId,
@@ -2886,192 +2359,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct TestGovernedTaskGateway {
-        tasks: Mutex<HashMap<GovernedTaskId, GovernedTaskRun>>,
-        promotion_response: Mutex<Option<GovernedPromotionResponse>>,
-        reject_registration: bool,
-        corrupt_registration: bool,
-        reject_running: bool,
-        corrupt_running: bool,
-    }
-
-    impl TestGovernedTaskGateway {
-        fn rejecting() -> Self {
-            Self {
-                tasks: Mutex::new(HashMap::new()),
-                promotion_response: Mutex::new(None),
-                reject_registration: true,
-                corrupt_registration: false,
-                reject_running: false,
-                corrupt_running: false,
-            }
-        }
-
-        fn corrupting_registration() -> Self {
-            Self {
-                corrupt_registration: true,
-                ..Self::default()
-            }
-        }
-
-        fn rejecting_running() -> Self {
-            Self {
-                reject_running: true,
-                ..Self::default()
-            }
-        }
-
-        fn corrupting_running() -> Self {
-            Self {
-                corrupt_running: true,
-                ..Self::default()
-            }
-        }
-
-        fn task(&self, id: &GovernedTaskId) -> Option<GovernedTaskRun> {
-            self.tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(id)
-                .cloned()
-        }
-    }
-
-    impl GovernedTaskGateway for TestGovernedTaskGateway {
-        fn promote_outcome(
-            &self,
-            _request: GovernedPromotionRequest,
-        ) -> Result<GovernedPromotionResponse, String> {
-            self.promotion_response
-                .lock()
-                .unwrap()
-                .clone()
-                .ok_or_else(|| "no test promotion response".to_string())
-        }
-
-        fn register(
-            &self,
-            registration: GovernedTaskRegistration,
-        ) -> Result<GovernedTaskRun, String> {
-            if self.reject_registration {
-                return Err("test daemon rejected registration".to_string());
-            }
-            let task = GovernedTaskRun {
-                id: registration.task_id,
-                revision: 0,
-                project_id: registration.project_id,
-                workspace_root: registration.workspace_root,
-                task: registration.task,
-                acceptance_criteria: registration.acceptance_criteria,
-                approval_policy: ApprovalPolicy::OperatorRequired,
-                world_scope: Default::default(),
-                verification_profile: registration.verification_profile,
-                role_assignment: registration.role_assignment,
-                role_compatibility: registration.role_compatibility,
-                runtime_id: registration.runtime_id,
-                agent_id: registration.agent_id,
-                session_id: registration.session_id,
-                initial_subject_revision: registration.initial_subject_revision,
-                staged_worktree: None,
-                promotions: vec![],
-                execution_state: GovernedExecutionState::Registered,
-                review_state: GovernedReviewState::AwaitingClaim,
-                claims: Vec::new(),
-                verifications: Vec::new(),
-                supervisor_verdicts: Vec::new(),
-                operator_decisions: Vec::new(),
-                events: Vec::new(),
-                created_at: impulse_ops::now_rfc3339(),
-                updated_at: impulse_ops::now_rfc3339(),
-            };
-            self.tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(task.id.clone(), task.clone());
-            let mut response = task;
-            if self.corrupt_registration {
-                response.agent_id = "cross-wired-agent".to_string();
-                response.id = GovernedTaskId::try_new("task-cross-wired-response").unwrap();
-            }
-            Ok(response)
-        }
-
-        fn mutate(&self, request: GovernedTaskMutationRequest) -> Result<GovernedTaskRun, String> {
-            let mut tasks = self
-                .tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let task = tasks
-                .get_mut(&request.task_id)
-                .ok_or_else(|| "test task missing".to_string())?;
-            if task.revision != request.expected_revision {
-                return Err("revision conflict".to_string());
-            }
-            match request.mutation {
-                GovernedTaskMutation::MarkRunning { .. } => {
-                    if self.reject_running {
-                        return Err("test daemon rejected running acknowledgment".to_string());
-                    }
-                    if task.execution_state != GovernedExecutionState::Registered {
-                        return Err("invalid running transition".to_string());
-                    }
-                    task.execution_state = GovernedExecutionState::Running;
-                }
-                GovernedTaskMutation::MarkLaunchFailed { .. } => {
-                    if task.execution_state != GovernedExecutionState::Registered {
-                        return Err("invalid launch-failed transition".to_string());
-                    }
-                    task.execution_state = GovernedExecutionState::LaunchFailed;
-                }
-                GovernedTaskMutation::MarkRuntimeExited { .. } => {
-                    if task.execution_state != GovernedExecutionState::Running {
-                        return Err("invalid runtime-exit transition".to_string());
-                    }
-                    task.execution_state = GovernedExecutionState::RuntimeExited;
-                }
-                _ => return Err("unsupported test mutation".to_string()),
-            }
-            task.revision += 1;
-            task.updated_at = impulse_ops::now_rfc3339();
-            let mut response = task.clone();
-            if self.corrupt_running && response.execution_state == GovernedExecutionState::Running {
-                response.project_id = "cross-wired-project".to_string();
-            }
-            Ok(response)
-        }
-
-        fn mutate_current(
-            &self,
-            project_id: &str,
-            task_id: &GovernedTaskId,
-            request_id: impulse_ops::governed_task::GovernedRequestId,
-            mutation: GovernedTaskMutation,
-        ) -> Result<GovernedTaskRun, String> {
-            let current = self
-                .task(task_id)
-                .ok_or_else(|| "test task missing".to_string())?;
-            self.mutate(GovernedTaskMutationRequest {
-                request_id,
-                project_id: project_id.to_string(),
-                task_id: task_id.clone(),
-                expected_revision: current.revision,
-                mutation,
-            })
-        }
-    }
-
-    fn runtime_with_task_gateway() -> (DesktopRuntime, Arc<TestGovernedTaskGateway>) {
-        let gateway = Arc::new(TestGovernedTaskGateway::default());
-        let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway.clone();
-        (
-            DesktopRuntime::builder()
-                .with_governed_task_gateway(gateway_trait)
-                .build(),
-            gateway,
-        )
-    }
-
     fn spawn_request(rows: u16, cols: u16, command: Option<&str>) -> AgentSpawnRequest {
         AgentSpawnRequest {
             agent_id: Some("agent-1".to_string()),
@@ -3088,8 +2375,6 @@ mod tests {
             role: None,
             task: None,
             role_assignment: None,
-            acceptance_criteria: Vec::new(),
-            verification_profile: None,
             target: None,
         }
     }
@@ -4045,234 +3330,8 @@ mod tests {
     }
 
     #[test]
-    fn test_governed_registration_failure_creates_no_pty_and_reserves_no_agent_id() {
-        let gateway = Arc::new(TestGovernedTaskGateway::rejecting());
-        let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway;
-        let runtime = DesktopRuntime::builder()
-            .with_governed_task_gateway(gateway_trait)
-            .build();
-        let workspace = tempfile::tempdir().expect("temporary governed workspace");
-        let marker = workspace.path().join("pty-created");
-        let root = workspace.path().display().to_string();
-        let mut request = spawn_request(24, 80, Some("sh"));
-        request.agent_id = Some("registration-rejected".to_string());
-        request.args = vec!["-c".to_string(), format!("touch {}", marker.display())];
-        request.cwd = Some(root.clone());
-        request.workspace = Some(WorkspaceTarget::from_root(root));
-        request.task = Some("prove registration gate".to_string());
-        request.role_assignment = Some(role_assignment(
-            "workspace.target",
-            EnforcementStrength::Mediated,
-            true,
-        ));
-
-        let error = runtime.spawn_agent(request).unwrap_err();
-        assert!(matches!(
-            error,
-            DesktopBridgeError::GovernedTaskFailed { ref message }
-                if message.contains("before PTY creation")
-        ));
-        assert!(
-            !marker.exists(),
-            "registration failure must prevent PTY work"
-        );
-
-        let mut legacy = spawn_request(24, 80, Some("sh"));
-        legacy.agent_id = Some("registration-rejected".to_string());
-        legacy.args = vec!["-c".to_string(), "sleep 1".to_string()];
-        let snapshot = runtime
-            .spawn_agent(legacy)
-            .expect("failed registration must not reserve the runtime id");
-        runtime
-            .close_agent(TerminalCloseRequest {
-                session_id: snapshot.agent_id,
-            })
-            .unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_profiled_governed_spawn_requires_routing_before_task_registration() {
-        let gateway = Arc::new(TestGovernedTaskGateway::default());
-        let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway.clone();
-        let runtime = DesktopRuntime::builder()
-            .with_governed_task_gateway(gateway_trait)
-            .build();
-        let workspace = tempfile::tempdir().expect("temporary governed workspace");
-        let run_git = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(workspace.path())
-                .args(args)
-                .status()
-                .expect("run Git fixture command");
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run_git(&["init", "--quiet"]);
-        run_git(&["config", "user.email", "test@example.com"]);
-        run_git(&["config", "user.name", "Impulse Test"]);
-        run_git(&["commit", "--allow-empty", "--quiet", "-m", "initial"]);
-
-        let marker = workspace.path().join("profiled-pty-created");
-        let root = workspace.path().display().to_string();
-        let mut request = spawn_request(24, 80, Some("sh"));
-        request.agent_id = Some("missing-profiled-routing".to_string());
-        request.args = vec!["-c".to_string(), format!("touch {}", marker.display())];
-        request.cwd = Some(root.clone());
-        request.workspace = Some(WorkspaceTarget::from_root(root));
-        request.task = Some("prove control CLI pre-registration gate".to_string());
-        request.role_assignment = Some(role_assignment(
-            "workspace.target",
-            EnforcementStrength::Mediated,
-            true,
-        ));
-        request.acceptance_criteria = vec!["the daemon owns evidence production".to_string()];
-        request.verification_profile = Some(GovernedVerificationProfile::RustWorkspaceV1);
-
-        let error = runtime.spawn_agent(request).unwrap_err();
-        assert!(matches!(
-            error,
-            DesktopBridgeError::GovernedTaskFailed { ref message }
-                if message.contains("requires an executable Impulse control CLI")
-        ));
-        assert!(
-            gateway
-                .tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .is_empty(),
-            "routing failure must happen before daemon task registration"
-        );
-        assert!(!marker.exists(), "routing failure must prevent PTY work");
-    }
-
-    #[test]
-    fn test_invalid_registration_ack_is_durably_rejected_before_pty_creation() {
-        let gateway = Arc::new(TestGovernedTaskGateway::corrupting_registration());
-        let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway.clone();
-        let runtime = DesktopRuntime::builder()
-            .with_governed_task_gateway(gateway_trait)
-            .build();
-        let workspace = tempfile::tempdir().expect("temporary governed workspace");
-        let marker = workspace.path().join("invalid-registration-created-pty");
-        let root = workspace.path().display().to_string();
-        let mut request = spawn_request(24, 80, Some("sh"));
-        request.agent_id = Some("invalid-registration-ack".to_string());
-        request.args = vec!["-c".to_string(), format!("touch {}", marker.display())];
-        request.cwd = Some(root.clone());
-        request.workspace = Some(WorkspaceTarget::from_root(root));
-        request.task = Some("reject cross-wired registration".to_string());
-        request.role_assignment = Some(role_assignment(
-            "workspace.target",
-            EnforcementStrength::Mediated,
-            true,
-        ));
-
-        let error = runtime.spawn_agent(request).unwrap_err();
-        assert!(matches!(
-            error,
-            DesktopBridgeError::GovernedTaskFailed { ref message }
-                if message.contains("did not match")
-        ));
-        assert!(!marker.exists());
-        let tasks = gateway
-            .tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(
-            tasks.values().next().unwrap().execution_state,
-            GovernedExecutionState::LaunchFailed
-        );
-    }
-
-    #[test]
-    fn test_running_ack_failure_consumes_agent_id_after_pty_callbacks_exist() {
-        let gateway = Arc::new(TestGovernedTaskGateway::rejecting_running());
-        let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway.clone();
-        let runtime = DesktopRuntime::builder()
-            .with_governed_task_gateway(gateway_trait)
-            .build();
-        let mut request = spawn_request(24, 80, Some("sh"));
-        let _workspace = bind_to_temporary_workspace(&mut request);
-        request.agent_id = Some("running-ack-rejected".to_string());
-        request.args = vec!["-c".to_string(), "sleep 0.1".to_string()];
-        request.task = Some("reject running acknowledgment".to_string());
-        request.role_assignment = Some(role_assignment(
-            "workspace.target",
-            EnforcementStrength::Mediated,
-            true,
-        ));
-
-        let error = runtime.spawn_agent(request).unwrap_err();
-        assert!(matches!(
-            error,
-            DesktopBridgeError::GovernedTaskFailed { ref message }
-                if message.contains("mark task running")
-        ));
-        assert_eq!(
-            gateway
-                .tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .values()
-                .next()
-                .unwrap()
-                .execution_state,
-            GovernedExecutionState::LaunchFailed
-        );
-
-        let mut retry = spawn_request(24, 80, Some("sh"));
-        retry.agent_id = Some("running-ack-rejected".to_string());
-        retry.args = vec!["-c".to_string(), "sleep 0.1".to_string()];
-        let error = runtime.spawn_agent(retry).unwrap_err();
-        assert!(matches!(
-            error,
-            DesktopBridgeError::InvalidTerminalRequest { ref message }
-                if message.contains("already been used")
-        ));
-    }
-
-    #[test]
-    fn test_cross_wired_running_ack_is_recorded_as_runtime_exit() {
-        let gateway = Arc::new(TestGovernedTaskGateway::corrupting_running());
-        let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway.clone();
-        let runtime = DesktopRuntime::builder()
-            .with_governed_task_gateway(gateway_trait)
-            .build();
-        let mut request = spawn_request(24, 80, Some("sh"));
-        let _workspace = bind_to_temporary_workspace(&mut request);
-        request.agent_id = Some("cross-wired-running".to_string());
-        request.args = vec!["-c".to_string(), "sleep 0.1".to_string()];
-        request.task = Some("reject cross-wired running state".to_string());
-        request.role_assignment = Some(role_assignment(
-            "workspace.target",
-            EnforcementStrength::Mediated,
-            true,
-        ));
-
-        let error = runtime.spawn_agent(request).unwrap_err();
-        assert!(matches!(
-            error,
-            DesktopBridgeError::GovernedTaskFailed { ref message }
-                if message.contains("running acknowledgment")
-        ));
-        assert_eq!(
-            gateway
-                .tasks
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .values()
-                .next()
-                .unwrap()
-                .execution_state,
-            GovernedExecutionState::RuntimeExited
-        );
-    }
-
-    #[test]
     fn test_compatible_assignment_and_task_survive_canonicalized_spawn_snapshot() {
-        let (runtime, gateway) = runtime_with_task_gateway();
+        let runtime = DesktopRuntime::default();
         let mut request = spawn_request(24, 80, Some("sh"));
         let _workspace = bind_to_temporary_workspace(&mut request);
         request.platform = platform_id("generic_shell");
@@ -4304,16 +3363,6 @@ mod tests {
         assert_eq!(compatibility.platform.as_str(), "shell");
         assert!(compatibility.launch_allowed());
         assert!(!compatibility.is_degraded());
-        let governed_task_id = snapshot
-            .governed_task_id
-            .clone()
-            .expect("daemon task id is retained");
-        assert_ne!(governed_task_id.as_str(), snapshot.agent_id);
-        assert_eq!(snapshot.governed_task_revision, Some(1));
-        assert_eq!(
-            gateway.task(&governed_task_id).unwrap().execution_state,
-            GovernedExecutionState::Running
-        );
         runtime
             .close_agent(TerminalCloseRequest {
                 session_id: snapshot.agent_id,
@@ -4323,7 +3372,7 @@ mod tests {
 
     #[test]
     fn test_optional_gap_allows_spawn_and_preserves_degraded_snapshot() {
-        let (runtime, _) = runtime_with_task_gateway();
+        let runtime = DesktopRuntime::default();
         let mut request = spawn_request(24, 80, Some("sh"));
         let _workspace = bind_to_temporary_workspace(&mut request);
         request.args = vec!["-c".to_string(), "sleep 1".to_string()];
@@ -4612,7 +3661,7 @@ mod tests {
             true,
         ));
 
-        let env = runtime_env("agent-1", &request, "sh", None, None, None);
+        let env = runtime_env("agent-1", &request, "sh", None);
         assert!(env
             .iter()
             .any(|(key, value)| *key == "IMPULSE_TASK" && value == "inspect compatibility"));

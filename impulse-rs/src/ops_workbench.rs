@@ -145,18 +145,6 @@ fn preserve_omitted_same_source_agent_facts(
             agent.role_assignment = previous_agent.role_assignment.clone();
             agent.role_compatibility = previous_agent.role_compatibility.clone();
         }
-        if agent.governed_task_id.is_none() {
-            agent.governed_task_id = previous_agent.governed_task_id.clone();
-            agent.governed_task_revision = previous_agent.governed_task_revision;
-        } else if agent.governed_task_id == previous_agent.governed_task_id {
-            agent.governed_task_revision = match (
-                agent.governed_task_revision,
-                previous_agent.governed_task_revision,
-            ) {
-                (Some(incoming), Some(previous)) => Some(incoming.max(previous)),
-                (incoming, previous) => incoming.or(previous),
-            };
-        }
     }
 }
 
