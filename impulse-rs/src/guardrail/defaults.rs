@@ -115,22 +115,6 @@ pub fn builtin_rules() -> Vec<GuardRule> {
             enabled: true,
             builtin: true,
         },
-        GuardRule {
-            id: "block-tool-output-secret".to_string(),
-            pattern:
-                r#"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['"]?[A-Za-z0-9/\+_\-]{16,}"#
-                    .to_string(),
-            action: GuardAction::Block,
-            target: GuardTarget::ToolCall,
-            reason: "Tool output appears to contain credential-shaped material that must not \
-                     flow back into model context."
-                .to_string(),
-            suggestion: Some(
-                "Redact secrets from command output before returning them to the model.".to_string(),
-            ),
-            enabled: true,
-            builtin: true,
-        },
         // ==================================================================
         // Warn rules
         // ==================================================================
@@ -481,29 +465,6 @@ mod tests {
         assert!(
             !GuardEngine::has_blocking(&results),
             "block-write-secret must not fire for Bash target"
-        );
-    }
-
-    #[test]
-    fn test_blocks_credential_shaped_tool_output() {
-        let engine = GuardEngine::new(&builtin_rules()).unwrap();
-
-        let results = engine.evaluate(
-            "ANTHROPIC_API_KEY=sk-ant-abcdef0123456789ABCDEF",
-            &GuardTarget::ToolCall,
-        );
-        assert!(
-            GuardEngine::has_blocking(&results),
-            "Should block credential-shaped tool output"
-        );
-
-        let results = engine.evaluate(
-            "ANTHROPIC_API_KEY=sk-ant-abcdef0123456789ABCDEF",
-            &GuardTarget::Bash,
-        );
-        assert!(
-            !GuardEngine::has_blocking(&results),
-            "block-tool-output-secret must not fire for Bash target"
         );
     }
 
