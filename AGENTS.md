@@ -40,11 +40,11 @@ Memory is one first-class service, not the whole product. Impulse also owns proc
 
 ---
 
-## Desktop Shell Status (as of 2026-07-12)
+## Desktop Shell Status (as of 2026-07-19)
 
-> **egui / impulse-gui is LEGACY.** It is frozen — no new features. The active retirement plan removes it as dead product code after release automation is made truthful; it is not treated as a functional fallback.
+> **egui / impulse-gui is LEGACY.** It is frozen — no new features. The active retirement plan removes it as dead product code after release automation is made truthful; it is not a functional fallback.
 
-The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. It is the cockpit, not the source of operational truth: authoritative workbench state and policy live in Rust daemon/control-plane contracts. Tauri-shaped code is retained only as a temporary compatibility adapter.
+The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. It is the cockpit, not the source of operational truth: authoritative workbench state and policy live in Rust daemon/control-plane contracts. Tauri-shaped code is a separate temporary compatibility adapter and remains until a packaged Dioxus app proves the real host bridge and required operator workflows end to end.
 
 - See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for canonical layer boundaries
 - See `docs/spec/DESKTOP-STACK-TRADEOFFS.md` for the full option evaluation
