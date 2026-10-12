@@ -188,8 +188,9 @@ impl Config {
             m.insert(key, SetRule::String);
         }
 
-        // Optional string fields (empty/"none" clears) (3)
+        // Optional string fields (empty/"none" clears) (4)
         m.insert("impulse_agent_model", SetRule::OptionalString);
+        m.insert("impulse_agent_escalate_model", SetRule::OptionalString);
         m.insert("conflict_webhook_url", SetRule::OptionalString);
 
         // Some-string fields (always wraps in Some) (4)

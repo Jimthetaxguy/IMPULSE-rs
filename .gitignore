@@ -67,3 +67,11 @@ _working-files/
 # Claude Code local hookify copies (machine-local; not product source)
 .claude/hookify.*.local.md
 .claude/*.local.md
+.cargo-target-voice/
+_archive-2026-07-16-L1-el-foreign-tools/
+
+# OpenWiki - local analysis state
+.openwiki/store.db
+
+# Cursor editor state (per-machine)
+.cursor/

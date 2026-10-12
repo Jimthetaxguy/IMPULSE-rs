@@ -1,0 +1,212 @@
+---
+title: "ADR-0015: Harness-Owned Step Model Choice"
+status: accepted
+created: 2026-08-17
+updated: 2026-09-12
+deciders: [Impulse Maintainers]
+---
+
+# ADR-0015: Harness-Owned Step Model Choice
+
+## Status
+
+Accepted.
+
+## Context
+
+Impulse is the harness. A gateway may do keys, rate limits, availability,
+audit, or provider failover. An application decides whether inference is
+permitted and retains its semantic acceptance gate. Neither may independently
+invent a per-step model policy. Final per-step selection stays in the
+Impulse-owned deterministic policy, not in an external proxy such as LiteLLM,
+OpenRouter, ROSA, or quirewiki.
+
+Construction-time resolution (`impulse_agent_model` / `IMPULSE_MODEL` /
+compiled default) remains the configured default. The seam is `ChatRequest.model`
+per request. Fill sites must call harness-owned `decide_step_model` through
+`resolve_step_model` instead of stuffing an env string straight into the request.
+
+ADR-0011 already records four-party attestation (worker claim, verifier
+evidence, supervisor judgment, operator approval). Model choice for a harness
+step belongs beside that arena record. It does not belong on a settlement
+ledger and it does not rewrite ADR-0014.
+
+## Decision
+
+1. **The harness owns final step model choice.** `decide_step_model` is the only
+   policy function. Applications decide whether an LLM runs and resolve a
+   concrete configured/default candidate first. Gateways, `*_BASE_URL`
+   overrides, and `monty/routing.rs` do not pick the final model.
+2. **Publish a pure policy boundary.** `impulse-step-model` contains only the
+   minimal actor/review/verification context, decision, reason, and pure policy.
+   It does not depend on `impulse-ops` and has no HTTP, provider failover,
+   configuration, token/cost tracking, tracing, persistence, TUI, PTY, SQLite,
+   office, or credential authority. Hosts adapt native facts and record the
+   returned evidence in their own audit domains.
+3. **Fill the existing seam.** Call `decide_step_model` through
+   `resolve_step_model` at the API `ChatRequest` fill sites (`Agent::chat`,
+   `run_tool_loop`, `ImpulseAgent::query_stateless`) and at the Ion/API chat
+   surfaces (`handlers::system::handle_chat`,
+   `daemon::handlers::handle_chat_request`). Start on Supervisor + Ion/API.
+   Worker CLI harness model stays opaque. Those chat surfaces use the same
+   harness policy. They must not invent a second picker, an env-only model
+   string, or a gateway router.
+4. **Policy order is host admissibility, then harness capability.**
+   - Host admissibility: the application or provider layer chooses whether
+     inference may occur, selects the provider, and supplies only non-empty,
+     provider-compatible current/configured/escalation candidates. Availability,
+     rate limits, current prices, and provider failover stay outside the pure
+     policy. The host must reject a result outside its admitted candidate set.
+   - Admissibility: Operator never gets a model pick. Verifier stays daemon
+     commands, never an LLM. Supervisor stays API-only, tool-free, and
+     history-free. A model cannot accept a governed task.
+   - Capability: return the configured model, except when latest verification
+     is `Failed`/`Inconclusive` or `review_state` is `VerificationFailed`. Then
+     the optional configured escalate model (`impulse_agent_escalate_model`
+     when a caller has that value) may be used. Escalate from verifier
+     failure, not token count. Do not read `token_tracker`.
+   - Stay on `current_model` unless verifier/attestation failed.
+   - v0 may be identity (`Configured`) when no escalate model is set, as long
+     as the hook is actually called and logged.
+5. **Reason names stay honest.** Do not name a reason `Escalate`. The
+   verifier-failure reason is `AfterVerifierFailure`.
+6. **Host-owned evidence.** Impulse emits a structured `StepModelRecord` (actor,
+   model, reason, tool round, optional `governed_api_actor_id`). Do not attach
+   it to `SettlementRecord`. ROSA and other consumers must emit equivalent
+   host-owned evidence rather than importing Impulse persistence. Durable
+   ledger attachment is later work.
+7. **Default N=1.** One model per step. No ensemble, no router fan-out.
+
+## Consequences
+
+- Construction-time model resolution remains the configured default. Per-request
+  choice is now an explicit harness function instead of a silent copy.
+- Cross-repository consumers can depend on `impulse-step-model` without
+  compiling or linking the Impulse application graph.
+- A later caller can populate `HarnessStepContext` from governed-task state
+  through Impulse's adapter without exporting `impulse-ops` as application
+  vocabulary.
+- Optional `impulse_agent_escalate_model` is a State config key copied onto
+  `HarnessStepContext` by `resolve_from_config`, so CLI query, TUI, and the
+  daemon cache share the same escalate model. Policy is unchanged.
+- Worker CLI protocol is unchanged. PRs that add provider base-URL overrides
+  or settlement records are independent and must not be stacked under this
+  decision.
+
+## Validation
+
+This decision is represented when tests prove:
+
+1. `decide_step_model` is called (via `resolve_step_model`) at the three API fill sites and at system/daemon `handle_chat`;
+2. v0 is identity unless verifier/attestation failed and an escalate model is
+   set;
+3. token count / tool-round volume does not escalate;
+4. Operator and Verifier actors do not receive an escalate model;
+5. `StepModelRecord` / decision types round-trip; and
+6. the arena log reuses `governed_api_actor_id` when present;
+7. `impulse-step-model` has no dependency on `impulse-rs` or `impulse-ops`; and
+8. an external consumer can compile the policy without the Impulse application
+   dependency graph.
+
+## ROSA consumer boundary
+
+ROSA has no independent harness-step model policy. It resolves its provider and
+concrete configured/default model, calls `impulse-step-model`, then emits a
+ROSA-owned trace record before constructing the provider request. ROSA must not
+grow `selector.rs` into a second picker and must not depend on the full
+`impulse-rs` application for this call.
+
+| Owner | Responsibility | Not owned |
+|---|---|---|
+| Impulse | `decide_step_model`: actor/verification-aware final model + reason | Whether ROSA runs inference, provider transport, ROSA audit persistence |
+| ROSA | Inference permission, provider/default resolution, admitted candidates, host trace | Independent step-model policy |
+| Provider adapter | Serialize and send the exact selected model | Silent defaulting after policy, provider failover inside policy |
+
+James locked the single-picker boundary on 2026-08-19. The 2026-08-23 crate
+extraction makes that decision portable instead of requiring ROSA to import the
+Impulse product.
+
+
+## Addendum: chat surfaces on origin/main (2026-09-02)
+
+`origin/main` at `4e581f3` (was `36bda00` when this addendum first landed on
+2026-09-02; tip advanced through daemon provenance ADR-0018 and related
+merges without changing the chat seam) routes system and daemon `handle_chat`
+through `resolve_step_model` with `HarnessStepContext::ion_api`. That is the
+same harness policy as the three API fill sites. It is not a second picker.
+Decision #3 above is updated to match that tree. The prior wording that said
+not to add a picker in those paths meant do not invent a separate chat-local
+model policy. Calling `resolve_step_model` there is required seam fill.
+
+Earlier local-only tip `9c586ba` held an equivalent chat-surface write before
+main advanced; that commit is no longer on the branch tip after a reset to
+`origin/main`. The live seam on HEAD is what this addendum records.
+
+Checked again on 2026-09-06: both chat fill sites (`handlers::system::handle_chat`
+and `daemon::handlers::handle_chat_request`) still call `resolve_step_model` with
+`HarnessStepContext::ion_api` on `origin/main` at `4e581f3`.
+
+Checked again on 2026-09-08: same two chat fill sites still call
+`resolve_step_model` with `HarnessStepContext::ion_api` on this checkout tip
+`4f9cb3d` (PR #51 branch; `origin/main` still `4e581f3`). Portable crate
+Inconclusive and review-failure tests now lock `AfterVerifierFailure` reason,
+not only the model string.
+
+Checked again on 2026-09-09: same two chat fill sites still call
+`resolve_step_model` with `HarnessStepContext::ion_api` on tip `4f9cb3d`
+(`origin/main` still `4e581f3`). Portable stay-configured paths
+(failure-without-escalate, blank escalate, tool-round, Operator/Verifier,
+empty current) now lock `Configured` reason to match the Impulse wrapper.
+
+Checked again on 2026-09-10: same two chat fill sites still call
+`resolve_step_model` with `HarnessStepContext::ion_api` on tip `4f9cb3d`
+(`origin/main` still `4e581f3`). Portable `StepModelContext::system` and
+Impulse `HarnessStepContext::system` constructors now sit next to
+worker/`ion_api` and supervisor for the three escalate-capable actors.
+
+Checked again on 2026-09-12: `origin/main` advanced to `8dfd2ab` (reservation
+journal #45, Ion tool floor #46, docx streaming #49, ADR-0019 reland #50).
+Both chat fill sites (`handlers::system::handle_chat`, line 255, and
+`daemon::handlers::handle_chat_request`, line 1495) still call
+`resolve_step_model` with `HarnessStepContext::ion_api`. No second picker.
+
+## Addendum: ROSA imports `decide_step_model`
+
+ROSA has no harness-step model policy. Impulse already owns that policy in `decide_step_model`. ROSA must call that function. ROSA must not grow `selector.rs` into a second picker.
+
+Codee mapped rosa-renew-build @ `0f1d4e2` against Impulse main `76ab525`:
+
+| Who | File / fn | What it sets | Step policy? |
+|---|---|---|---|
+| Impulse | `step_model.rs` `decide_step_model` | `ChatRequest.model` | Yes. Admissibility, then verifier-failure escalate, then stay on `current_model`. |
+| Impulse | `Agent::chat`, `run_tool_loop`, `ImpulseAgent::query_stateless`, `handlers::system::handle_chat`, `daemon::handlers::handle_chat_request` | Calls `resolve_step_model` / the hook | Yes. |
+| ROSA | `selector.rs` `select()` | `BackendId` from `ROSA_BACKEND` / catalog score | No. Exported. No production caller. Same class as `monty/routing.rs`. |
+| ROSA | `team.rs` `AgentRole::to_request` | `RunRequest.model` from role model or `Team.default_model` | No. Construction-time string. |
+| ROSA | anthropic/gemini `start_run` | empty → compiled `DEFAULT_MODEL`; same string for the tool loop | No. |
+| ROSA | `dispatch_spawn_subagent` | copies `parent_model` | No. Tool-in-loop inherit. |
+
+`spawn_subagent` is a tool-in-loop. It is not an A2A row.
+
+Jim locked 2026-08-19: Impulse stays the only picker. ROSA has no step picker and should call Impulse's `decide_step_model`.
+
+Do not add LiteLLM, OpenRouter, or a ROSA sibling of `decide_step_model`.
+
+## Addendum: discrete semantic judgments are not this function (2026-09-17)
+
+`decide_step_model` stays a **deterministic** per-step model-id policy: actor, verification/review, `configured`, optional host-admitted `escalate_model`. It does not classify tools, score intent, or call a critic.
+
+Dev-time critics (typed noul/choice/score over an authored answer space) may be used **outside** this crate to find holes. Findings land as ordinary Impulse tests and gates (capability, confirmation, sandbox, allowlists). They must not:
+
+- grow `impulse-step-model` with probability inputs,
+- become a second picker or vendor router,
+- run in product runtime as a model-in-the-loop for `ChatRequest.model`.
+
+If a critic pack’s “should we escalate?” is always “only after verification failed,” that fact is already this function. Do not duplicate it.
+
+## Related Documents
+
+- [`0011-governed-task-run-lifecycle.md`](0011-governed-task-run-lifecycle.md)
+- [`0012-daemon-owned-governed-runtime-producers.md`](0012-daemon-owned-governed-runtime-producers.md)
+- [`../../impulse-rs/impulse-step-model/README.md`](../../impulse-rs/impulse-step-model/README.md)
+- [`../../VISION.md`](../../VISION.md)
+- [`../spec/RUST-CANONICAL-CONTRACT.md`](../spec/RUST-CANONICAL-CONTRACT.md)
