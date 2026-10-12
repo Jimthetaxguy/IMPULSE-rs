@@ -666,6 +666,12 @@ impl DesktopRuntime {
         }
     }
 
+    pub fn downgrade(&self) -> WeakDesktopRuntime {
+        WeakDesktopRuntime {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     pub fn spawn_agent(
         &self,
         request: AgentSpawnRequest,
