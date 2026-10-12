@@ -1,6 +1,8 @@
 ---
 title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
+version: '2.6'
+updated: '2026-07-13'
 version: '2.8'
 updated: '2026-09-26'
 schema_version: '1.0'
@@ -10,6 +12,7 @@ category: docs
 # Navigation Tree
 
 roadmap_contract: >-
+  Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only
   Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only
 
 quick_reference:
@@ -60,6 +63,7 @@ quick_reference:
 
 active_tracks:
   - name: Control-Plane Foundations
+    description: Current implementation boundary and governed supervisor-builder roadmap
     description: Current profiled producer boundary and governed supervisor-builder roadmap
     docs:
       - ../VISION.md
@@ -79,6 +83,7 @@ phases:
       path: ARCHITECTURE-CLARIFICATION.md
 
   next:
+    - name: Governed Supervisor and Builder Vertical Slice
     - name: Complete Launched-Runtime Governed Workflow
       path: ../VISION.md
     - name: User Story Map
@@ -184,6 +189,9 @@ validation_and_history:
     path: guides/HOOK-VALIDATION-GUIDE.md
 
 metadata:
+  total_documents: 136
+  categories: 9
+  decisions: 10
   total_documents: 140
   categories: 9
   decisions: 12

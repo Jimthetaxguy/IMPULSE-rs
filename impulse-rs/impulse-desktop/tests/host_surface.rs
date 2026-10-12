@@ -147,6 +147,20 @@ async fn test_host_native_island_command_surface_returns_dto() {
 }
 
 #[tokio::test]
+async fn test_host_native_island_file_open_panel_is_unhandled_without_desktop_app_feature() {
+    let result = host_commands::native_island_request(NativeIslandRequest {
+        request_id: "host-folder".to_string(),
+        kind: NativeIslandKind::FileOpenPanel,
+        payload: json!({}),
+    })
+    .await
+    .expect("native island command should route");
+
+    #[cfg(not(feature = "desktop-app"))]
+    assert!(!result.handled);
+}
+
+#[tokio::test]
 async fn test_host_workspace_registration_preserves_project_notes() {
     let memory_root = tempfile::tempdir().expect("tempdir");
     let state = host_commands::DesktopShellState::new(
