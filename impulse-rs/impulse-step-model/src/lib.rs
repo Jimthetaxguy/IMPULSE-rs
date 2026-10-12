@@ -208,12 +208,6 @@ mod tests {
 
     #[test]
     fn test_decide_step_model_system_after_failure_uses_admitted_escalation_model() {
-        // System is on the crate enum and is not blocked the way Operator and
-        // Verifier are. After verification Failed it may take an admitted
-        // escalate_model. The Impulse wrapper already locks GovernedActorKind::System;
-        // this locks the portable StepActor::System path.
-        let mut ctx = StepModelContext::worker("sonnet");
-        ctx.actor = StepActor::System;
         // System is escalate-capable (Operator and Verifier stay blocked). Use
         // StepModelContext::system next to worker and supervisor for the three
         // escalate-capable actors.

@@ -394,7 +394,6 @@ impl ImpulseAgent {
             config: ImpulseAgentConfig {
                 mode: AgentMode::Api {
                     provider: ImpulseProvider::Anthropic,
-                    model: Some(model.clone()),
                     // Keep the raw configuration unresolved so governed
                     // provenance tests exercise the production `model=None`
                     // path. `Agent::new` owns the resolved model actually sent
@@ -1760,12 +1759,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn test_harness_query_kills_hung_child_instead_of_orphaning() {
-        // Regression test for full process-group cleanup on the explicit
-        // timeout path. The fake wrapper publishes its own PID and its sleep
-        // child's PID so the proof observes only processes this test owns.
     /// Writes an executable wrapper script that backgrounds a `sleep`
     /// grandchild, publishes `"$$\n$child\n"` (wrapper pid, grandchild pid)
     /// to `pid_file`, then blocks in `wait` like a hung harness CLI. The
@@ -1792,29 +1785,6 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
         }
-        let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
-        let agent = ImpulseAgent::new(config)
-            .expect("harness agent should construct")
-            .with_test_harness_command(script_path.clone());
-
-        let result = agent
-            .harness_query_structured_with_timeout(
-                "system",
-                "hello",
-                &[],
-                None,
-                Duration::from_secs(2),
-            )
-            .await;
-        assert!(matches!(result, Err(AgentError::HarnessTimedOut { .. })));
-
-        let contents = std::fs::read_to_string(&pid_file)
-            .expect("fake harness must publish wrapper and child pids before timeout");
-        let pids = contents
-            .lines()
-            .map(|line| line.parse::<u32>().expect("pid file must contain integers"))
-            .collect::<Vec<_>>();
-        assert_eq!(pids.len(), 2, "pid file must identify wrapper and child");
         (dir, script_path, pid_file)
     }
 
@@ -1914,29 +1884,6 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn test_aborting_harness_query_kills_the_whole_process_group() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script_path = dir.path().join("claude");
-        let pid_file = dir.path().join("harness-pids");
-        std::fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nsleep 60 &\nchild=$!\nprintf '%s\\n%s\\n' \"$$\" \"$child\" > \"{}\"\nwait\n",
-                pid_file.display()
-            ),
-        )
-        .expect("write fake harness script");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path)
-                .expect("stat fake harness script")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
-        }
-        let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
-        let agent = ImpulseAgent::new(config)
-            .expect("harness agent should construct")
-            .with_test_harness_command(script_path.clone());
         let (_dir, script_path, pid_file) = write_pid_publishing_fake_harness();
         let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
         let agent = ImpulseAgent::new(config)
@@ -1954,22 +1901,6 @@ mod tests {
                 .await
         });
 
-        let pids = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
-                    let pids = contents
-                        .lines()
-                        .filter_map(|line| line.parse::<u32>().ok())
-                        .collect::<Vec<_>>();
-                    if pids.len() == 2 {
-                        break pids;
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("fake harness grandchild did not start");
         let pids = wait_for_published_pids(&pid_file).await;
 
         task.abort();

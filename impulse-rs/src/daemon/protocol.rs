@@ -346,8 +346,6 @@ mod tests {
     // ── PROTOCOL_VERSION ───────────────────────────────────────────────
 
     #[test]
-    fn test_protocol_version_is_three() {
-        assert_eq!(PROTOCOL_VERSION, 3);
     fn test_protocol_version_is_nine() {
         // v7 (ADR-0018) adds PresentOperatorCapability and the operator-class
         // requirement on RecordOperatorDecision. v8 (ADR-0019) adds the

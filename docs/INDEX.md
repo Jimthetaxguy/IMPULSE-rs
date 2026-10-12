@@ -1,10 +1,6 @@
 ---
 title: Documentation Index
 description: Master navigation hub for Impulse documentation
-version: '1.4'
-updated: 2026-07-12
-version: '1.5'
-updated: 2026-07-13
 version: '1.7'
 updated: 2026-09-26
 type: doc
@@ -13,8 +9,6 @@ phase: all
 status: active
 audience: everyone
 tags: [index, navigation, discovery]
-last_updated: 2026-07-12
-last_updated: 2026-07-13
 last_updated: 2026-09-26
 authors:
   - name: Impulse Maintainers
@@ -30,9 +24,6 @@ authors:
 > current implementation contract [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md).
 >
 > **Canonical stack: Rust (impulse-rs)**
-> **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
-> **Current launch slice:** explicit product role/task preflight and typed compatibility telemetry.
-> **Next governed slice:** daemon-owned task evidence, verification results, and supervisor decisions.
 > **Roadmap contract:** Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 > **Current governed slice:** profiled Builder preflight, exact criteria, daemon-attested clean Git
 > subjects, daemon-derived claim/verification, strict API Supervisor review, operator acceptance,
@@ -65,8 +56,6 @@ authors:
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | **Authoritative contract for current product behavior**                    | all   |
 | [USER-STORY-MAP.md](spec/USER-STORY-MAP.md)                   | Rust-first product stories, acceptance criteria, and story status          | all   |
 | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)             | Story-to-test map for the current Rust workspace                           | all   |
-| [COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md) | Market analysis and differentiation                                        | all   |
-| [PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)         | Performance budgets and benchmarks                                         | 1-2   |
 
 ### Product North Star and Boundaries
 
@@ -76,33 +65,12 @@ authors:
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative contract for current implemented behavior |
 | [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) | Current code boundary matrix and enforcement truth |
 
-ADR-0010 accepts only the explicit role/task launch-preflight boundary. Do not split separate
-role/runtime/supervisor schema documents until the remaining hierarchy, adapter, lifecycle, and
-generalized capability-negotiation decisions listed in `VISION.md` are resolved.
 ADR-0010 accepts role/task launch preflight, ADR-0011 accepts the governed-task lifecycle,
 ADR-0012 accepts the first daemon-owned producer profile, and ADR-0013 accepts deterministic
 pending accepted-run candidates. Do not split separate
 role/runtime/supervisor schema documents until the
 remaining hierarchy, adapter, reassignment, and generalized capability-negotiation decisions listed
 in `VISION.md` are resolved.
-
-### Validation and Historical Risk
-
-| Document | Scope |
-| --- | --- |
-| [HONEST-ROADMAP.md](HONEST-ROADMAP.md) | Historical hook/memory validation register; not current roadmap authority |
-| [HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md) | Current procedure for generating real Claude hook evidence |
-
-### Product North Star and Boundaries
-
-| Document | Description |
-| --- | --- |
-| [VISION.md](../VISION.md) | **Living product north star:** control-plane promise, hierarchy, live-versus-target boundary, and complete vertical slice |
-| [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative contract for current implemented behavior |
-| [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) | Current code boundary matrix and enforcement truth |
-
-Do not split separate role/runtime/supervisor schema documents until the hierarchy, adapter, and
-enforcement-strength ADR decisions listed in `VISION.md` are resolved.
 
 ### Validation and Historical Risk
 
@@ -255,9 +223,6 @@ See [research/README.md](research/README.md) for reading sequences by phase.
 
 Older Ralph loop plans and `ROADMAP-PLAN.md` are preserved for provenance only. Use
 [`VISION.md`](../VISION.md),
-`spec/RUST-CANONICAL-CONTRACT.md`, and `decisions/0008-dioxus-desktop-host.md` for current guidance.
-`spec/RUST-CANONICAL-CONTRACT.md`, `decisions/0008-dioxus-desktop-host.md`, and
-`decisions/0010-product-role-launch-contract.md` for current guidance.
 `spec/RUST-CANONICAL-CONTRACT.md`, `decisions/0008-dioxus-desktop-host.md`,
 `decisions/0010-product-role-launch-contract.md`,
 `decisions/0011-governed-task-run-lifecycle.md`, and
@@ -279,24 +244,7 @@ Start here:
 6. [AGENTS.md](../AGENTS.md) — Current architecture and operational guidance
 7. [COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md) — Agent lane, worktree, and handoff rules
 8. [ROADMAP-PLAN.md](ROADMAP-PLAN.md) — Superseded desktop implementation history
-9. [BEST-PRACTICES.md](guides/BEST-PRACTICES.md) — Coding conventions
 
-### Next: Governed Supervisor/Builder Vertical Slice + Hierarchy/Enforcement ADR
-
-1. [VISION.md](../VISION.md) — Ten-step governed workflow and unresolved hierarchy decisions
-2. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — Live foundations and contract boundary
-3. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Enforcement and authority boundary map
-4. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Acceptance criteria for current surfaces
-5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Evidence map and known gaps
-
-### Next: Daemon-Owned Governed-Run Evidence/Decision Lifecycle
-
-1. [0010-product-role-launch-contract.md](decisions/0010-product-role-launch-contract.md) — Live preflight boundary and explicit next lifecycle
-2. [VISION.md](../VISION.md) — Ten-step governed workflow and unresolved lifecycle/hierarchy decisions
-3. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — Live foundations and contract boundary
-4. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Enforcement and authority boundary map
-5. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Acceptance criteria for current surfaces
-6. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Evidence map and known gaps
 ### Next: Complete Launched-Runtime Governed Workflow
 
 1. [0013-deterministic-accepted-run-memory-candidates.md](decisions/0013-deterministic-accepted-run-memory-candidates.md) — Live pending review projection and explicit no-promotion boundary
@@ -327,7 +275,6 @@ Start here:
 | `spec`         | RUST-CANONICAL-CONTRACT, USER-STORY-MAP, TEST-TRACEABILITY                   |
 | `hooks`        | RUST-CANONICAL-CONTRACT, HOOK-VALIDATION-GUIDE                               |
 | `memory`       | impulse-memory-architecture, MEMORY-EXTRACTION-ANALYSIS, PHASE2-PERSISTENCE |
-| `testing`      | TEST-TRACEABILITY, TESTING-FRAMEWORK, SYNTHETIC-TESTING-GUIDE               |
 | `testing`      | TEST-TRACEABILITY; phase-era testing guides are historical                   |
 | `validation`   | HOOK-VALIDATION-GUIDE, HONEST-ROADMAP                                        |
 | `architecture` | RESEARCH-DIGEST, ADRs                                                       |

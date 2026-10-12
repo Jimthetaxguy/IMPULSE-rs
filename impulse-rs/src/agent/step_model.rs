@@ -298,13 +298,6 @@ mod tests {
 
     #[test]
     fn test_decide_step_model_system_actor_can_escalate_after_verifier_failure() {
-        // ADR-0015 blocks only Operator and Verifier. System maps through and
-        // may take an admitted escalate_model after verification failed.
-        let mut ctx = configured_ctx("haiku");
-        ctx.actor = GovernedActorKind::System;
-        ctx.latest_verification = Some(GovernedVerificationOutcome::Failed);
-        ctx.escalate_model = Some("sonnet".to_string());
-        let decision = decide_step_model(&ctx, "haiku");
         // ADR-0015 blocks only Operator and Verifier. Use
         // HarnessStepContext::system next to ion_api and supervisor for the
         // three escalate-capable actors.

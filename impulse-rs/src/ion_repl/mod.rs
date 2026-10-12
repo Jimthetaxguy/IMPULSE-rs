@@ -634,10 +634,6 @@ mod tests {
         )
     }
 
-    fn init_git_repo() -> tempfile::TempDir {
-        init_git_repo_with_empty_commit()
-    }
-
     #[tokio::test]
     async fn test_respond_empty_returns_no_text_and_does_not_exit() {
         let tools = ReplToolRegistry::with_defaults();

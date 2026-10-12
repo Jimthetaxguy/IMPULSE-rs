@@ -1867,9 +1867,6 @@ pub(crate) async fn handle_ops_request(
 const AGENT_BUSY_RETRY_AFTER_MS: u64 = 250;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct AgentTurnBusy;
-
-fn agent_turn_busy_response() -> DaemonResponse {
 pub(super) struct AgentTurnBusy;
 
 pub(super) fn agent_turn_busy_response() -> DaemonResponse {
@@ -1897,7 +1894,6 @@ pub(super) fn agent_turn_busy_response() -> DaemonResponse {
 /// guard forever. Fail-fast acquisition also guarantees a request cannot wait
 /// behind another full provider timeout and later commit a turn after its
 /// client has disconnected.
-fn try_lock_agent_for_turn<'a>(
 pub(super) fn try_lock_agent_for_turn<'a>(
     cached_agent: &'a tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>,
     state: &SharedState,

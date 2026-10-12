@@ -2,7 +2,6 @@
 title: "ADR-0015: Harness-Owned Step Model Choice"
 status: accepted
 created: 2026-08-17
-updated: 2026-09-02
 updated: 2026-09-12
 deciders: [Impulse Maintainers]
 ---
@@ -127,21 +126,6 @@ James locked the single-picker boundary on 2026-08-19. The 2026-08-23 crate
 extraction makes that decision portable instead of requiring ROSA to import the
 Impulse product.
 
-
-## Addendum: chat surfaces on origin/main (2026-09-02)
-
-`origin/main` at `36bda00` routes system and daemon `handle_chat` through
-`resolve_step_model` with `HarnessStepContext::ion_api`. That is the same
-harness policy as the three API fill sites. It is not a second picker.
-Decision #3 above is updated to match that tree. The prior wording that said
-not to add a picker in those paths meant do not invent a separate chat-local
-model policy. Calling `resolve_step_model` there is required seam fill.
-
-Earlier local-only tip `9c586ba` held an equivalent chat-surface write before
-main advanced; that commit is no longer on the branch tip after a reset to
-`origin/main`. The live seam on HEAD is what this addendum records.
-
-## Related Documents
 
 ## Addendum: chat surfaces on origin/main (2026-09-02)
 

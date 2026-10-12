@@ -1,16 +1,6 @@
 # IMPULSE — Feed the impulse to build.
 
 - **Status:** Living product north star
-- **Updated:** 2026-07-12
-- **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
-- **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
-- **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
-- **Updated:** 2026-07-13
-- **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
-- **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
-- **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
-- **Current launch slice:** explicit product role/task preflight and typed compatibility telemetry.
-- **Next governed slice:** daemon-owned task evidence, verification results, and supervisor decisions.
 - **Updated:** 2026-09-02
 - **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
@@ -55,7 +45,6 @@ Impulse is differentiated by treating those agents as workers inside one governe
 - It supports both wrapped third-party harnesses and an Impulse-native runtime.
 - It treats memory as a governed platform service with provenance, not an indiscriminate transcript dump.
 - It separates worker claims, observed evidence, supervisor judgment, and user approval.
-- It keeps the cockpit replaceable by making backend contracts authoritative.
 - It keeps operator surfaces replaceable by making daemon and backend contracts authoritative.
 
 ## Product hierarchy
@@ -63,17 +52,6 @@ Impulse is differentiated by treating those agents as workers inside one governe
 These concepts must stay separate:
 
 ```text
-project / workspace scope
-        |
-        +-- task (assignment + completion criteria)
-        |      |
-        |      +-- agent instance
-        |             +-- role
-        |             +-- runtime
-        |             +-- session(s)
-        |             +-- terminal/API channel
-        |
-        +-- project memory, artifacts, policy, and verification
 project (governance scope) <------> workspace target (execution root)
         |                                      |
         +-- task                               +-- agent process / PTY
@@ -93,7 +71,6 @@ pane = a cockpit view onto an agent channel, never the authority
 - A **runtime** is the execution engine or harness integration.
 - An **agent instance** is one running identity assigned a role/runtime/scope.
 - A **session** is bounded recorded work, not necessarily process lifetime.
-- A **task** is an assignment and its acceptance evidence; it may span sessions.
 - A **task** is the broader assignment concept. A **governed task** is today's durable daemon-owned
   carrier for that assignment and its acceptance evidence; it may outlive one runtime process.
   Reassignment/resume under a different agent or runtime is not implemented yet.
@@ -101,8 +78,6 @@ pane = a cockpit view onto an agent channel, never the authority
 - A **workspace target** is the filesystem root used for execution.
 - A **project** is the governance boundary for memory, artifacts, policy, and verification.
 
-The exact cardinalities and durable identifiers remain an ADR decision. This hierarchy is enough to
-prevent the most harmful conflations without prematurely freezing the schema.
 ADR-0011 makes the governed task ID durable and distinct from agent/session identity. The remaining
 cardinalities, durable project identity, and task reassignment rules still require an ADR. This
 hierarchy is enough to prevent the most harmful conflations without prematurely freezing the rest
@@ -158,8 +133,6 @@ control plane and should share platform services where their capabilities allow 
 
 ## Capability negotiation
 
-Different runtimes support different operations. A future adapter contract must report rather than
-hide those differences. Relevant capabilities include:
 Different runtimes support different operations. A future generalized/dynamic adapter contract must
 report rather than hide those differences. Relevant capabilities include:
 
@@ -324,7 +297,6 @@ needs a reason and an audit path. The user can interrupt, narrow, revoke, review
 - Rust daemon and versioned workbench protocol/read models.
 - PTY spawn/write/resize/focus/exit lifecycle and process cleanup.
 - Dioxus Desktop host/bridge plus ratatui and CLI operator surfaces.
-- Open registry-backed desktop platform identity and launch metadata.
 - Registry-backed desktop platform identity and launch metadata.
 - Explicit product-role/task launch preflight, backend mandatory-capability gate, and typed
   compatibility telemetry.
@@ -352,8 +324,6 @@ needs a reason and an audit path. The user can interrupt, narrow, revoke, review
 - Credential provider abstraction, artifacts, delegations, and verification gates.
 - Ion interactive native coding runtime with direct providers, typed tools, guardrails, and loop bounds.
 
-This contract describes the verified local implementation. Publishing a remote release is a
-separate action and must not be inferred from local branch integration.
 This contract describes the current repository implementation. Inclusion in a tagged release is
 a separate action and must not be inferred from repository state alone.
 
@@ -365,7 +335,6 @@ a separate action and must not be inferred from repository state alone.
 - Typed cross-agent messaging, acknowledgements, routing, and project isolation.
 - Role-scoped tools, credentials, context, memory, and verification policies.
 - Event-driven supervisor attention and resource budgets.
-- Evidence-backed task completion visible in one cockpit.
 - Stronger same-user actor authorization and a process-level proof across launched Builder and
   Supervisor runtimes.
 - Explicit operator promotion/dismissal for pending candidates, including semantic validation,
@@ -384,12 +353,6 @@ subsystem:
 6. The supervisor receives prioritized summaries and can request context, evidence, or revision.
 7. The builder uses at least one Impulse-provided typed tool and produces a provenance-bearing artifact.
 8. Project verification runs and records exact evidence.
-9. The supervisor accepts, rejects, or escalates based on evidence; the user sees and controls the decision.
-10. Only verified outcomes become scoped durable memory, with an inspectable reason and source.
-
-The explicit Builder task/role preflight and compatibility telemetry now establish part of steps
-3-5. Daemon-owned task evidence, verification results, supervisor decisions, and durable-memory
-promotion remain the next governed-run slice; the complete workflow is not yet live.
 9. The supervisor recommends acceptance, requests changes, or escalates based on evidence; the
    operator explicitly approves or rejects an accept recommendation.
 10. Only accepted, verified outcomes become scoped durable memory, with an inspectable reason and source.
@@ -428,23 +391,6 @@ so step 10 and the complete multi-runtime workflow are not yet closed.
 
 ## Open ADR decisions
 
-The following decisions must be resolved together before schema-specific documents split out:
-
-1. Exact hierarchy/cardinality and durable ids for project, workspace, role, runtime, instance,
-   session, task, pane, and supervisor scope.
-2. Minimum runtime-adapter interface and semantics for optional/emulated operations.
-3. Capability/enforcement-strength vocabulary and launch-blocking rules.
-4. Role contract composition, override, persistence, and migration.
-5. Cross-agent message routing, direct worker communication, acknowledgement, and isolation.
-6. Memory authorship, verification, conflict resolution, correction, forgetting, and inheritance.
-7. Credential grants, revocation, audit, redaction, and cross-project prevention.
-8. Supervisor scheduling, attention summaries, context budget, and intervention priority.
-9. Verification profiles and who has final approval by impact class.
-ADR-0010 accepts only the explicit product-role/task launch-preflight contract. The following
-broader decisions remain open and must be resolved before schema-specific documents split out:
-
-1. Exact hierarchy/cardinality and durable ids for project, workspace, role, runtime, instance,
-   session, task, pane, and supervisor scope.
 ADR-0010 accepts the product-role/task launch preflight, ADR-0011 accepts the daemon-owned
 governed-task lifecycle, ADR-0012 accepts the first daemon-owned producer profile, and ADR-0013
 accepts the deterministic pending-candidate projection. The following broader decisions remain open
@@ -457,10 +403,6 @@ and must be resolved before schema-specific documents split out:
    discovery, attestation freshness, emulation, and post-launch re-evaluation.
 4. Role contract composition, override, persistence, and migration.
 5. Cross-agent message routing, direct worker communication, acknowledgement, and isolation.
-6. Memory authorship, verification, conflict resolution, correction, forgetting, and inheritance.
-7. Credential grants, revocation, audit, redaction, and cross-project prevention.
-8. Supervisor scheduling, attention summaries, context budget, and intervention priority.
-9. Verification profiles and who has final approval by impact class.
 6. Candidate promotion/dismissal authorization plus memory authorship, semantic verification,
    conflict resolution, correction, forgetting, and inheritance.
 7. Credential grants, revocation, audit, redaction, and cross-project prevention.
