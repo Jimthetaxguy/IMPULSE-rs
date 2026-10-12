@@ -35,28 +35,7 @@ fn impulse_rs_dir() -> PathBuf {
 /// `#[cfg(test)]`-gated module regardless of visibility -- this is a
 /// deliberate, minimal, kept-in-sync copy, not a missed consolidation.
 fn init_git_repo() -> tempfile::TempDir {
-    let dir = tempfile::TempDir::new().expect("failed to create tempdir");
-    let run = |args: &[&str]| {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(dir.path())
-            .args(args)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("HOME", dir.path())
-            .output()
-            .expect("failed to run git");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
-    run(&["init", "--quiet"]);
-    run(&["config", "user.email", "test@example.com"]);
-    run(&["config", "user.name", "Test"]);
-    run(&["commit", "--allow-empty", "--quiet", "-m", "init"]);
-    dir
+    impulse_rs::test_git_repo::init_git_repo_with_empty_commit()
 }
 
 fn run_ion_verify_cli(repo: &Path, gate_script: &Path, extra_args: &[&str]) -> Output {

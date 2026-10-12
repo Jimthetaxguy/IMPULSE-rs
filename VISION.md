@@ -1,12 +1,18 @@
 # IMPULSE — Feed the impulse to build.
 
 - **Status:** Living product north star
-- **Updated:** 2026-07-13
+- **Updated:** 2026-09-02
 - **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
 - **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
 - **Current launch slice:** explicit product role/task preflight and typed compatibility telemetry.
 - **Next governed slice:** daemon-owned task evidence, verification results, and supervisor decisions.
+
+## In one sentence
+
+Impulse is the local operating environment for coding agents: it launches and scopes heterogeneous
+terminal runtimes, supervises their work, and holds completion to observed evidence and human
+approval — without replacing the CLIs builders already use.
 
 ## The promise
 
@@ -39,7 +45,7 @@ Impulse is differentiated by treating those agents as workers inside one governe
 - It supports both wrapped third-party harnesses and an Impulse-native runtime.
 - It treats memory as a governed platform service with provenance, not an indiscriminate transcript dump.
 - It separates worker claims, observed evidence, supervisor judgment, and user approval.
-- It keeps the cockpit replaceable by making backend contracts authoritative.
+- It keeps operator surfaces replaceable by making daemon and backend contracts authoritative.
 
 ## Product hierarchy
 
