@@ -25,7 +25,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: impulse-rs
-      - run: cargo test
+      - name: Test (default features, includes office-support)
+        run: cargo test
+      - name: Test lib (minimal, no default features)
+        run: cargo test --no-default-features --lib
 
   lint:
     name: Lint

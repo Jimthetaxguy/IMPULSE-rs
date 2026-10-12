@@ -600,10 +600,20 @@ where
         }
         Commands::GovernedClaim { .. }
         | Commands::GovernedVerify { .. }
-        | Commands::GovernedReview { .. } => {
+        | Commands::GovernedReview { .. }
+        | Commands::GovernedPromote { .. }
+        | Commands::GovernedDiscard { .. } => {
             anyhow::bail!(
                 "governed producer commands require --daemon so the project daemon remains authoritative"
             );
+        }
+        Commands::InternalPdfText {
+            path,
+            max_chars,
+            max_pages,
+            memory_limit_bytes,
+        } => {
+            handlers::internal_pdf_text::run(&path, max_chars, max_pages, memory_limit_bytes)?;
         }
     }
 
@@ -1568,7 +1578,7 @@ mod tests {
         let _ = result; // Just verify no panic
     }
 
-    // ── Commands::Calc (requires Python on PATH) ─────────────────────────
+    // ── Commands::Calc (in-process Monty sandbox; no host Python needed) ──
 
     #[tokio::test]
     async fn test_dispatch_calc_simple_expression_returns_ok() {
@@ -1580,8 +1590,7 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        // Succeeds when Python is available, errors when it isn't — no panic either way
-        let _ = result;
+        assert!(result.is_ok(), "Calc should return Ok: {result:?}");
     }
 
     #[tokio::test]
@@ -1594,10 +1603,10 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        let _ = result;
+        assert!(result.is_ok(), "Calc should return Ok: {result:?}");
     }
 
-    // ── Commands::Exec (requires Python on PATH) ─────────────────────────
+    // ── Commands::Exec (in-process Monty sandbox; no host Python needed) ──
 
     #[tokio::test]
     async fn test_dispatch_exec_print_statement_returns_ok() {
@@ -1609,7 +1618,27 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        let _ = result;
+        assert!(result.is_ok(), "Exec should return Ok: {result:?}");
+    }
+
+    /// A program that raises did not run, so the command fails and the process
+    /// exits non-zero. It used to print the error and exit 0.
+    #[tokio::test]
+    async fn test_dispatch_exec_faulting_program_returns_err() {
+        let tmp = TempDir::new().unwrap();
+        let cli = cli_with(
+            &tmp,
+            Commands::Exec {
+                code: "1 / 0".to_string(),
+            },
+        );
+        let error = dispatch(cli)
+            .await
+            .expect_err("Exec of a program that raises should return Err");
+        // Dispatch adds its own context, so the fault class is one level down
+        // the chain; `{:#}` prints the whole chain.
+        let chain = format!("{error:#}");
+        assert!(chain.contains("runtime"), "unexpected error: {chain}");
     }
 
     // ── Commands::ValidateHooks ──────────────────────────────────────────

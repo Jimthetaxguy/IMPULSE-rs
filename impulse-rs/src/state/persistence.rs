@@ -43,6 +43,16 @@ pub struct State {
     storage: Storage,
     pub(super) governed_tasks: std::sync::Mutex<super::governed_task::GovernedTaskLedger>,
     pub(super) memory_candidates: std::sync::Mutex<super::memory_candidate::MemoryCandidateLedger>,
+    /// Whether `MEMORY_CANDIDATES.json` existed when this `State` opened.
+    ///
+    /// Captured before any reconciliation writes it, because candidate
+    /// reconciliation re-creates the file — so a later probe would report
+    /// `Local` on every machine and a fresh clone's tracked memory log would be
+    /// misread as a pile of interrupted decisions (ADR-0020 rule 3b).
+    pub(super) memory_ledger_origin: super::memory_record::LedgerOrigin,
+    /// Verified view of the append-only promoted-memory log (ADR-0020).
+    /// Always locked *after* `memory_candidates`, never before.
+    pub(super) memory_log: std::sync::Mutex<super::memory_record::MemoryLog>,
     pub(super) producer_reservations:
         std::sync::Mutex<super::producer_reservation::ProducerReservationLedger>,
     governed_producer_locks: tokio::sync::Mutex<
@@ -92,13 +102,16 @@ impl State {
             .read_json::<Config>(CONFIG_FILE)
             .context("Failed to read config from disk")?;
         let governed_tasks = Self::load_governed_task_ledger(&storage)?;
-        let memory_candidates = Self::load_memory_candidate_ledger(&storage)?;
+        let (memory_candidates, memory_ledger_origin) =
+            Self::load_memory_candidate_ledger(&storage)?;
         let producer_reservations = Self::load_producer_reservation_ledger(&storage)?;
 
         let state = Self {
             storage,
             governed_tasks,
             memory_candidates,
+            memory_ledger_origin,
+            memory_log: std::sync::Mutex::new(Default::default()),
             producer_reservations,
             governed_producer_locks: tokio::sync::Mutex::new(HashMap::new()),
             live_state: RwLock::new(live_state),
@@ -106,6 +119,9 @@ impl State {
             config: RwLock::new(config),
         };
         state.reconcile_accepted_run_memory_candidates()?;
+        // Must follow candidate reconciliation: the log is cross-checked against
+        // the reconciled review statuses, not the pre-migration ones.
+        state.reconcile_promoted_memory_log()?;
         state.reconcile_producer_reservations()?;
         Ok(state)
     }

@@ -7,36 +7,116 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
+use impulse_ops::governed_task::{GovernedRequestId, GovernedTaskId, OperatorAuthentication};
 use impulse_ops::governed_task::{
     GovernedReviewState, GovernedTaskRun, GovernedVerificationOutcome, OperatorDecisionKind,
     SupervisorVerdictKind,
 };
 use impulse_ops::memory_candidate::{
     AcceptedRunCommandEvidence, AcceptedRunMemoryCandidate, AcceptedRunSourceAssurance,
-    MemoryCandidateId, MemoryCandidateStatus, ACCEPTED_RUN_MEMORY_CANDIDATE_SCHEMA_VERSION,
-    ACCEPTED_RUN_MEMORY_DERIVATION_VERSION,
+    MemoryCandidateId, MemoryCandidateStatus, MemoryRecord, MemorySource,
+    ACCEPTED_RUN_MEMORY_CANDIDATE_SCHEMA_VERSION, ACCEPTED_RUN_MEMORY_DERIVATION_VERSION,
+};
+use impulse_ops::memory_wiring::{
+    MemoryCandidateDecision, MemoryCandidateDecisionInput, MemoryCandidateDecisionKind,
+    MemoryCandidateDecisionOutcome,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::memory_record::{
+    carry_status_forward, derive_promoted_record, read_index_marker, render_projection,
+    write_projection, LedgerOrigin, MemoryLog, MemoryLogHead,
+};
 use super::State;
 use crate::storage::Storage;
 
 const MEMORY_CANDIDATES_FILE: &str = "MEMORY_CANDIDATES.json";
-const MEMORY_CANDIDATES_LEDGER_SCHEMA_VERSION: u32 = 1;
+/// Bumped to 2 by ADR-0020: the ledger gained a compare-and-swap `revision`,
+/// idempotency receipts, the committed memory-log head, and carried-forward
+/// review statuses. Every new field is serde-defaulted, so a v1 ledger loads
+/// unchanged and is rewritten at v2 on its first persist.
+const MEMORY_CANDIDATES_LEDGER_SCHEMA_VERSION: u32 = 2;
+const MEMORY_CANDIDATES_LEDGER_MIN_SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
+/// Typed decision failures. The daemon lane maps these onto its wire errors;
+/// every one of them leaves the ledger, the log, and the projection untouched.
+#[derive(Debug, thiserror::Error)]
+pub enum MemoryCandidateDecisionError {
+    #[error("memory candidate `{0}` was not found")]
+    NotFound(MemoryCandidateId),
+    #[error("memory candidate ledger revision conflict: expected {expected}, current {current}")]
+    RevisionConflict { expected: u64, current: u64 },
+    #[error(
+        "memory candidate decision request id `{request_id}` was replayed with a different payload"
+    )]
+    IdempotencyPayloadConflict { request_id: GovernedRequestId },
+    #[error(
+        "memory candidate `{candidate_id}` was already {status}; a review decision is terminal"
+    )]
+    AlreadyDecided {
+        candidate_id: MemoryCandidateId,
+        status: &'static str,
+    },
+    #[error(
+        "memory candidate `{candidate_id}` is superseded: it no longer matches the current deterministic derivation from accepted governed-task truth, so promoting it would record a fact the evidence no longer supports"
+    )]
+    SupersededCandidate { candidate_id: MemoryCandidateId },
+    #[error(
+        "a previous memory decision (request `{request_id}`) was interrupted after appending to the memory log and before committing the ledger; replay that exact request id to finish it before deciding anything else"
+    )]
+    InterruptedDecision { request_id: GovernedRequestId },
+    #[error(
+        "the memory log's uncommitted trailing entry (request `{request_id}`, candidate `{candidate_id}`) belongs to no decision this checkout ever made, so it cannot be finished by replaying it. .impulse/MEMORY.jsonl was appended to outside this Impulse: keep the first {committed_entries} lines and discard the rest, which loses nothing committed, and the decision can proceed"
+    )]
+    ForeignUncommittedTail {
+        request_id: GovernedRequestId,
+        candidate_id: String,
+        committed_entries: u64,
+    },
+    #[error("memory candidate decisions belong to project `{expected}`, not `{actual}`")]
+    ProjectMismatch { expected: String, actual: String },
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct MemoryCandidateLedger {
     schema_version: u32,
+    /// Compare-and-swap revision for review decisions (ADR-0020). Serde-default
+    /// 0 so a v1 ledger's first decision starts the sequence cleanly.
+    #[serde(default)]
+    revision: u64,
     #[serde(default)]
     candidates: BTreeMap<MemoryCandidateId, AcceptedRunMemoryCandidate>,
+    /// Review decisions belonging to candidates that a derivation-version
+    /// migration has re-derived under a new id, keyed by governed task. Applied
+    /// by reconciliation and then cleared. Persisted rather than held in memory
+    /// so an interrupted migration does not lose an operator's decision.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending_status_migrations: BTreeMap<GovernedTaskId, MemoryCandidateStatus>,
+    /// The head of `MEMORY.jsonl` this ledger commits. The witness that makes
+    /// trailing truncation of the append-only log detectable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_log_head: Option<MemoryLogHead>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    processed_decisions: BTreeMap<GovernedRequestId, MemoryCandidateDecision>,
+}
+
+/// What a derivation-version migration moved, for the startup log line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DerivationMigration {
+    candidates: usize,
+    carried_decisions: usize,
 }
 
 impl Default for MemoryCandidateLedger {
     fn default() -> Self {
         Self {
             schema_version: MEMORY_CANDIDATES_LEDGER_SCHEMA_VERSION,
+            revision: 0,
             candidates: BTreeMap::new(),
+            pending_status_migrations: BTreeMap::new(),
+            memory_log_head: None,
+            processed_decisions: BTreeMap::new(),
         }
     }
 }
@@ -46,39 +126,72 @@ impl MemoryCandidateLedger {
         let mut ledger: Self = storage
             .read_json(MEMORY_CANDIDATES_FILE)
             .context("Failed to read accepted-run memory candidate ledger")?;
-        let superseded = ledger.prune_superseded_derivations();
-        if superseded > 0 {
+        let migrated = ledger.migrate_superseded_derivations();
+        if migrated.candidates > 0 {
             tracing::info!(
-                superseded_candidates = superseded,
+                superseded_candidates = migrated.candidates,
+                carried_decisions = migrated.carried_decisions,
                 derivation_version = ACCEPTED_RUN_MEMORY_DERIVATION_VERSION,
-                "dropping memory candidates derived under a superseded derivation version; \
-                 they are re-derived from accepted governed-task truth"
+                "migrating memory candidates derived under a superseded derivation version; \
+                 they are re-derived from accepted governed-task truth and any review decision \
+                 is carried forward"
             );
         }
         ledger.validate_shape()?;
         Ok(ledger)
     }
 
-    /// Drop candidates whose `derivation_version` is not the current one and
-    /// report how many were dropped.
+    /// Migrate candidates whose `derivation_version` is not the current one,
+    /// carrying any review decision forward.
     ///
     /// Governed tasks remain the source of truth and this ledger is
     /// independently replaceable, so a derivation-version bump must reconcile
     /// deterministically rather than fail an otherwise healthy daemon at
     /// startup: `validate_shape` rejects a stale `derivation_version`, and
     /// reconcile would then see a stale candidate as orphaned (its id is a
-    /// digest over the derivation version). Pruning first lets reconcile
-    /// re-derive the same accepted runs under the new version.
-    fn prune_superseded_derivations(&mut self) -> usize {
-        let before = self.candidates.len();
-        self.candidates.retain(|_, candidate| {
-            candidate.derivation_version == ACCEPTED_RUN_MEMORY_DERIVATION_VERSION
-        });
-        before - self.candidates.len()
+    /// digest over the derivation version).
+    ///
+    /// ADR-0018 follow-up 2: this replaces the ADR-0013-era
+    /// `prune_superseded_derivations`, which simply dropped the record.
+    /// Dropping was lossless only while `MemoryCandidateStatus` had one
+    /// variant. Now that a candidate can be promoted or dismissed, a prune
+    /// would silently revert an operator's review decision to
+    /// `PendingReview` — and, for a promotion, orphan the record already in
+    /// `MEMORY.jsonl`. The decision is parked under the candidate's governed
+    /// task id, which survives re-derivation, and reconciliation reapplies it
+    /// to the freshly derived candidate.
+    fn migrate_superseded_derivations(&mut self) -> DerivationMigration {
+        let mut migration = DerivationMigration::default();
+        let stale = self
+            .candidates
+            .iter()
+            .filter(|(_, candidate)| {
+                candidate.derivation_version != ACCEPTED_RUN_MEMORY_DERIVATION_VERSION
+            })
+            .map(|(id, candidate)| {
+                (
+                    id.clone(),
+                    candidate.governed_task_id.clone(),
+                    candidate.status.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (candidate_id, governed_task_id, status) in stale {
+            self.candidates.remove(&candidate_id);
+            migration.candidates += 1;
+            if !status.is_pending() {
+                migration.carried_decisions += 1;
+                self.pending_status_migrations
+                    .insert(governed_task_id, status);
+            }
+        }
+        migration
     }
 
     fn validate_shape(&self) -> Result<()> {
-        if self.schema_version != MEMORY_CANDIDATES_LEDGER_SCHEMA_VERSION {
+        if self.schema_version < MEMORY_CANDIDATES_LEDGER_MIN_SUPPORTED_SCHEMA_VERSION
+            || self.schema_version > MEMORY_CANDIDATES_LEDGER_SCHEMA_VERSION
+        {
             anyhow::bail!(
                 "Unsupported memory candidate ledger schema version {}",
                 self.schema_version
@@ -107,10 +220,26 @@ impl MemoryCandidateLedger {
 }
 
 impl State {
+    /// Load the review ledger, reporting whether its file existed *before*
+    /// anything in this start-up wrote it.
+    ///
+    /// The existence probe has to happen here and nowhere later:
+    /// `reconcile_accepted_run_memory_candidates` re-creates
+    /// `MEMORY_CANDIDATES.json` from governed-task truth, so by the time the log
+    /// reconcile runs the file always exists and a fresh clone would be
+    /// misread as a local ledger that commits nothing.
     pub(super) fn load_memory_candidate_ledger(
         storage: &Storage,
-    ) -> Result<std::sync::Mutex<MemoryCandidateLedger>> {
-        Ok(std::sync::Mutex::new(MemoryCandidateLedger::load(storage)?))
+    ) -> Result<(std::sync::Mutex<MemoryCandidateLedger>, LedgerOrigin)> {
+        let origin = if storage.path(MEMORY_CANDIDATES_FILE).exists() {
+            LedgerOrigin::Local
+        } else {
+            LedgerOrigin::Absent
+        };
+        Ok((
+            std::sync::Mutex::new(MemoryCandidateLedger::load(storage)?),
+            origin,
+        ))
     }
 
     /// Reconcile the independently persisted review queue from authoritative
@@ -137,7 +266,10 @@ impl State {
                     "memory candidate `{candidate_id}` is orphaned from accepted governed-task truth"
                 )
             })?;
-            if stored != expected_candidate {
+            // The review status is operator state, not derived state, so the
+            // comparison against governed-task truth deliberately ignores it.
+            // Everything else must still match byte for byte.
+            if !matches_ignoring_status(stored, expected_candidate) {
                 anyhow::bail!(
                     "memory candidate `{candidate_id}` does not match its accepted governed-task source"
                 );
@@ -145,15 +277,192 @@ impl State {
         }
 
         let mut repaired = ledger.clone();
-        for (candidate_id, candidate) in expected {
-            repaired.candidates.entry(candidate_id).or_insert(candidate);
+        for (candidate_id, mut candidate) in expected {
+            if repaired.candidates.contains_key(&candidate_id) {
+                continue;
+            }
+            // A decision parked by a derivation-version migration rejoins its
+            // re-derived candidate here, keyed by the governed task id, which
+            // survives re-derivation.
+            if let Some(status) = repaired
+                .pending_status_migrations
+                .remove(&candidate.governed_task_id)
+            {
+                carry_status_forward(&status, &mut candidate);
+            }
+            repaired.candidates.insert(candidate_id, candidate);
         }
-        if repaired.candidates != ledger.candidates {
+        // A migration whose accepted task is gone cannot be reapplied. A parked
+        // *pending* status carries nothing, so drop it. A parked decision is
+        // operator state: keep it, say so loudly, and let it name itself in the
+        // orphan error if its record is still in the log — silently clearing it
+        // would turn a recoverable situation into an error pointing nowhere.
+        repaired
+            .pending_status_migrations
+            .retain(|governed_task_id, status| {
+                if status.is_pending() {
+                    return false;
+                }
+                tracing::warn!(
+                    governed_task_id = %governed_task_id,
+                    status = status.label(),
+                    "a parked memory review decision has no accepted governed task to reattach to; \
+                     keeping it so its record is not reported as an unexplained orphan"
+                );
+                true
+            });
+        if repaired.candidates != ledger.candidates
+            || repaired.pending_status_migrations != ledger.pending_status_migrations
+        {
             self.storage()
                 .write_private_json(MEMORY_CANDIDATES_FILE, &repaired)
                 .context("Failed to persist reconciled accepted-run memory candidates")?;
             *ledger = repaired;
         }
+        Ok(())
+    }
+
+    /// Verify the promoted-memory log against the reconciled candidate ledger
+    /// and regenerate the projection. Called once at start-up, after
+    /// [`Self::reconcile_accepted_run_memory_candidates`].
+    ///
+    /// Fails closed: a tampered, truncated, or head-mismatched `MEMORY.jsonl`
+    /// stops the daemon from starting rather than serving a silently shortened
+    /// memory. The operator surface for that failure is the daemon start-up
+    /// error itself (and, in direct CLI mode, the command's error): typed as
+    /// [`super::memory_record::MemoryLogError`], naming the file and which of
+    /// the distinguishable corruptions was hit.
+    pub(super) fn reconcile_promoted_memory_log(&self) -> Result<()> {
+        let mut ledger = self
+            .memory_candidates
+            .lock()
+            .map_err(|error| anyhow::anyhow!("memory candidate ledger lock poisoned: {error}"))?;
+        // `MEMORY_CANDIDATES.json` is gitignored local state while
+        // `MEMORY.jsonl` is tracked, so a fresh clone legitimately has a full
+        // log and no ledger. That is not the same as a ledger that commits
+        // nothing, and must not be read as an interrupted decision.
+        //
+        // The origin is captured at load time, before
+        // `reconcile_accepted_run_memory_candidates` re-creates the ledger file
+        // from governed-task truth. Probing the path here instead would always
+        // see `Local` on any machine that has `GOVERNED_TASKS.json`, which is
+        // every machine that has ever run a governed task.
+        let origin = self.memory_ledger_origin;
+        let log = MemoryLog::load(self.storage(), ledger.memory_log_head.as_ref(), origin)
+            .context("Failed to load the promoted memory log")?;
+        log.cross_check_statuses(
+            ledger.candidates.values(),
+            &ledger.pending_status_migrations,
+            origin == LedgerOrigin::Local,
+        )
+        .context("Promoted memory log does not match the candidate ledger")?;
+        if origin == LedgerOrigin::Absent {
+            if let Some(adopted) = log.head() {
+                tracing::info!(
+                    entry_count = adopted.entry_count,
+                    "adopting a checked-out promoted memory log: this machine had no candidate \
+                     ledger, so the verified log is recorded as committed"
+                );
+                let mut repaired = ledger.clone();
+                repaired.memory_log_head = Some(adopted);
+                // Recording the head is not enough. The review statuses lived
+                // only in the ledger that is missing, so without reattachment
+                // every adopted record would be an orphan on the *next*
+                // start-up, and its candidate would sit pending and be
+                // promotable a second time into a duplicate record.
+                //
+                // The record carries its own provenance, so the status is
+                // rebuilt from it. `decided_by` says plainly that this machine
+                // did not witness the decision: the log is the authority for
+                // what was promoted, not for who approved it.
+                for entry in log.committed() {
+                    let record = &entry.record;
+                    let MemorySource::CandidateRef {
+                        candidate_id,
+                        governed_task_id,
+                        ..
+                    } = &record.source
+                    else {
+                        continue;
+                    };
+                    let status = MemoryCandidateStatus::Promoted {
+                        record_id: record.id.clone(),
+                        decided_at: record.valid_from.clone(),
+                        decided_by: adopted_decision_actor(),
+                    };
+                    match repaired.candidates.get_mut(candidate_id) {
+                        Some(candidate) if candidate.status.is_pending() => {
+                            candidate.status = status;
+                        }
+                        Some(_) => {}
+                        // The candidate was re-derived under a different id, or
+                        // its accepted task is not present here. Park the
+                        // rebuilt decision the same way a derivation migration
+                        // would, so a later start-up reattaches it — or names
+                        // the lost task instead of reporting a bare orphan.
+                        None => {
+                            repaired
+                                .pending_status_migrations
+                                .insert(governed_task_id.clone(), status);
+                        }
+                    }
+                }
+                self.storage()
+                    .write_private_json(MEMORY_CANDIDATES_FILE, &repaired)
+                    .context("Failed to record the adopted promoted-memory log head")?;
+                *ledger = repaired;
+            }
+        }
+        for (governed_task_id, record_id) in
+            log.unreattached_parked_claims(&ledger.pending_status_migrations)
+        {
+            tracing::warn!(
+                governed_task_id = %governed_task_id,
+                record_id = %record_id,
+                "a promoted memory record is claimed by a parked review decision with no candidate \
+                 on this machine; it stays out of the review queue until that governed task is \
+                 present here"
+            );
+        }
+        if let Some(entry) = log.uncommitted_tail().first() {
+            tracing::warn!(
+                request_id = %entry.record.request_id,
+                record_id = %entry.record.id,
+                "promoted memory log holds one uncommitted entry from an interrupted decision; \
+                 replay that request id to finish it"
+            );
+        }
+        // Regenerate the projection so a deleted or hand-edited
+        // GENOME_PROJECTION.md is restored from the log. Never marks the
+        // retrieval index dirty: start-up changed no promoted record.
+        //
+        // Skipped entirely when nothing has ever been promoted and no
+        // projection exists: `State::new` must not create `.impulse/` (or any
+        // file in it) as a side effect of merely opening a project that has no
+        // memory yet. A fresh clone takes the other branch — its tracked log is
+        // non-empty — and rewrites the tracked projection only if the rendering
+        // differs from what was committed.
+        let projected = log.projected_records();
+        if !projected.is_empty()
+            || self
+                .storage()
+                .path(super::memory_record::GENOME_PROJECTION_FILE)
+                .exists()
+        {
+            write_projection(
+                self.storage(),
+                &projected,
+                &impulse_ops::now_rfc3339(),
+                false,
+            )
+            .context("Failed to regenerate the GENOME projection")?;
+        }
+        drop(projected);
+        let mut slot = self
+            .memory_log
+            .lock()
+            .map_err(|error| anyhow::anyhow!("promoted memory log lock poisoned: {error}"))?;
+        *slot = log;
         Ok(())
     }
 
@@ -220,6 +529,421 @@ impl State {
         candidates.sort_by(|left, right| right.staged_at.cmp(&left.staged_at));
         Ok(candidates)
     }
+}
+
+impl State {
+    /// Promote or dismiss one pending review candidate (ADR-0020).
+    ///
+    /// `authentication` is stamped by the caller from the *connection class*,
+    /// never read from `input` — `MemoryCandidateDecisionInput` has no such
+    /// field and refuses one (ADR-0018's rule, applied to this family). An
+    /// in-process or direct-CLI caller passes
+    /// [`OperatorAuthentication::Declared`].
+    ///
+    /// Ordering, and why: the log is appended first and the ledger second. A
+    /// process killed between the two leaves one *uncommitted* trailing entry
+    /// that the projection and the retrieval index both ignore; replaying the
+    /// exact request id adopts that entry instead of appending a duplicate, and
+    /// any other decision is refused until it does. The reverse order would
+    /// instead leave a promoted candidate naming a record that does not exist,
+    /// which is not recoverable from the ledger alone.
+    pub fn decide_memory_candidate(
+        &self,
+        input: MemoryCandidateDecisionInput,
+        authentication: OperatorAuthentication,
+        now: &str,
+    ) -> Result<MemoryCandidateDecisionOutcome> {
+        input
+            .validate()
+            .context("Invalid memory candidate decision")?;
+        let expected_project = self.governed_project_id();
+        if input.project_id != expected_project {
+            return Err(MemoryCandidateDecisionError::ProjectMismatch {
+                expected: expected_project,
+                actual: input.project_id,
+            }
+            .into());
+        }
+
+        // Derive governed truth before taking the candidate-ledger lock, so the
+        // two locks are always acquired in the same order as reconciliation.
+        let expected_candidates = self
+            .all_governed_tasks()?
+            .iter()
+            .filter(|task| task.is_accepted())
+            .map(derive_accepted_run_memory_candidate)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(|candidate| (candidate.id.clone(), candidate))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut ledger = self
+            .memory_candidates
+            .lock()
+            .map_err(|error| anyhow::anyhow!("memory candidate ledger lock poisoned: {error}"))?;
+        let mut log = self
+            .memory_log
+            .lock()
+            .map_err(|error| anyhow::anyhow!("promoted memory log lock poisoned: {error}"))?;
+
+        if let Some(recorded) = ledger.processed_decisions.get(&input.request_id) {
+            require_idempotent_decision(recorded, &input)?;
+            let candidate = ledger
+                .candidates
+                .get(&recorded.candidate_id)
+                .cloned()
+                .ok_or_else(|| {
+                    MemoryCandidateDecisionError::NotFound(recorded.candidate_id.clone())
+                })?;
+            let record = recorded
+                .record_id
+                .as_ref()
+                .and_then(|record_id| log.committed_record(record_id).cloned());
+            let decision = recorded.clone();
+            let projection_digest = super::memory_record::projection_digest(&render_projection(
+                &log.projected_records(),
+            ));
+            let retrieval_index_dirty = read_index_marker(self.storage())?
+                .map(|marker| marker.is_dirty())
+                .unwrap_or(false);
+            return Ok(MemoryCandidateDecisionOutcome {
+                decision,
+                candidate,
+                record,
+                replayed: true,
+                projection_digest,
+                retrieval_index_dirty,
+            });
+        }
+
+        if ledger.revision != input.expected_ledger_revision {
+            return Err(MemoryCandidateDecisionError::RevisionConflict {
+                expected: input.expected_ledger_revision,
+                current: ledger.revision,
+            }
+            .into());
+        }
+
+        let stored = ledger
+            .candidates
+            .get(&input.candidate_id)
+            .cloned()
+            .ok_or_else(|| MemoryCandidateDecisionError::NotFound(input.candidate_id.clone()))?;
+        if !stored.status.is_pending() {
+            return Err(MemoryCandidateDecisionError::AlreadyDecided {
+                candidate_id: input.candidate_id,
+                status: stored.status.label(),
+            }
+            .into());
+        }
+        // Wire-gate discipline: the approval must still cover the thing being
+        // approved. A candidate that no longer matches the current
+        // deterministic derivation from accepted governed-task truth is
+        // superseded, and promoting it would durably record a fact its evidence
+        // no longer supports.
+        match expected_candidates.get(&input.candidate_id) {
+            Some(expected) if matches_ignoring_status(&stored, expected) => {}
+            _ => {
+                return Err(MemoryCandidateDecisionError::SupersededCandidate {
+                    candidate_id: input.candidate_id,
+                }
+                .into())
+            }
+        }
+
+        // An interrupted decision left exactly one uncommitted entry: the
+        // append landed, the ledger commit did not, so no receipt exists and
+        // the replay path above could not see it. Replaying that same request
+        // id adopts the entry; any other decision is refused until it does.
+        let adopted = match log.uncommitted_tail().first() {
+            Some(entry) if entry.record.request_id == input.request_id => {
+                Some(entry.record.clone())
+            }
+            Some(entry) => {
+                // "Replay that request id" is only actionable advice when the
+                // request was ever real here. A well-formed, correctly chained
+                // entry appended to the *tracked* log by anyone with write or
+                // merge access names a request no checkout can replay — and
+                // without this branch it would refuse every future decision on
+                // every checkout, permanently, with instructions that cannot be
+                // followed. That is a denial of service, not an interruption,
+                // and its remedy is the truncation one.
+                if is_foreign_tail(entry, &ledger) {
+                    return Err(MemoryCandidateDecisionError::ForeignUncommittedTail {
+                        request_id: entry.record.request_id.clone(),
+                        candidate_id: tail_candidate_id(entry)
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "<none>".to_string()),
+                        committed_entries: ledger
+                            .memory_log_head
+                            .as_ref()
+                            .map(|head| head.entry_count)
+                            .unwrap_or(0),
+                    }
+                    .into());
+                }
+                return Err(MemoryCandidateDecisionError::InterruptedDecision {
+                    request_id: entry.record.request_id.clone(),
+                }
+                .into());
+            }
+            None => None,
+        };
+
+        let based_on_ledger_revision = ledger.revision;
+        let next_revision = based_on_ledger_revision
+            .checked_add(1)
+            .context("memory candidate ledger revision exhausted u64")?;
+
+        let mut updated = stored.clone();
+        let mut record: Option<MemoryRecord> = None;
+        let mut head = ledger.memory_log_head.clone();
+        let promoting = input.decision.is_promote();
+        // An adopted entry keeps its original `valid_from`, and the decision
+        // records the same instant: the decision happened when the append did,
+        // not when the replay arrived.
+        let mut decided_at = now.to_string();
+
+        match &input.decision {
+            MemoryCandidateDecisionKind::Promote => {
+                let derived = derive_promoted_record(
+                    &stored,
+                    &input.request_id,
+                    based_on_ledger_revision,
+                    now,
+                )?;
+                let promoted = match adopted {
+                    Some(tail) => {
+                        // The identity digest excludes `valid_from`, so a
+                        // genuine replay derives exactly the tail's id. A
+                        // different payload under the same request id does not.
+                        if tail.id != derived.id {
+                            return Err(MemoryCandidateDecisionError::IdempotencyPayloadConflict {
+                                request_id: input.request_id,
+                            }
+                            .into());
+                        }
+                        decided_at = tail.valid_from.clone();
+                        tail
+                    }
+                    None => {
+                        log.append(self.storage(), derived.clone())?;
+                        derived
+                    }
+                };
+                head = log.full_head();
+                updated.status = MemoryCandidateStatus::Promoted {
+                    record_id: promoted.id.clone(),
+                    decided_at: decided_at.clone(),
+                    decided_by: input.actor.clone(),
+                };
+                record = Some(promoted);
+            }
+            MemoryCandidateDecisionKind::Dismiss { reason } => {
+                // Only a promotion ever appends, so a dismissal that matches an
+                // uncommitted tail's request id is the same id carrying a
+                // different payload.
+                if adopted.is_some() {
+                    return Err(MemoryCandidateDecisionError::IdempotencyPayloadConflict {
+                        request_id: input.request_id,
+                    }
+                    .into());
+                }
+                updated.status = MemoryCandidateStatus::Dismissed {
+                    reason: reason.clone(),
+                    decided_at: decided_at.clone(),
+                    decided_by: input.actor.clone(),
+                };
+            }
+        }
+        updated
+            .validate_shape()
+            .context("Decided memory candidate failed its own contract")?;
+
+        let decision = MemoryCandidateDecision {
+            request_id: input.request_id.clone(),
+            candidate_id: input.candidate_id.clone(),
+            decision: input.decision.clone(),
+            actor: input.actor.clone(),
+            authentication,
+            decided_at,
+            based_on_ledger_revision,
+            resulting_ledger_revision: next_revision,
+            record_id: record.as_ref().map(|record| record.id.clone()),
+        };
+
+        let mut candidate_ledger = ledger.clone();
+        candidate_ledger.schema_version = MEMORY_CANDIDATES_LEDGER_SCHEMA_VERSION;
+        candidate_ledger.revision = next_revision;
+        candidate_ledger
+            .candidates
+            .insert(input.candidate_id.clone(), updated.clone());
+        candidate_ledger.memory_log_head = head;
+        candidate_ledger
+            .processed_decisions
+            .insert(input.request_id.clone(), decision.clone());
+        self.storage()
+            .write_private_json(MEMORY_CANDIDATES_FILE, &candidate_ledger)
+            .context("Failed to persist memory candidate decision")?;
+        *ledger = candidate_ledger;
+        log.commit_tail();
+
+        // Only a promotion changes the projection, so only a promotion can
+        // leave the retrieval index dirty. ADR-0013 rule 9 — a pending (or
+        // dismissed) candidate is never indexed — is held by construction.
+        let (projection_digest, retrieval_index_dirty) =
+            write_projection(self.storage(), &log.projected_records(), now, promoting)?;
+
+        Ok(MemoryCandidateDecisionOutcome {
+            decision,
+            candidate: updated,
+            record,
+            replayed: false,
+            projection_digest,
+            retrieval_index_dirty,
+        })
+    }
+
+    /// Read the rendered GENOME projection, or `None` when nothing has been
+    /// promoted yet. This is the surface a runtime memory tool reads; the raw
+    /// candidate ledger is never exposed to one.
+    pub fn read_genome_projection(&self) -> Result<Option<String>> {
+        let path = self
+            .storage()
+            .path(super::memory_record::GENOME_PROJECTION_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(
+            std::fs::read_to_string(&path).context("Failed to read the GENOME projection")?,
+        ))
+    }
+
+    /// Reindex the promoted memory records into the real retrieval index and
+    /// stamp the dirty marker clean.
+    ///
+    /// Only projected records are passed to the indexer, so a pending or
+    /// dismissed candidate can never enter the index (ADR-0013 rule 9). Returns
+    /// how many records were indexed.
+    pub fn index_promoted_memory_records(&self, now: &str) -> Result<usize> {
+        let records = self.list_promoted_memory_records()?;
+        let indexed = crate::retrieval::index_promoted_memory(self.storage().base_path(), &records)
+            .context("Failed to index promoted memory records")?;
+        let borrowed = records.iter().collect::<Vec<_>>();
+        let digest = super::memory_record::projection_digest(&render_projection(&borrowed));
+        super::memory_record::stamp_indexed(self.storage(), &digest, now)?;
+        Ok(indexed)
+    }
+
+    /// Whether the retrieval index is behind the current projection.
+    pub fn memory_retrieval_index_is_dirty(&self) -> Result<bool> {
+        Ok(read_index_marker(self.storage())?
+            .map(|marker| marker.is_dirty())
+            .unwrap_or(false))
+    }
+
+    /// Every committed promoted record, in log order.
+    pub fn list_promoted_memory_records(&self) -> Result<Vec<MemoryRecord>> {
+        let log = self
+            .memory_log
+            .lock()
+            .map_err(|error| anyhow::anyhow!("promoted memory log lock poisoned: {error}"))?;
+        Ok(log
+            .projected_records()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>())
+    }
+}
+
+/// The candidate a log entry was promoted from, when it names one.
+fn tail_candidate_id(
+    entry: &impulse_ops::memory_candidate::MemoryLogEntry,
+) -> Option<&MemoryCandidateId> {
+    match &entry.record.source {
+        MemorySource::CandidateRef { candidate_id, .. } => Some(candidate_id),
+        MemorySource::OperatorManual { .. } => None,
+    }
+}
+
+/// Whether an uncommitted trailing entry belongs to a decision this checkout
+/// could ever have made.
+///
+/// Genuine interruption leaves a tail whose candidate is local — the decision
+/// was taken against it moments earlier — or whose request id already has a
+/// receipt. Anything else came from outside, and telling an operator to replay
+/// it is instructions they cannot follow.
+fn is_foreign_tail(
+    entry: &impulse_ops::memory_candidate::MemoryLogEntry,
+    ledger: &MemoryCandidateLedger,
+) -> bool {
+    if ledger
+        .processed_decisions
+        .contains_key(&entry.record.request_id)
+    {
+        return false;
+    }
+    let Some(candidate_id) = tail_candidate_id(entry) else {
+        // An operator-manual record has no candidate to be local, and no
+        // producer mints one in this stage.
+        return true;
+    };
+    if ledger.candidates.contains_key(candidate_id) {
+        return false;
+    }
+    // A candidate re-derived under a new id still leaves its decision parked
+    // under the governed task, which the record names.
+    match &entry.record.source {
+        MemorySource::CandidateRef {
+            governed_task_id, ..
+        } => !ledger
+            .pending_status_migrations
+            .contains_key(governed_task_id),
+        MemorySource::OperatorManual { .. } => true,
+    }
+}
+
+/// The actor recorded for a review decision rebuilt from an adopted log.
+///
+/// A checked-out `MEMORY.jsonl` says which records were promoted; it does not
+/// say who approved them, because the approving actor lives in the gitignored
+/// ledger. Naming that gap is more honest than borrowing the record's agent id
+/// and implying an approval this machine never saw.
+fn adopted_decision_actor() -> impulse_ops::governed_task::GovernedActor {
+    impulse_ops::governed_task::GovernedActor {
+        kind: impulse_ops::governed_task::GovernedActorKind::System,
+        id: "adopted-from-checkout".to_string(),
+    }
+}
+
+/// Compare two candidates on everything except the operator-owned review
+/// status. Derivation produces `PendingReview`; a decided candidate still has
+/// to match governed-task truth in every derived field.
+fn matches_ignoring_status(
+    stored: &AcceptedRunMemoryCandidate,
+    expected: &AcceptedRunMemoryCandidate,
+) -> bool {
+    let mut normalized = stored.clone();
+    normalized.status = expected.status.clone();
+    &normalized == expected
+}
+
+/// A replayed request id must carry the same payload it did the first time.
+fn require_idempotent_decision(
+    recorded: &MemoryCandidateDecision,
+    input: &MemoryCandidateDecisionInput,
+) -> Result<()> {
+    if recorded.candidate_id != input.candidate_id
+        || recorded.decision != input.decision
+        || recorded.actor != input.actor
+        || recorded.based_on_ledger_revision != input.expected_ledger_revision
+    {
+        return Err(MemoryCandidateDecisionError::IdempotencyPayloadConflict {
+            request_id: input.request_id.clone(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -396,4 +1120,1098 @@ pub(super) fn derive_accepted_run_memory_candidate(
 #[cfg(test)]
 pub(super) fn memory_candidates_file() -> &'static str {
     MEMORY_CANDIDATES_FILE
+}
+
+#[cfg(test)]
+pub(in crate::state) mod tests {
+    use super::*;
+    use impulse_ops::governed_task::{GovernedActor, GovernedActorKind};
+    use impulse_ops::memory_candidate::MemoryRecordId;
+
+    use crate::state::governed_task::tests::{accept_run, state};
+
+    pub(in crate::state) fn sample_candidate() -> AcceptedRunMemoryCandidate {
+        let (_root, state) = state();
+        let task = accept_run(&state, "sample");
+        derive_accepted_run_memory_candidate(&task).expect("accepted run derives a candidate")
+    }
+
+    fn operator() -> GovernedActor {
+        GovernedActor {
+            kind: GovernedActorKind::Operator,
+            id: "james".to_string(),
+        }
+    }
+
+    fn promote(
+        candidate_id: &MemoryCandidateId,
+        request_id: &str,
+        revision: u64,
+    ) -> MemoryCandidateDecisionInput {
+        MemoryCandidateDecisionInput {
+            request_id: GovernedRequestId::try_new(request_id).unwrap(),
+            project_id: String::new(),
+            candidate_id: candidate_id.clone(),
+            decision: MemoryCandidateDecisionKind::Promote,
+            actor: operator(),
+            expected_ledger_revision: revision,
+        }
+    }
+
+    fn dismiss(
+        candidate_id: &MemoryCandidateId,
+        request_id: &str,
+        revision: u64,
+        reason: &str,
+    ) -> MemoryCandidateDecisionInput {
+        MemoryCandidateDecisionInput {
+            request_id: GovernedRequestId::try_new(request_id).unwrap(),
+            project_id: String::new(),
+            candidate_id: candidate_id.clone(),
+            decision: MemoryCandidateDecisionKind::Dismiss {
+                reason: reason.to_string(),
+            },
+            actor: operator(),
+            expected_ledger_revision: revision,
+        }
+    }
+
+    /// Build a state holding exactly one accepted run and its pending candidate.
+    fn state_with_candidate() -> (tempfile::TempDir, std::sync::Arc<State>, MemoryCandidateId) {
+        let (root, state) = state();
+        accept_run(&state, "one");
+        let candidates = state
+            .list_accepted_run_memory_candidates(&state.governed_project_id())
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        let id = candidates[0].id.clone();
+        (root, state, id)
+    }
+
+    fn with_project(
+        mut input: MemoryCandidateDecisionInput,
+        state: &State,
+    ) -> MemoryCandidateDecisionInput {
+        input.project_id = state.governed_project_id();
+        input
+    }
+
+    #[test]
+    fn test_decide_memory_candidate_promote_writes_record_projection_and_dirty_index() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let outcome = state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &state),
+                OperatorAuthentication::CapabilityAuthenticated,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+
+        assert!(!outcome.replayed);
+        assert!(outcome.retrieval_index_dirty);
+        let record = outcome.record.expect("a promotion produces a record");
+        assert_eq!(record.project_id, state.governed_project_id());
+        assert_eq!(
+            outcome.decision.authentication,
+            OperatorAuthentication::CapabilityAuthenticated
+        );
+        assert_eq!(outcome.decision.resulting_ledger_revision, 1);
+        assert!(outcome.candidate.status.is_promoted());
+
+        let projection = state
+            .read_genome_projection()
+            .unwrap()
+            .expect("a promotion renders the projection");
+        assert!(projection.contains(record.id.as_str()));
+        assert!(projection.contains("do not edit"));
+        assert_eq!(state.list_promoted_memory_records().unwrap(), vec![record]);
+
+        // GENOME.md is a separate, hand-curated artifact and stays untouched.
+        assert!(!state.storage().path("GENOME.md").exists());
+    }
+
+    #[test]
+    fn test_decide_memory_candidate_replay_is_idempotent() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let first = state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        let log_after_first = std::fs::read(state.storage().path("MEMORY.jsonl")).unwrap();
+
+        let replay = state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T11:00:00Z",
+            )
+            .unwrap();
+
+        assert!(replay.replayed);
+        assert_eq!(replay.decision, first.decision);
+        assert_eq!(replay.record, first.record);
+        assert_eq!(replay.projection_digest, first.projection_digest);
+        assert_eq!(
+            std::fs::read(state.storage().path("MEMORY.jsonl")).unwrap(),
+            log_after_first,
+            "a replay must not append a second entry"
+        );
+    }
+
+    #[test]
+    fn test_decide_memory_candidate_replay_with_a_different_payload_is_refused() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        let error = state
+            .decide_memory_candidate(
+                with_project(
+                    dismiss(&candidate_id, "decide-1", 0, "changed my mind"),
+                    &state,
+                ),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("replayed with a different payload"));
+    }
+
+    #[test]
+    fn test_decide_memory_candidate_dismiss_requires_a_reason_and_never_dirties_the_index() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let error = state
+            .decide_memory_candidate(
+                with_project(dismiss(&candidate_id, "decide-1", 0, "   "), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("decision.reason"));
+
+        let outcome = state
+            .decide_memory_candidate(
+                with_project(
+                    dismiss(
+                        &candidate_id,
+                        "decide-2",
+                        0,
+                        "duplicates an existing record",
+                    ),
+                    &state,
+                ),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        assert!(outcome.record.is_none());
+        assert!(
+            !outcome.retrieval_index_dirty,
+            "a dismissal changes no promoted record, so it must not dirty the index"
+        );
+        assert!(!state.storage().path("MEMORY.jsonl").exists());
+        assert!(state.read_genome_projection().unwrap().is_some());
+        assert!(state.list_promoted_memory_records().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_decide_memory_candidate_second_decision_on_a_decided_candidate_is_refused() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        let error = state
+            .decide_memory_candidate(
+                with_project(dismiss(&candidate_id, "decide-2", 1, "too late"), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("already promoted"));
+    }
+
+    #[test]
+    fn test_decide_memory_candidate_revision_conflict_is_refused() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let error = state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 7), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("revision conflict"));
+    }
+
+    #[test]
+    fn test_decide_memory_candidate_unknown_candidate_and_wrong_project_are_refused() {
+        let (_root, state, _candidate_id) = state_with_candidate();
+        let missing =
+            MemoryCandidateId::try_new(format!("memory-candidate-{}", "0".repeat(64))).unwrap();
+        let error = state
+            .decide_memory_candidate(
+                with_project(promote(&missing, "decide-1", 0), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("was not found"));
+
+        let mut wrong_project = promote(&missing, "decide-2", 0);
+        wrong_project.project_id = "some-other-project".to_string();
+        let error = state
+            .decide_memory_candidate(
+                wrong_project,
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("belong to project"));
+    }
+
+    #[test]
+    fn test_decide_memory_candidate_superseded_candidate_is_refused() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        // Rewrite the persisted candidate so it is still self-consistent and
+        // still keyed by its original id, but no longer equals the current
+        // deterministic derivation from accepted governed-task truth.
+        let path = state.storage().path(MEMORY_CANDIDATES_FILE);
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        ledger["candidates"][candidate_id.as_str()]["task"] =
+            serde_json::json!("a task nobody accepted");
+        std::fs::write(&path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+
+        // Reloading fails closed on the mismatch, which is ADR-0013 rule 8; the
+        // decision-time guard is the second, independent check on the same
+        // invariant, so drive it directly against the in-memory ledger.
+        assert!(State::new(state.storage().base_path().to_path_buf()).is_err());
+
+        let stored = state
+            .list_accepted_run_memory_candidates(&state.governed_project_id())
+            .unwrap()
+            .remove(0);
+        let mut superseded = stored.clone();
+        superseded.task = "a task nobody accepted".to_string();
+        assert!(!matches_ignoring_status(&superseded, &stored));
+        assert!(matches_ignoring_status(&stored, &stored));
+    }
+
+    #[test]
+    fn test_matches_ignoring_status_tolerates_only_the_status_field() {
+        let candidate = sample_candidate();
+        let mut promoted = candidate.clone();
+        promoted.status = MemoryCandidateStatus::Promoted {
+            record_id: MemoryRecordId::try_new(format!("memory-record-{}", "a".repeat(64)))
+                .unwrap(),
+            decided_at: "2026-09-12T10:00:00Z".to_string(),
+            decided_by: operator(),
+        };
+        assert!(matches_ignoring_status(&promoted, &candidate));
+
+        let mut altered = promoted;
+        altered.proposed_summary.push_str(" tampered");
+        assert!(!matches_ignoring_status(&altered, &candidate));
+    }
+
+    #[test]
+    fn test_status_preserving_migration_carries_a_decision_across_a_derivation_bump() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let outcome = state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        let record_id = outcome.record.as_ref().unwrap().id.clone();
+        let base = state.storage().base_path().to_path_buf();
+        drop(state);
+
+        // Simulate the v1 -> v2 derivation bump the ADR-0018 follow-up warns
+        // about: the persisted candidate sits at the previous derivation
+        // version, carrying a Promoted status, and must not be reverted to
+        // pending or lose its record.
+        let path = base.join(MEMORY_CANDIDATES_FILE);
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        ledger["candidates"][candidate_id.as_str()]["derivation_version"] =
+            serde_json::json!(ACCEPTED_RUN_MEMORY_DERIVATION_VERSION - 1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+
+        let reloaded = State::new(base).expect("a superseded derivation migrates, never fails");
+        let candidates = reloaded
+            .list_accepted_run_memory_candidates(&reloaded.governed_project_id())
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].status.promoted_record_id(),
+            Some(&record_id),
+            "the review decision must survive re-derivation"
+        );
+        assert_eq!(
+            candidates[0].derivation_version,
+            ACCEPTED_RUN_MEMORY_DERIVATION_VERSION
+        );
+        assert_eq!(
+            reloaded.list_promoted_memory_records().unwrap().len(),
+            1,
+            "the promoted record must not be orphaned by the migration"
+        );
+    }
+
+    #[test]
+    fn test_reload_after_a_promotion_verifies_the_log_and_keeps_the_projection() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let outcome = state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        let projection = state.read_genome_projection().unwrap().unwrap();
+        let base = state.storage().base_path().to_path_buf();
+        drop(state);
+
+        let reloaded = State::new(base).unwrap();
+        assert_eq!(
+            reloaded.list_promoted_memory_records().unwrap(),
+            vec![outcome.record.unwrap()]
+        );
+        assert_eq!(
+            reloaded.read_genome_projection().unwrap().unwrap(),
+            projection
+        );
+    }
+
+    #[test]
+    fn test_reload_with_a_tampered_memory_log_fails_closed() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        let base = state.storage().base_path().to_path_buf();
+        drop(state);
+
+        let log_path = base.join("MEMORY.jsonl");
+        let raw = std::fs::read_to_string(&log_path).unwrap();
+        std::fs::write(
+            &log_path,
+            raw.replace("Accepted governed outcome", "Fabricated outcome"),
+        )
+        .unwrap();
+
+        let error = State::new(base).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("modified outside Impulse"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_reload_with_a_truncated_memory_log_fails_closed() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        let base = state.storage().base_path().to_path_buf();
+        drop(state);
+
+        std::fs::write(base.join("MEMORY.jsonl"), "").unwrap();
+        let error = State::new(base).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("truncated"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_decision_error_display_covers_every_variant() {
+        let candidate_id =
+            MemoryCandidateId::try_new(format!("memory-candidate-{}", "a".repeat(64))).unwrap();
+        let request_id = GovernedRequestId::try_new("request-a").unwrap();
+        let rendered = [
+            MemoryCandidateDecisionError::NotFound(candidate_id.clone()).to_string(),
+            MemoryCandidateDecisionError::RevisionConflict {
+                expected: 1,
+                current: 2,
+            }
+            .to_string(),
+            MemoryCandidateDecisionError::IdempotencyPayloadConflict {
+                request_id: request_id.clone(),
+            }
+            .to_string(),
+            MemoryCandidateDecisionError::AlreadyDecided {
+                candidate_id: candidate_id.clone(),
+                status: "promoted",
+            }
+            .to_string(),
+            MemoryCandidateDecisionError::SupersededCandidate {
+                candidate_id: candidate_id.clone(),
+            }
+            .to_string(),
+            MemoryCandidateDecisionError::InterruptedDecision {
+                request_id: request_id.clone(),
+            }
+            .to_string(),
+            MemoryCandidateDecisionError::ForeignUncommittedTail {
+                request_id,
+                candidate_id: candidate_id.to_string(),
+                committed_entries: 4,
+            }
+            .to_string(),
+            MemoryCandidateDecisionError::ProjectMismatch {
+                expected: "a".to_string(),
+                actual: "b".to_string(),
+            }
+            .to_string(),
+        ];
+        for (message, expected) in rendered.iter().zip([
+            "was not found",
+            "revision conflict",
+            "replayed with a different payload",
+            "already promoted",
+            "superseded",
+            "interrupted",
+            "belongs to no decision this checkout ever made",
+            "belong to project",
+        ]) {
+            assert!(
+                message.contains(expected),
+                "`{message}` should mention `{expected}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pending_candidate_is_never_indexed_but_a_promoted_record_is() {
+        // Runs against the real SQLite retrieval index inside the state's own
+        // temp IMPULSE_HOME — not a stub.
+        let (_root, state, candidate_id) = state_with_candidate();
+        let base = state.storage().base_path().to_path_buf();
+        let query = "governed";
+
+        // Pending: nothing indexed, nothing searchable. ADR-0013 rule 9.
+        assert_eq!(
+            state
+                .index_promoted_memory_records("2026-09-12T10:00:00Z")
+                .unwrap(),
+            0
+        );
+        assert!(crate::retrieval::search_promoted_memory(&base, query, 10)
+            .unwrap()
+            .is_empty());
+        assert!(!state.memory_retrieval_index_is_dirty().unwrap());
+
+        let outcome = state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        let record_id = outcome.record.unwrap().id;
+        assert!(
+            state.memory_retrieval_index_is_dirty().unwrap(),
+            "a promotion must leave the index needing a reindex"
+        );
+
+        assert_eq!(
+            state
+                .index_promoted_memory_records("2026-09-12T10:05:00Z")
+                .unwrap(),
+            1
+        );
+        assert!(!state.memory_retrieval_index_is_dirty().unwrap());
+        let hits = crate::retrieval::search_promoted_memory(&base, query, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, record_id.as_str());
+        assert_eq!(hits[0].source, "memory");
+    }
+
+    #[test]
+    fn test_dismissed_candidate_never_reaches_the_retrieval_index() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let base = state.storage().base_path().to_path_buf();
+        state
+            .decide_memory_candidate(
+                with_project(
+                    dismiss(
+                        &candidate_id,
+                        "decide-1",
+                        0,
+                        "duplicates an existing record",
+                    ),
+                    &state,
+                ),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        assert!(!state.memory_retrieval_index_is_dirty().unwrap());
+        assert_eq!(
+            state
+                .index_promoted_memory_records("2026-09-12T10:05:00Z")
+                .unwrap(),
+            0
+        );
+        assert!(
+            crate::retrieval::search_promoted_memory(&base, "governed", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Reproduce the crash window: the append lands, the ledger commit does
+    /// not. The ledger file is rolled back to its pre-decision bytes, which is
+    /// exactly what a process killed between the two side effects leaves.
+    fn crash_between_append_and_commit(
+        state: &State,
+        candidate_id: &MemoryCandidateId,
+        request_id: &str,
+    ) -> std::path::PathBuf {
+        let base = state.storage().base_path().to_path_buf();
+        let ledger_path = state.storage().path(MEMORY_CANDIDATES_FILE);
+        let before = std::fs::read(&ledger_path).unwrap();
+        state
+            .decide_memory_candidate(
+                with_project(promote(candidate_id, request_id, 0), state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        std::fs::write(&ledger_path, before).unwrap();
+        base
+    }
+
+    #[test]
+    fn test_interrupted_decision_is_finished_by_replaying_the_same_request_id() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let base = crash_between_append_and_commit(&state, &candidate_id, "decide-1");
+        let log_after_crash = std::fs::read(base.join("MEMORY.jsonl")).unwrap();
+        drop(state);
+
+        // The log's one entry is uncommitted: the daemon starts, warns, and the
+        // projection does not yet carry the record.
+        let reloaded = State::new(base.clone()).unwrap();
+        assert!(reloaded.list_promoted_memory_records().unwrap().is_empty());
+        let recovered_candidate = reloaded
+            .list_accepted_run_memory_candidates(&reloaded.governed_project_id())
+            .unwrap()
+            .remove(0);
+        assert!(recovered_candidate.status.is_pending());
+
+        // Replaying the same request id adopts the entry instead of appending
+        // a second one, and commits the ledger.
+        let outcome = reloaded
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &reloaded),
+                OperatorAuthentication::Declared,
+                "2026-09-12T12:00:00Z",
+            )
+            .unwrap();
+        assert!(!outcome.replayed, "this is the original decision finishing");
+        let record = outcome.record.expect("adoption yields the logged record");
+        assert_eq!(
+            std::fs::read(base.join("MEMORY.jsonl")).unwrap(),
+            log_after_crash,
+            "adoption must not append a second entry"
+        );
+        assert_eq!(
+            record.valid_from, "2026-09-12T10:00:00Z",
+            "the adopted record keeps the instant its append happened"
+        );
+        assert_eq!(outcome.decision.decided_at, record.valid_from);
+        assert_eq!(
+            outcome.candidate.status.promoted_record_id(),
+            Some(&record.id)
+        );
+        assert_eq!(
+            reloaded.list_promoted_memory_records().unwrap(),
+            vec![record]
+        );
+
+        // And the recovered state reloads clean.
+        drop(reloaded);
+        assert_eq!(
+            State::new(base)
+                .unwrap()
+                .list_promoted_memory_records()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_interrupted_decision_blocks_a_different_request_until_it_is_replayed() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let base = crash_between_append_and_commit(&state, &candidate_id, "decide-1");
+        drop(state);
+        let reloaded = State::new(base).unwrap();
+
+        let error = reloaded
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-2", 0), &reloaded),
+                OperatorAuthentication::Declared,
+                "2026-09-12T12:00:00Z",
+            )
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("interrupted"));
+        assert!(
+            rendered.contains("decide-1"),
+            "the error must name the request to replay: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_interrupted_decision_refuses_the_same_request_id_with_a_different_payload() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let base = crash_between_append_and_commit(&state, &candidate_id, "decide-1");
+        drop(state);
+        let reloaded = State::new(base).unwrap();
+
+        // Same request id, now a dismissal: only a promotion ever appends, so
+        // this is a payload conflict, not an adoption.
+        let error = reloaded
+            .decide_memory_candidate(
+                with_project(
+                    dismiss(&candidate_id, "decide-1", 0, "changed my mind"),
+                    &reloaded,
+                ),
+                OperatorAuthentication::Declared,
+                "2026-09-12T12:00:00Z",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("replayed with a different payload"));
+    }
+
+    #[test]
+    fn test_startup_keeps_a_parked_decision_whose_accepted_task_is_gone() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let outcome = state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &state),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        let record_id = outcome.record.unwrap().id;
+        let base = state.storage().base_path().to_path_buf();
+        drop(state);
+
+        // Age the candidate's derivation and remove the governed task ledger,
+        // so the parked decision has nothing to reattach to.
+        let path = base.join(MEMORY_CANDIDATES_FILE);
+        let mut ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        ledger["candidates"][candidate_id.as_str()]["derivation_version"] =
+            serde_json::json!(ACCEPTED_RUN_MEMORY_DERIVATION_VERSION - 1);
+        std::fs::write(&path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
+        std::fs::remove_file(base.join("GOVERNED_TASKS.json")).unwrap();
+
+        // The parked decision claims its record, so start-up succeeds and the
+        // record stays visible. Refusing here would have made this state — and
+        // a true fresh clone, which reaches it by a different road — permanently
+        // unbootable, for review state that is waiting rather than wrong.
+        let reloaded = State::new(base.clone()).expect("a parked claim is not corruption");
+        assert_eq!(
+            reloaded.list_promoted_memory_records().unwrap()[0].id,
+            record_id
+        );
+        assert!(reloaded
+            .list_accepted_run_memory_candidates(&reloaded.governed_project_id())
+            .unwrap()
+            .is_empty());
+
+        // And it survives a second boot rather than degrading.
+        drop(reloaded);
+        assert_eq!(
+            State::new(base)
+                .unwrap()
+                .list_promoted_memory_records()
+                .unwrap()[0]
+                .id,
+            record_id
+        );
+    }
+
+    /// The reviewer's round-2 P1: candidate reconciliation re-creates
+    /// `MEMORY_CANDIDATES.json`, so probing the path after it runs reports
+    /// `Local` on every machine that has ever run a governed task — which is
+    /// every machine that could have a memory log in the first place. A fresh
+    /// clone's tracked log then became a pile of "interrupted decisions": two
+    /// records refused startup with a remedy that changed nothing, and one
+    /// record loaded with the record silently invisible.
+    fn promote_n_then_delete_the_local_ledger(count: usize) -> std::path::PathBuf {
+        let (root, state) = state();
+        let base = state.storage().base_path().to_path_buf();
+        for index in 0..count {
+            accept_run(&state, &format!("run-{index}"));
+            let pending = state
+                .list_accepted_run_memory_candidates(&state.governed_project_id())
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.status.is_pending())
+                .expect("a freshly accepted run leaves a pending candidate");
+            state
+                .decide_memory_candidate(
+                    with_project(
+                        promote(&pending.id, &format!("decide-{index}"), index as u64),
+                        &state,
+                    ),
+                    OperatorAuthentication::Declared,
+                    "2026-09-12T10:00:00Z",
+                )
+                .unwrap();
+        }
+        assert_eq!(state.list_promoted_memory_records().unwrap().len(), count);
+        drop(state);
+
+        // The candidate ledger is gitignored; the log and its projection are
+        // tracked. A fresh clone has the second pair and not the first, while
+        // GOVERNED_TASKS.json is present because it is local runtime state a
+        // running daemon rebuilds.
+        std::fs::remove_file(base.join(MEMORY_CANDIDATES_FILE)).unwrap();
+        assert!(base.join("GOVERNED_TASKS.json").exists());
+        std::mem::forget(root);
+        base
+    }
+
+    #[test]
+    fn test_absent_ledger_adopts_a_single_record_log_even_with_governed_tasks_present() {
+        let base = promote_n_then_delete_the_local_ledger(1);
+        let reloaded = State::new(base).expect("an absent ledger must adopt, never refuse");
+        assert_eq!(
+            reloaded.list_promoted_memory_records().unwrap().len(),
+            1,
+            "the promoted record must not become silently invisible"
+        );
+        assert!(reloaded
+            .read_genome_projection()
+            .unwrap()
+            .expect("the projection is rebuilt from the adopted log")
+            .contains("## memory-record-"));
+    }
+
+    #[test]
+    fn test_absent_ledger_adopts_a_multi_record_log_even_with_governed_tasks_present() {
+        let base = promote_n_then_delete_the_local_ledger(2);
+        let reloaded = State::new(base.clone()).expect("an absent ledger must adopt, never refuse");
+        assert_eq!(reloaded.list_promoted_memory_records().unwrap().len(), 2);
+
+        // Adoption also rebuilds the review statuses from the records. Without
+        // that, every adopted record orphans on the next start-up and its
+        // candidate sits pending, promotable a second time into a duplicate.
+        let candidates = reloaded
+            .list_accepted_run_memory_candidates(&reloaded.governed_project_id())
+            .unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.status.is_promoted()),
+            "adopted records must reattach to their candidates"
+        );
+        for candidate in &candidates {
+            let MemoryCandidateStatus::Promoted { decided_by, .. } = &candidate.status else {
+                unreachable!("asserted promoted above");
+            };
+            assert_eq!(
+                decided_by.id, "adopted-from-checkout",
+                "an adopted decision must not claim an approver this machine never saw"
+            );
+        }
+
+        // Adoption is recorded, so the next start-up sees a local ledger with a
+        // head and does not have to adopt again.
+        drop(reloaded);
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(base.join(MEMORY_CANDIDATES_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(ledger["memory_log_head"]["entry_count"], 2);
+        assert_eq!(
+            State::new(base)
+                .unwrap()
+                .list_promoted_memory_records()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// A **true** fresh clone: only the tracked artifacts, no
+    /// `GOVERNED_TASKS.json` and no candidate ledger.
+    ///
+    /// Round 2 shipped adoption but tested only the governed-tasks-present
+    /// variant. Here the adopted records have no local candidate, so their
+    /// rebuilt decisions are parked — and reattachment only ever fired when
+    /// candidate reconciliation *inserted* a candidate from an accepted task,
+    /// which never happens when there are no tasks. Boot 1 adopted and boot 2
+    /// refused, permanently.
+    fn fresh_clone_of_a_project_with_two_promoted_records(
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (_root, state) = state();
+        let base = state.storage().base_path().to_path_buf();
+        for index in 0..2 {
+            accept_run(&state, &format!("run-{index}"));
+            let pending = state
+                .list_accepted_run_memory_candidates(&state.governed_project_id())
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.status.is_pending())
+                .expect("a freshly accepted run leaves a pending candidate");
+            state
+                .decide_memory_candidate(
+                    with_project(
+                        promote(&pending.id, &format!("decide-{index}"), index as u64),
+                        &state,
+                    ),
+                    OperatorAuthentication::Declared,
+                    "2026-09-12T10:00:00Z",
+                )
+                .unwrap();
+        }
+        assert_eq!(state.list_promoted_memory_records().unwrap().len(), 2);
+        drop(state);
+
+        let clone = tempfile::tempdir().unwrap();
+        // Mirror the original layout: the governed project id is derived from
+        // the directory holding `.impulse`, and boot 3 accepts a run here.
+        let clone_base = clone.path().join("impulse-test").join(".impulse");
+        std::fs::create_dir_all(&clone_base).unwrap();
+        for tracked in ["MEMORY.jsonl", "GENOME_PROJECTION.md", "config.json"] {
+            let from = base.join(tracked);
+            if from.exists() {
+                std::fs::copy(&from, clone_base.join(tracked)).unwrap();
+            }
+        }
+        assert!(!clone_base.join("GOVERNED_TASKS.json").exists());
+        assert!(!clone_base.join(MEMORY_CANDIDATES_FILE).exists());
+        (clone, clone_base)
+    }
+
+    #[test]
+    fn test_true_fresh_clone_boots_repeatedly_and_keeps_its_records_visible() {
+        let (_clone, base) = fresh_clone_of_a_project_with_two_promoted_records();
+
+        // Boot 1: adopt.
+        let first = State::new(base.clone()).expect("boot 1 must adopt");
+        assert_eq!(first.list_promoted_memory_records().unwrap().len(), 2);
+        drop(first);
+
+        // Boot 2: the ledger now exists, so the parked decisions are the only
+        // thing claiming those records. This is the boot that used to refuse.
+        let second = State::new(base.clone()).expect("boot 2 must not refuse");
+        assert_eq!(
+            second.list_promoted_memory_records().unwrap().len(),
+            2,
+            "adopted records must stay visible across boots"
+        );
+        assert!(
+            second
+                .list_accepted_run_memory_candidates(&second.governed_project_id())
+                .unwrap()
+                .is_empty(),
+            "a clone with no governed tasks has no candidates to review"
+        );
+        let projection = second.read_genome_projection().unwrap().unwrap();
+        assert_eq!(projection.matches("\n## memory-record-").count(), 2);
+
+        // Nothing here can be re-promoted into a duplicate: there is no
+        // candidate to decide on at all.
+        let error = second
+            .decide_memory_candidate(
+                with_project(
+                    promote(
+                        &MemoryCandidateId::try_new(format!("memory-candidate-{}", "a".repeat(64)))
+                            .unwrap(),
+                        "decide-clone",
+                        second_ledger_revision(&base),
+                    ),
+                    &second,
+                ),
+                OperatorAuthentication::Declared,
+                "2026-09-12T12:00:00Z",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("was not found"));
+        drop(second);
+
+        // Boot 3, after this machine accepts a run of its own and promotes it:
+        // the new record and the adopted ones coexist.
+        let third = State::new(base.clone()).unwrap();
+        accept_run(&third, "local");
+        let pending = third
+            .list_accepted_run_memory_candidates(&third.governed_project_id())
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.status.is_pending())
+            .expect("the locally accepted run leaves a pending candidate");
+        let outcome = third
+            .decide_memory_candidate(
+                with_project(
+                    promote(&pending.id, "decide-local", second_ledger_revision(&base)),
+                    &third,
+                ),
+                OperatorAuthentication::Declared,
+                "2026-09-12T13:00:00Z",
+            )
+            .unwrap();
+        let local_record = outcome.record.unwrap().id;
+        assert_eq!(third.list_promoted_memory_records().unwrap().len(), 3);
+
+        // Promoting it again is refused, and a fourth boot still loads clean.
+        let error = third
+            .decide_memory_candidate(
+                with_project(
+                    promote(
+                        &pending.id,
+                        "decide-local-again",
+                        second_ledger_revision(&base),
+                    ),
+                    &third,
+                ),
+                OperatorAuthentication::Declared,
+                "2026-09-12T13:01:00Z",
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("already promoted"));
+        drop(third);
+
+        let fourth = State::new(base).expect("boot 4 must not refuse");
+        let records = fourth.list_promoted_memory_records().unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records.iter().any(|record| record.id == local_record));
+    }
+
+    /// The ledger revision on disk, so a test can CAS against it without
+    /// tracking every decision it has made.
+    fn second_ledger_revision(base: &std::path::Path) -> u64 {
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(base.join(MEMORY_CANDIDATES_FILE)).unwrap())
+                .unwrap();
+        ledger["revision"].as_u64().unwrap_or(0)
+    }
+
+    /// Reviewer's round-4 Case A. A well-formed, correctly chained entry
+    /// appended to the *tracked* `MEMORY.jsonl` by anyone with write or merge
+    /// access lands in the uncommitted tail, loads fine, and stays invisible —
+    /// but used to refuse every future decision on every checkout with
+    /// "replay that exact request id", an instruction no one could follow.
+    #[test]
+    fn test_a_foreign_uncommitted_tail_is_refused_with_a_truncation_recovery_not_a_replay() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let base = state.storage().base_path().to_path_buf();
+        drop(state);
+
+        // The foreign entry names a candidate from a different project, so this
+        // checkout has never seen it, live or parked.
+        let foreign_source = sample_candidate();
+        let foreign = derive_promoted_record(
+            &foreign_source,
+            &GovernedRequestId::try_new("never-issued-here").unwrap(),
+            0,
+            "2026-09-12T09:00:00Z",
+        )
+        .unwrap();
+        let storage = Storage::new(base.clone());
+        let mut log = MemoryLog::load(&storage, None, LedgerOrigin::Local).unwrap();
+        log.append(&storage, foreign.clone()).unwrap();
+        let planted = std::fs::read(base.join("MEMORY.jsonl")).unwrap();
+
+        // It loads: one trailing entry is within the cap, and it is invisible.
+        let reloaded = State::new(base.clone()).unwrap();
+        assert!(reloaded.list_promoted_memory_records().unwrap().is_empty());
+        assert!(reloaded
+            .read_genome_projection()
+            .unwrap()
+            .is_none_or(|projection| !projection.contains(foreign.id.as_str())));
+
+        // But every decision is refused — with the recovery an operator can
+        // actually perform, and without the replay instruction.
+        let error = reloaded
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &reloaded),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("belongs to no decision this checkout ever made"),
+            "unexpected error: {rendered}"
+        );
+        assert!(
+            rendered.contains("keep the first 0 lines"),
+            "the message must name the exact truncation: {rendered}"
+        );
+        assert!(
+            !rendered.contains("replay that exact request id"),
+            "an unreplayable request must not be handed the replay instruction: {rendered}"
+        );
+        assert_eq!(
+            std::fs::read(base.join("MEMORY.jsonl")).unwrap(),
+            planted,
+            "a refusal must not touch the log"
+        );
+        drop(reloaded);
+
+        // Truncating to the committed head — nothing committed, so an empty
+        // file — unblocks promotion.
+        std::fs::write(base.join("MEMORY.jsonl"), "").unwrap();
+        let recovered = State::new(base).unwrap();
+        let outcome = recovered
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &recovered),
+                OperatorAuthentication::Declared,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        assert!(outcome.record.is_some());
+        assert_eq!(recovered.list_promoted_memory_records().unwrap().len(), 1);
+    }
+
+    /// The genuine interrupted-decision path is untouched: its candidate is
+    /// local, so it is never classified as foreign.
+    #[test]
+    fn test_a_genuine_interrupted_tail_still_says_replay() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        let base = crash_between_append_and_commit(&state, &candidate_id, "decide-1");
+        drop(state);
+        let reloaded = State::new(base).unwrap();
+
+        let error = reloaded
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-2", 0), &reloaded),
+                OperatorAuthentication::Declared,
+                "2026-09-12T12:00:00Z",
+            )
+            .unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("replay that exact request id"));
+        assert!(rendered.contains("decide-1"));
+        assert!(!rendered.contains("belongs to no decision"));
+    }
 }

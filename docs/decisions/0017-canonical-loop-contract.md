@@ -3,13 +3,13 @@ title: "ADR-0017: Canonical Loop Contract"
 description: Typed loop budgets, layered stop conditions, and termination evidence for Impulse-owned loops
 status: review
 created: 2026-09-01
-updated: 2026-09-01
+updated: 2026-09-12
 type: decision
 category: architecture
 phase: all
 audience: builders
 deciders: [Impulse Maintainers]
-tags: [adr, loop, ion, governance, evidence]
+tags: [adr, loop, ion, governance, evidence, context-budget]
 ---
 
 # ADR-0017: Canonical Loop Contract
@@ -124,6 +124,106 @@ This decision is represented when tests prove:
 
 Source of truth: `impulse-rs/src/loop_contract.rs`, `impulse-rs/src/llm_backends/mod.rs`,
 `impulse-rs/src/error.rs`.
+
+
+## Addendum, 2026-09-12: context budget (Stage 1b-A)
+
+Status unchanged. This addendum records one additive rule; it revises nothing above.
+
+**Rule 7. A loop may also declare what its own conversation may weigh, and must try to fit before
+it trips.** `LoopBudget` gains `max_context_chars: Option<usize>` (serde default `None`, rejected
+when `Some(0)`), `LoopTrip` gains `ContextBudget { chars, limit }`, and `LoopReport` gains
+`compactions`. Unlike every trip in rule 2, this one is not reached on first breach: the loop first
+compacts tool-result content oldest-first into a bounded stub that preserves the `tool_use` id and
+names the originating tool, and only trips when compaction cannot get the history back under
+budget. Two classes of content are never compacted: prose — the user's turn and the model's own
+words — and **the results this run produced**, which the model has not been shown even once. A
+loop that cannot fit without touching either trips instead of silently eliding it. That second
+exemption is scoped to the current run: a tool result carried in from an earlier, completed turn
+has already been seen and is ordinary compactible history.
+
+The budget is evaluated *before* the round is admitted, so a history that never fit reports
+`rounds_used: 0` rather than claiming a round it never spent.
+
+**Rule 8. A truncated or refused turn is neither executed nor completed.** A provider that stops on
+`max_tokens` while emitting tool calls produced a partial batch: a call's input may be missing
+fields, or the batch may be missing calls. Running it executes the model's half-written intent;
+returning it as a final reply hands the caller an empty string with a `Completed` report and no
+tool ever run — a truncation rendered as a successful answer. The loop fails with
+`AgentError::TruncatedToolCall { provider, tool_calls }` instead, history untouched. A truncated
+*plain* reply is unaffected: it is still the model's answer and is returned as before.
+
+The same principle covers a provider that declines, on every provider: an OpenAI-style refusal
+(`message.refusal` with null content), a blocked completion
+(`finish_reason: "content_filter"`), and Anthropic's `stop_reason: "refusal"` all return
+`AgentError::ProviderRefusal { provider, message }` rather than an empty assistant message
+committed as success — with the response text when there is any, and a fixed reason when there is
+not. An empty reply is never an acceptable rendering of "the model would not answer".
+`StopReason::Other` keeps its literal meaning, a stop reason this code does not recognize, and such
+a response still completes normally.
+
+Measurement and compaction live with the caller (`llm_backends`), which owns the message types;
+this module declares the limit, counts the compactions, and names the trip. Rule 6 is therefore
+preserved: `loop_contract` still depends on no provider, tool, or daemon type.
+
+**Measurement is of what is sent, at its widest.** A call's input costs different amounts on
+different wires: Anthropic sends it as a JSON object, OpenAI as `function.arguments`, a JSON
+*string* holding that object's serialization, so quotes and backslashes are escaped twice.
+Measuring the un-escaped form under-counted the OpenAI wire by roughly 1.28x on escape-heavy
+inputs. The measurement therefore takes `WireFormat::widest_tool_input_chars` — the largest
+rendering across every wire shape — rather than reading the shape off the running provider. Reading
+it off the provider would mean a `LlmProvider` trait method, and a defaulted trait method is
+exactly how this under-measurement would return: a future provider that forgets to override it
+silently measures its own traffic short. The widest can never under-count for anyone; over-counting
+only spends the budget's deliberate headroom slightly sooner.
+
+**Already-compacted is tracked by identity.** The run carries a set of compacted `tool_use_id`s
+beside the working history, committed with it on success and discarded with it on every error path.
+Classifying by the stub's marker text was wrong in both directions: a re-wrapped stub no longer
+begins with the marker, and a genuine tool result that merely contains it was skipped as though it
+were a stub, tripping the budget where compaction would have succeeded.
+
+**A stub carries untrusted text and must stay framed.** The tool name a stub quotes comes from the
+model's own request, not from a registry, so it is rendered through `serde_json::Value::String`
+(escaping quotes, backslashes, and control characters) and bounded to 64 characters. Because a stub
+replaces the result's *entire* stored content — including any framing the executor applied — it is
+re-wrapped through `ToolExecutor::wrap_compaction_stub`, a hook on the executor because the
+executor is the layer that framed the content in the first place. `llm_backends` neither knows nor
+imports what that framing is.
+
+The Ion contract defaults to 200,000 characters (`ION_DEFAULT_MAX_CONTEXT_CHARS`); the governed
+Builder contract leaves the budget unset, because the daemon holds claim records rather than a
+conversation. `LoopReport::compactions` is omitted from the wire form when zero, so every
+already-persisted governed `loop_report_digest` reproduces byte-for-byte and
+`GOVERNED_BUILDER_LOOP_VERSION` does not move.
+
+Rule 3's invariant is unchanged: compaction mutates only the caller's working copy, a trip discards
+it, and history is committed only on success. A `ContextBudget` trip surfaces through the existing
+`AgentError::ToolLoopStalled { trip }` rather than a new error variant.
+
+**Verification.** This addendum is represented when tests prove: a budget of `Some(0)` is rejected;
+`LoopBudget`, `LoopTrip::ContextBudget`, and a `LoopReport` carrying `compactions` round-trip
+through serde, and JSON written before either field existed still loads; a zero compaction count
+never reaches the wire form; compaction preserves `tool_use_id`, runs oldest-first, stops as soon
+as it is under budget, refuses to grow the history, never re-compacts a result whose id the run already
+recorded, still compacts a genuine result that merely contains the stub marker, and never touches
+the newest round's results; the compaction record is committed with history on success, discarded
+with it on failure, and cleared by `clear_history`; a history of prose alone over budget trips; the measurement of an
+escape-heavy input is the OpenAI rendering, not the Anthropic one; a hostile tool name survives only
+as an escaped, bounded JSON string; a stub is re-wrapped in the executor's framing; and
+`chat_with_tools` surfaces the trip as `ToolLoopStalled` with history untouched, a `Tripped`
+report, and `rounds_used: 0` when nothing ever fit. a result carried in from an
+earlier completed turn is compactible on the next turn while one this run produced is not. Rule 8
+is represented when a provider stopping on `max_tokens` with tool calls returns
+`TruncatedToolCall`, runs no tool, leaves history untouched, and never returns `Ok("")`, while a
+truncated plain reply still completes; and when an OpenAI-style `refusal`, a `content_filter`
+finish, or an Anthropic `stop_reason: "refusal"` returns `ProviderRefusal` rather than an empty
+success — carrying the response text when there is any and a fixed reason when there is not, and
+leaving history untouched — while an empty or null `refusal` field on an ordinary reply, and an
+unrecognized stop reason carrying real text, both still complete.
+
+Full design, including the algorithm's exact ordering and what was deliberately not adopted:
+`docs/superpowers/specs/2026-09-01-loop-contract-design.md` (addendum of the same date).
 
 ## Related Documents
 

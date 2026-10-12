@@ -88,14 +88,16 @@ mod tests {
     use rustyline::history::History;
 
     /// Serializes tests that mutate process-global env vars (`IMPULSE_HOME`,
-    /// `HOME`, `USERPROFILE`), since `cargo test` runs unit tests in the
-    /// same process on multiple threads by default. Mirrors the identical
-    /// helper in `handlers/ion.rs` and `impulse-ion/src/pi_adapter.rs`.
+    /// `HOME`, `USERPROFILE`). Delegates to the crate-wide
+    /// `test_support::impulse_home_env_lock` (review round 5 on PR #54):
+    /// this file's own PRIVATE static lock used to only serialize tests
+    /// within `history.rs` itself, not against `ion_repl::mod`'s or
+    /// `tooling::builtin::{memory_search,genome_read}`'s tests, which also
+    /// mutate the same process-global `IMPULSE_HOME` -- a real cross-file
+    /// race `cargo test`'s default multi-threaded-single-process execution
+    /// could hit.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::test_support::impulse_home_env_lock()
     }
 
     #[test]

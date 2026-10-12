@@ -11,6 +11,7 @@
 //! - This file — `Daemon` struct, startup, socket accept loop, shutdown
 
 pub mod actor_provenance;
+pub mod governed_wiring;
 pub mod handlers;
 pub mod protocol;
 

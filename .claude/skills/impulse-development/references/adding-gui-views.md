@@ -69,6 +69,23 @@ cargo fmt --all -- --check
 ```
 
 Record the current checkout's results, including passed, ignored, and failed test totals. The frozen `impulse-gui` crate is excluded from this workspace; do not run its tests for a Dioxus view change.
+Run the focused desktop checks first:
+
+```bash
+cd impulse-rs
+cargo test -p impulse-desktop
+# visual smoke lives in the same crate; do not run tests inside frozen impulse-gui
+```
+
+Those do not replace the repository-wide gate. A new public `DesktopView` variant or `ui.rs` dispatch arm can break other workspace crates. Before commit, also run the AGENTS.md verification gate:
+
+```bash
+cd impulse-rs
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
 
 ---
 
@@ -84,3 +101,6 @@ Record the current checkout's results, including passed, ignored, and failed tes
 - visual_smoke.mjs route with the real active selector
 - named local impulse-desktop crate test and visual smoke clean
 - full workspace build, test, Clippy, and format gate clean; current test totals recorded
+- named local impulse-desktop crate test clean (`cargo test -p impulse-desktop`)
+- AGENTS.md workspace gate clean (`cargo build --workspace`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`)
+- no tests run inside frozen impulse-gui

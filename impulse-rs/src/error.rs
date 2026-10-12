@@ -74,16 +74,52 @@ pub enum AgentError {
     #[error("Harness command '{command}' did not complete within {seconds}s")]
     HarnessTimedOut { command: String, seconds: u64 },
 
-    /// Surfaced by `llm_backends::Agent::chat_with_tools` when the loop
-    /// contract's no-progress detectors trip (ADR-0017): the model kept
-    /// issuing the same tool call, the same batch of calls round after
-    /// round, or the same tool kept failing the same way. Round-cap and
-    /// wall-clock trips keep their dedicated variants above; history is left
-    /// untouched on this path too.
+    /// Surfaced by `llm_backends::Agent::chat_with_tools` for every loop
+    /// trip that has no dedicated variant above (ADR-0017): the no-progress
+    /// detectors (the model kept issuing the same tool call, the same batch
+    /// of calls round after round, or the same tool kept failing the same
+    /// way) and, since the 2026-09-12 addendum, `LoopTrip::ContextBudget` —
+    /// the working history was still over the contract's context budget
+    /// after compaction. Round-cap and wall-clock trips keep their dedicated
+    /// variants above; history is left untouched on this path too. The
+    /// `LoopTrip`'s own `Display` carries the specific reason, so callers
+    /// that render this generically need no change when a trip is added.
     #[error("Tool-use loop stalled: {trip}")]
     ToolLoopStalled {
         trip: crate::loop_contract::LoopTrip,
     },
+
+    /// Surfaced by `llm_backends::run_tool_loop` when a provider stops on
+    /// `max_tokens` *while emitting tool calls* (review round 1, P1).
+    ///
+    /// The tool-use blocks in such a response are truncated: the model was
+    /// cut off mid-emission, so a call's `input` may be missing fields the
+    /// model intended to send, or the batch may be missing calls entirely.
+    /// Executing them would run the model's half-written intent, and
+    /// treating the turn as a finished plain reply would hand the caller
+    /// `Ok("")` with a `Completed` report and no tool ever run — a
+    /// truncation silently rendered as a successful empty answer. Neither is
+    /// acceptable, so the run fails here instead, with history left
+    /// untouched exactly as on every other error path.
+    #[error(
+        "Provider '{provider}' stopped at its token limit while emitting {tool_calls} tool call(s); \
+         the request was truncated mid-tool-use and was not executed"
+    )]
+    TruncatedToolCall { provider: String, tool_calls: usize },
+
+    /// Surfaced when a provider declines to answer (review round 3).
+    ///
+    /// OpenAI-style completions report this two ways: a structured
+    /// `message.refusal` string with `message.content` null, and
+    /// `finish_reason: "content_filter"`. Both used to reach the loop as an
+    /// ordinary reply whose content was `unwrap_or_default()`-ed to the empty
+    /// string, so the turn committed an empty assistant message and reported
+    /// success — the user saw a blank answer with no indication the model had
+    /// refused or the completion had been filtered. A refusal is a real,
+    /// nameable outcome and is surfaced as one; history is left untouched, as
+    /// on every other error path.
+    #[error("Provider '{provider}' declined to answer: {message}")]
+    ProviderRefusal { provider: String, message: String },
 }
 
 pub type AgentResult<T> = Result<T, AgentError>;
@@ -213,5 +249,50 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("claude"), "expected command name in: {msg}");
         assert!(msg.contains("120"), "expected timeout seconds in: {msg}");
+    }
+
+    #[test]
+    fn test_agent_error_truncated_tool_call_display() {
+        let err = AgentError::TruncatedToolCall {
+            provider: "openai".to_string(),
+            tool_calls: 2,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("openai"), "expected provider name in: {msg}");
+        assert!(msg.contains('2'), "expected the call count in: {msg}");
+        assert!(msg.contains("truncated"), "expected the reason in: {msg}");
+        assert!(
+            msg.contains("not executed"),
+            "the message must say nothing ran: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_agent_error_tool_loop_stalled_display_carries_a_context_budget_trip() {
+        let err = AgentError::ToolLoopStalled {
+            trip: crate::loop_contract::LoopTrip::ContextBudget {
+                chars: 900,
+                limit: 100,
+            },
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("stalled"), "{msg}");
+        assert!(msg.contains("900"), "{msg}");
+        assert!(msg.contains("100"), "{msg}");
+    }
+
+    #[test]
+    fn test_agent_error_provider_refusal_display() {
+        let err = AgentError::ProviderRefusal {
+            provider: "openai".to_string(),
+            message: "I can't help with that.".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("openai"), "expected provider name in: {msg}");
+        assert!(
+            msg.contains("I can't help with that."),
+            "expected the refusal text in: {msg}"
+        );
+        assert!(msg.contains("declined"), "expected the reason in: {msg}");
     }
 }

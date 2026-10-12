@@ -53,7 +53,7 @@ CONTRACT_KEY_FILES = [
 DURABLE_ROADMAP_MARKER = (
     "Now=control-plane foundations + governed runtime producers + accepted-run review candidates; "
     "Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; "
-    "Later=explicit memory promotion/dismissal + general roles + negotiated runtimes + "
+    "Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + "
     "multi-project routing; Legacy=egui compile-maintenance only"
 )
 
@@ -102,8 +102,10 @@ CONTRACT_REQUIRED_MARKERS = {
         DURABLE_ROADMAP_MARKER,
     ],
     DOCS_DIR / "IPC-PROTOCOL.md": [
-        "**Protocol version: 7**",
-        '"protocol_version": 7',
+        "**Protocol version: 9**",
+        '"protocol_version": 9',
+        "### v9 — Daemon governed wiring",
+        "### v8 — Builder staged-worktree world scope",
         "### v7 — Socket actor provenance",
         "### v6 — Deterministic accepted-run memory candidates",
         "### v5 — Daemon-owned governed producers",

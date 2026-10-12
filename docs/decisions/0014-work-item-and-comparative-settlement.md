@@ -1,6 +1,6 @@
 ---
 title: "ADR-0014: WorkItem Identity and Comparative Settlement"
-status: proposed
+status: review
 created: 2026-08-10
 deciders: [Impulse Maintainers]
 ---
@@ -9,7 +9,7 @@ deciders: [Impulse Maintainers]
 
 ## Status
 
-Proposed.
+Proposed; pending ratification. The metadata status `review` does not mark this ADR accepted.
 
 ## Context
 

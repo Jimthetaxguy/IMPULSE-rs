@@ -13,7 +13,7 @@ exclude = ["impulse-gui"]
 name = "impulse-rs"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.96" # floor set by monty 1.0 (ADR-0021)
 description = "Terminal-native local control plane and harness manager for AI coding agents"
 authors = ["Impulse Maintainers"]
 license = "MIT"
@@ -91,7 +91,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Readline REPL (ion binary, TUI_SPEC.md T6). TUI_SPEC.md floated "15" as a
 # candidate pin; 18 is the current major on crates.io as of this task and
-# resolves/builds cleanly against this workspace's MSRV (1.82), so we pin to
+# resolves/builds cleanly against this workspace's MSRV (then 1.82), so we pin to
 # the current major instead of the stale suggestion.
 rustyline = "18"
 
@@ -107,7 +107,9 @@ pyo3 = { version = "0.29.0", optional = true, features = ["extension-module"] }
 
 # DataFusion for advanced analytics (optional)
 # Enable with --features datafusion-support
-datafusion = { version = "43", optional = true }
+# Nothing imports this crate yet; the requirement only shapes the lockfile. 43's
+# arrow 53 tree capped chrono below 0.4.40, which monty 1.0 needs (ADR-0021).
+datafusion = { version = "55", optional = true }
 
 # Office document handling (optional)
 # Enable with --features office-support
@@ -118,12 +120,39 @@ docx = { version = "0.4", optional = true, package = "docx-rs" }
 zip = { version = "0.6", optional = true, default-features = false, features = ["deflate"] }
 # Streaming docx text extraction for ion document_read (calamine already pulls quick-xml 0.31)
 quick-xml = { version = "0.31", optional = true }
+# PDF text-layer extraction for ion document_read (Stage 1b-B). Text layer only, page-by-page
+# via the public output_doc_page/PlainTextOutput API so page count and the extracted-character
+# budget can be enforced before/between pages; never renders images (PlainTextOutput has no
+# image handling). Re-exports lopdf at its crate root (`pdf_extract::Document` etc.), so no
+# separate lopdf dependency is needed for this crate's own PDF handling or its test fixtures.
+pdf-extract = { version = "0.12", optional = true }
+# Bounded FlateDecode stream-inflation preflight for PDFs (review round 2, P2): pdf-extract's own
+# internal decompression of a stream's content is unbounded, so a crafted PDF can inflate a small
+# compressed stream hundreds of times over before BoundedSink's first write-time check ever runs.
+# Already a transitive dependency (via lopdf, zip, image); pinned here as direct so this crate can
+# call its streaming decoder to count inflated bytes without ever materializing them.
+flate2 = { version = "1", optional = true }
+# Bounded LZWDecode stream-inflation preflight for PDFs (review round 3, F1):
+# lopdf can decode /LZWDecode streams but the round-2 preflight only counted
+# FlateDecode, so an LZW-filtered bomb reached multi-GB RSS despite the
+# preflight reporting "OK". Already a transitive dependency (via lopdf, gif,
+# tiff) at the same 0.1.x line; pinned here as direct so this crate can drive
+# its streaming decoder to count decoded bytes without ever materializing
+# them, mirroring the flate2 precedent immediately above.
+weezl = { version = "0.1", optional = true }
+
+# In-process Python sandbox for calculator/python_exec (ADR-0021). No host
+# functions, mounts, or inputs are wired, so the interpreter is the boundary.
+# monty-pool (subprocess workers, crash isolation) is the planned follow-up.
+monty = "1.0.0"
+monty-types = { version = "1.0.0", features = ["tzdb"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# Keep Impulse's Rust 1.82 MSRV: security-framework 3.7 requires Rust 1.85.
+# Pinned while the MSRV was 1.82 (security-framework 3.7 requires Rust 1.85). The
+# floor is now 1.96 for the Monty sandbox (ADR-0021), so this pin can be revisited.
 security-framework = "=3.6.0"
 security-framework-sys = "=2.17.0"
 
@@ -135,11 +164,29 @@ monty-support = ["dep:pyo3"]
 # DataFusion support enables advanced analytics and aggregation
 datafusion-support = ["dep:datafusion"]
 # Office support enables document parsing and generation
-# Supports: Excel (.xlsx), Word (.docx), CSV
-office-support = ["dep:calamine", "dep:rust_xlsxwriter", "dep:docx", "dep:zip", "dep:quick-xml"]
+# Supports: Excel (.xlsx), Word (.docx), CSV; ion's document_read additionally reads
+# PDF (text layer), txt, and md under this same feature.
+office-support = [
+    "dep:calamine",
+    "dep:rust_xlsxwriter",
+    "dep:docx",
+    "dep:zip",
+    "dep:quick-xml",
+    "dep:pdf-extract",
+    "dep:flate2",
+    "dep:weezl",
+]
 
 [dev-dependencies]
 filetime = "0.2"
+# Property-based / fuzz-style testing over the parsers adversarial review keeps
+# breaking (CLAUDE.md "Property-Based Testing"); first used by the governed
+# fuzz harness lane, docs/superpowers/specs/2026-09-12-governed-parser-property-tests.md.
+proptest = "1"
+# `tokio::time::pause`/`resume` so a test can decide *when* a
+# `tokio::time::timeout` fires instead of betting on wall-clock ordering
+# (agent::tests::test_harness_query_kills_hung_child_instead_of_orphaning).
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 opt-level = 3

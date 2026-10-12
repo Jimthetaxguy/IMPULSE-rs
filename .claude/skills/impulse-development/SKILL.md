@@ -2,7 +2,7 @@
 name: impulse-development
 description: "Use when adding features to the Impulse codebase — CLI commands, daemon IPC messages, GUI views, dynamic tools, context lifecycle, or guardrails. Routes to detailed step-by-step guides."
 version: 1.0.0
-updated: 2026-08-29
+updated: 2026-09-12
 domain: engineering
 category: languages
 maturity: silver
@@ -183,9 +183,13 @@ Each test gets a unique socket path to support parallel execution.
 
 ### Verification Before Commit
 ```bash
-cargo build && cargo test && cargo clippy -- -D warnings && cargo fmt --check
+cd impulse-rs
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
-All four must pass. Never skip with `--no-verify`.
+All four must pass. Never skip with `--no-verify`. Crate-local checks (`cargo test -p impulse-desktop`) are extra, not a substitute.
 
 ---
 

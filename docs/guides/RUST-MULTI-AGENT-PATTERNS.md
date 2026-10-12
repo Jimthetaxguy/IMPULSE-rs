@@ -3,15 +3,41 @@ status: active
 phase: all
 audience: builder
 tags: [guide, rust, multi-agent, harness, implementation]
-last_updated: 2026-03-31
+last_updated: 2026-09-14
 ---
 
 # Rust Multi-Agent and Meta-Harness Patterns
 
-> **Version:** 1.0 | **Status:** Implementation Guide | **Updated:** 2026-03-31
+> **Version:** 1.1 | **Status:** Implementation Guide | **Updated:** 2026-09-14
 > **Purpose:** Capture the Rust programming patterns that best fit Impulse if it grows toward trace-driven harness optimization and richer multi-agent coordination.
 
 ---
+
+## Current Impulse contract
+
+Reviewed against the current Rust sources on 2026-09-14. The snippets below illustrate patterns;
+they do not define new daemon messages, role authority, or a second harness registry.
+
+- Extend the governed-task records and revision/request receipts in
+  [`governed_task`](../../impulse-rs/impulse-ops/src/governed_task.rs). Registration, claim,
+  verification, Supervisor review, and operator decision are distinct transitions; model output
+  or process exit does not accept a task.
+- Socket operator authority comes from peer credentials plus the per-daemon-run capability in
+  [`actor_provenance.rs`](../../impulse-rs/src/daemon/actor_provenance.rs), not a role field supplied
+  by a client. A same-UID process that deliberately discovers the token remains inside the stated
+  threat-model limit.
+- [`governed_wiring.rs`](../../impulse-rs/src/daemon/governed_wiring.rs) wraps verification,
+  Supervisor review, and promotion side effects and their recorded mutations in durable producer
+  reservations. A panic/crash can leave an open reservation requiring reconciliation; this is not
+  a promise of transactional rollback of arbitrary external effects.
+- Reuse the existing [`daemon protocol`](../../impulse-rs/src/daemon/protocol.rs) and
+  [`impulse-ops`](../../impulse-rs/impulse-ops/src/lib.rs) contracts. Dioxus consumes daemon truth;
+  the CLI and runtime adapters must not create a parallel policy authority.
+- Keep memory candidates, promoted records, their derived projection, and hand-curated GENOME
+  separate. [ADR-0020](../decisions/0020-scoped-memory-promotion-and-dismissal.md) provides state
+  and wire contracts but explicitly defers daemon endpoint, Dioxus controls, and Ion integration.
+  [ADR-0019](../decisions/0019-builder-staged-worktree-world-scope.md) staged-worktree Promote/Discard
+  is a separate, wired operation.
 
 ## Why This Guide Exists
 
@@ -37,7 +63,7 @@ This guide keeps that requirement concrete for the existing Rust codebase.
 
 4. **Preserve the direct/daemon split.** Short hook paths stay cheap; long-lived authoritative state belongs in the daemon.
 
-5. **Use serde as part of the safety boundary.** Policy mutations that do not deserialize cleanly should never progress deeper into evaluation.
+5. **Deserialize, then validate and authorize.** Serde checks representation; it does not grant mutation authority. Reject invalid invariants, stale revisions, and missing permissions before evaluation or effects.
 
 ---
 
@@ -65,7 +91,7 @@ Benefits:
 
 - human-readable
 - testable with round-trip serde
-- safe to mutate via `serde_json`
+- serializable via `serde_json`; applying a change still requires validation and authority
 - consistent with the repo's existing config direction
 
 ---
@@ -78,9 +104,9 @@ If a policy can be evaluated, it needs a stable `run_id` that joins:
 - evaluation score
 - trace file
 - resulting artifact
-- durable note in `GENOME.md`
+- governed-task evidence and any derived review candidate, with source identity preserved
 
-Without that, the system can search traces but cannot learn from them precisely.
+Correlation supports inspection and comparison; it does not authorize automatic GENOME writes. Hand-curated `GENOME.md` retains its existing operator-controlled writer, separate from candidate and promoted-record artifacts.
 
 ---
 
@@ -146,28 +172,33 @@ If candidate policies are ever evaluated in parallel, use bounded concurrency ra
 - `tokio::sync::Semaphore`
 - explicit evaluation budgets
 
-The goal is deterministic, inspectable evaluation, not maximum task fan-out.
+The window bounds spawned-but-uncollected tasks as well as active evaluators. Completion order
+is nondeterministic. On an evaluator or join error, this example returns the error and dropping
+the JoinSet requests cancellation of remaining tasks; evaluators must define their own cleanup
+and must not assume cancellation rolls back external effects.
 
 ```rust
-use std::sync::Arc;
-use tokio::{sync::Semaphore, task::JoinSet};
+use anyhow::Result;
+use tokio::task::JoinSet;
 
-async fn run_candidates(candidates: Vec<String>) {
-    let gate = Arc::new(Semaphore::new(4));
+// evaluate_candidate returns Result<()>; task and evaluator failures must reach the caller.
+async fn run_candidates(candidates: Vec<String>) -> Result<()> {
+    const MAX_IN_FLIGHT: usize = 4;
     let mut tasks = JoinSet::new();
 
     for candidate in candidates {
-        let gate = gate.clone();
-        tasks.spawn(async move {
-            let _permit = gate.acquire_owned().await.expect("semaphore closed");
-            evaluate_candidate(candidate).await
-        });
+        if tasks.len() >= MAX_IN_FLIGHT {
+            if let Some(result) = tasks.join_next().await {
+                result??;
+            }
+        }
+        tasks.spawn(async move { evaluate_candidate(candidate).await });
     }
 
     while let Some(result) = tasks.join_next().await {
-        // Record each result immediately; don't wait for the full batch.
-        let _ = result;
+        result??;
     }
+    Ok(())
 }
 ```
 
@@ -243,12 +274,12 @@ This split aligns with existing guardrail and daemon design instincts in the rep
 
 ## Recommended Build Sequence
 
-1. **Externalize routing policy** into serializable config.
-2. **Attach `run_id` to injection artifacts** and downstream trace outputs.
-3. **Introduce a small harness registry** using the current SQLite patterns.
-4. **Add a focused evaluation harness** with deterministic fixtures and `#[tokio::test]`.
-5. **Write structured GENOME entries** for meaningful wins and regressions.
-6. **Only then** consider proposer-driven policy mutation.
+1. **Map the change onto existing governed-task and artifact records** before proposing new storage.
+2. **Carry task, request, revision, and basis identity** through the existing producer path.
+3. **Keep verification and Supervisor review separate from operator acceptance**, including failure and replay paths.
+4. **Exercise bounded scheduling, stale revisions, producer failures, and recovery** in focused tests.
+5. **Preserve raw evidence and review candidates**; accepting a run must not silently rewrite GENOME.
+6. **Add policy changes or memory promotion wiring only under their own scoped contracts and gates.**
 
 This sequence keeps the codebase honest: first make behavior observable, then make it evolvable.
 
@@ -277,10 +308,10 @@ Verification should still use the repo's existing Rust gate:
 
 ```bash
 cd impulse-rs
-cargo fmt --check
-cargo check --all-features
-cargo test
-cargo clippy --all-features --all-targets -- -D warnings
+cargo build --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
 
 ---
