@@ -1,5 +1,6 @@
 # Impulse CLI Command Reference
 
+> All commands: `impulse-rs <command> [flags]`
 > Packaged executable: `impulse-rs`
 > All commands: `impulse-rs [global flags] <command> [command flags]`
 > Daemon mode: `impulse-rs --daemon <command>` (requires a foreground daemon in another terminal)

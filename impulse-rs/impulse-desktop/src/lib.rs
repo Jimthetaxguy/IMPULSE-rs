@@ -26,6 +26,8 @@ pub use bridge::{
     TerminalSessionResponse, TerminalWriteRequest,
 };
 pub use daemon_ops::{
+    agent_runtime_from_snapshot, attach_desktop_daemon_ops, DesktopDaemonOpsConfig,
+    DesktopDaemonOpsStartError, DEFAULT_HEARTBEAT_INTERVAL,
     agent_runtime_from_snapshot, attach_desktop_daemon_ops, DesktopDaemonOpsAttachment,
     DesktopDaemonOpsConfig, DesktopDaemonOpsStartError, DEFAULT_HEARTBEAT_INTERVAL,
 };
@@ -43,6 +45,8 @@ pub use native::{
 pub use runtime::{
     default_builtin_mcp_tools, AgentPlatformId, AgentRuntimeSnapshot, AgentSpawnRequest,
     AgentWriteRequest, BuiltInMcpTool, DesktopEvent, DesktopEventSink, DesktopRuntime,
+    DesktopRuntimeBuilder, LocalSupervisorAction, SupervisorLocalActionRequest, WeakDesktopRuntime,
+    WorkspaceTarget,
     DesktopRuntimeBuilder, GovernedRoutingMetadata, GovernedTaskGateway, LocalSupervisorAction,
     SupervisorLocalActionRequest, WeakDesktopRuntime, WorkspaceTarget,
 };
