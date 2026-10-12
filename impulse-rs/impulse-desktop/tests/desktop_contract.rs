@@ -289,7 +289,7 @@ impl Document for FakeDocument {
     fn eval(&self, js: String) -> Eval {
         self.state.borrow_mut().scripts.push(js.clone());
         let messages = if js.contains("__impulseOpsBridge") {
-            self.state.borrow_mut().bridge_messages.drain(..).collect()
+            std::mem::take(&mut self.state.borrow_mut().bridge_messages)
         } else {
             VecDeque::new()
         };

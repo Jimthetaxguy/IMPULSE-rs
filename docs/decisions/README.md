@@ -44,6 +44,7 @@ registry-backed runtime identity, daemon truth, or the current Now/Next/Later ro
 | [0015](0015-harness-owned-step-model.md) | Harness-owned step model choice | **Accepted** | Pure Impulse-owned per-step policy; applications retain inference and semantic authority | 2026-08-17 | -- |
 | [0017](0017-canonical-loop-contract.md) | Canonical loop contract | **Proposed** | Typed loop budgets, breaker-evaluated stop conditions, and termination evidence for Ion tool loops; 0016 reserved by the drafted harness evolution plane | 2026-09-01 | -- |
 | [0018](0018-socket-actor-provenance.md) | Socket actor provenance | **Proposed** | Peer credentials plus a per-run operator capability classify every daemon connection, so only an operator surface can mint `accepted` | 2026-09-02 | -- |
+| [0019](0019-builder-staged-worktree-world-scope.md) | Builder staged-worktree world scope | **Proposed** | Declared `WorldScope`, a disposable staged Builder worktree, fast-forward-only promotion after operator acceptance, mediated (never structural) `filesystem.scoped` reporting, and the governed Builder loop binding; 0018 reserved by the socket actor-provenance lane | 2026-09-02 | -- |
 
 ## ADR Format
 

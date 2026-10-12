@@ -270,6 +270,15 @@ pub(super) fn derive_accepted_run_memory_candidate(
         .operator_decisions
         .last()
         .context("accepted governed task has no current operator decision")?;
+    // The projection is pinned to the revision the acceptance landed on, not to
+    // the task's current revision. ADR-0019 records promotion facts after an
+    // acceptance, and a post-accept revision must not re-derive the candidate
+    // under a different identity. For every record written before ADR-0019 the
+    // two are the same number, so no stored digest changes.
+    let accepted_task_revision = operator
+        .based_on_revision
+        .checked_add(1)
+        .context("accepted governed task operator decision revision exhausted u64")?;
     if verification.outcome != GovernedVerificationOutcome::Passed
         || verification.claim_id != claim.id
         || verification.subject_revision != claim.subject_revision
@@ -277,7 +286,7 @@ pub(super) fn derive_accepted_run_memory_candidate(
         || supervisor.verification_id != verification.id
         || operator.decision != OperatorDecisionKind::Approve
         || operator.supervisor_verdict_id != supervisor.id
-        || operator.based_on_revision.checked_add(1) != Some(task.revision)
+        || accepted_task_revision > task.revision
     {
         anyhow::bail!(
             "accepted governed task `{}` has an incoherent candidate evidence chain",
@@ -313,7 +322,7 @@ pub(super) fn derive_accepted_run_memory_candidate(
         project_id: &task.project_id,
         workspace_root: &task.workspace_root,
         governed_task_id: &task.id,
-        accepted_task_revision: task.revision,
+        accepted_task_revision,
         task: &task.task,
         acceptance_criteria: &task.acceptance_criteria,
         runtime_id: &task.runtime_id,
@@ -359,7 +368,7 @@ pub(super) fn derive_accepted_run_memory_candidate(
         project_id: task.project_id.clone(),
         workspace_root: task.workspace_root.clone(),
         governed_task_id: task.id.clone(),
-        accepted_task_revision: task.revision,
+        accepted_task_revision,
         task: task.task.clone(),
         acceptance_criteria: task.acceptance_criteria.clone(),
         proposed_summary,

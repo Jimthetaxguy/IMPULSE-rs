@@ -15,7 +15,7 @@ pub mod role_assignment;
 ///
 /// v7 (ADR-0018) adds the connection-scoped `PresentOperatorCapability`
 /// request and the operator-class requirement on `RecordOperatorDecision`.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 7;
+pub const DAEMON_PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {

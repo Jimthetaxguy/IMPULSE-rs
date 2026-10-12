@@ -24,7 +24,7 @@ pub mod delegation;
 pub mod docs;
 pub mod envelope;
 pub mod error;
-pub(crate) mod governed_producers;
+pub mod governed_producers;
 pub mod guardrail;
 pub mod handlers;
 pub mod injection;
