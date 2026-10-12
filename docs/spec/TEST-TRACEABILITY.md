@@ -3,6 +3,8 @@ title: Test Traceability Matrix
 description: Story-to-test coverage map for the current Rust Impulse workspace and open validation gaps
 version: '1.1'
 updated: 2026-07-12
+version: '1.2'
+updated: 2026-07-13
 version: '1.3'
 updated: 2026-07-15
 type: specification
@@ -47,6 +49,7 @@ authors:
 | ST-11 Enforce verification-before-completion | `impulse-rs/src/validate.rs`, recent invalid-direct-request fixes, session-end verify flows | Strong | manual operator acceptance still matters for claim wording, but automated coverage is present |
 | ST-12 Prove the real hook memory loop before expanding claims | `impulse-rs/tests/hook_validation_session_start.rs`, `hook_validation_precompact.rs`, `hook_validation_extraction_benchmark.rs`, `docs/guides/HOOK-VALIDATION-GUIDE.md` | Manual | the code can generate evidence, but product truth still depends on real external hook runs |
 | ST-13 Complete one governed supervisor-and-builder vertical slice | `impulse-rs/impulse-desktop/src/runtime.rs`, `host_commands.rs`, `mcp.rs`, `impulse-desktop/tests/runtime.rs`, `desktop_contract.rs`, `impulse-ops/src/{agent_registry.rs,lib.rs}`, and daemon supervisor/publish-subscribe tests | Moderate | launch/write/focus/close, registry identity, daemon truth, and supervisor-specific policy are directly tested; no single E2E yet binds supervisor and builder roles to one scoped task, proves backend role enforcement, and carries builder evidence through supervisor/operator acceptance |
+| ST-13 Complete one governed supervisor-and-builder vertical slice | `impulse-rs/impulse-ops/src/{role_assignment.rs,agent_registry.rs,lib.rs}`, `impulse-rs/impulse-desktop/src/{ui.rs,runtime.rs,daemon_ops.rs,mcp.rs}`, `impulse-rs/impulse-desktop/tests/{runtime.rs,desktop_contract.rs}`, `impulse-rs/src/ops_workbench.rs`, and daemon supervisor/publish-subscribe tests | Moderate | focused tests prove the Builder task/assignment request, static compatibility preview, stale-catalog fail-closed behavior, canonical workspace binding, mandatory rejection before agent-id/PTY creation, optional degradation, and typed telemetry preservation; no single E2E yet binds supervisor and builder governed runs and carries evidence through verification, supervisor judgment, and operator approval |
 | ST-13 Complete one governed supervisor-and-builder vertical slice | `impulse-rs/impulse-ops/src/memory_candidate.rs` plus governed contract tests; `impulse-rs/src/{governed_producers.rs,state/{governed_task,memory_candidate}.rs,agent/mod.rs}` plus daemon protocol/handler tests; `impulse-rs/tests/governed_process_flow.rs`; desktop runtime/contract/SSR tests and `impulse-term` process tests | Moderate | state/contract/UI tests prove deterministic pending-candidate staging, replay/startup repair, provenance shape, and no `GENOME`/`HISTORY` mutation; the real daemon/CLI/child-process test still stops at `awaiting_supervisor`. One process must compose launched Builder and Supervisor runtimes through acceptance and candidate observation; semantic promotion/dismissal remains later |
 
 ## High-Signal Existing Test Surfaces
@@ -162,6 +165,7 @@ These gaps matter because they sit on stable or nearly stable public interfaces:
 - single-project daemon-truth GUI behavior has direct automated evidence; multi-workspace routing remains an active delivery lane
 - the governed supervisor/builder claim remains incomplete until one E2E binds roles, assignment, policy enforcement, evidence, and approval
 - generalized role contracts and runtime capability negotiation remain target-only and must not be inferred from the current supervisor-specific policy
+- the governed supervisor/builder claim remains incomplete until one E2E binds the live launch preflight to supervisor policy, evidence, verification, judgment, and approval
 - daemon-owned profiled claims, detached Rust verification, and strict API Supervisor review are live
   and directly tested; the broader supervisor/builder claim remains incomplete until one process
   composes launched runtimes through acceptance and observes exactly one staged candidate

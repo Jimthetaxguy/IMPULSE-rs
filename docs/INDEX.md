@@ -3,6 +3,8 @@ title: Documentation Index
 description: Master navigation hub for Impulse documentation
 version: '1.4'
 updated: 2026-07-12
+version: '1.5'
+updated: 2026-07-13
 version: '1.7'
 updated: 2026-09-26
 type: doc
@@ -12,6 +14,7 @@ status: active
 audience: everyone
 tags: [index, navigation, discovery]
 last_updated: 2026-07-12
+last_updated: 2026-07-13
 last_updated: 2026-09-26
 authors:
   - name: Impulse Maintainers
@@ -28,6 +31,8 @@ authors:
 >
 > **Canonical stack: Rust (impulse-rs)**
 > **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
+> **Current launch slice:** explicit product role/task preflight and typed compatibility telemetry.
+> **Next governed slice:** daemon-owned task evidence, verification results, and supervisor decisions.
 > **Roadmap contract:** Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 > **Current governed slice:** profiled Builder preflight, exact criteria, daemon-attested clean Git
 > subjects, daemon-derived claim/verification, strict API Supervisor review, operator acceptance,
@@ -71,6 +76,9 @@ authors:
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative contract for current implemented behavior |
 | [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) | Current code boundary matrix and enforcement truth |
 
+ADR-0010 accepts only the explicit role/task launch-preflight boundary. Do not split separate
+role/runtime/supervisor schema documents until the remaining hierarchy, adapter, lifecycle, and
+generalized capability-negotiation decisions listed in `VISION.md` are resolved.
 ADR-0010 accepts role/task launch preflight, ADR-0011 accepts the governed-task lifecycle,
 ADR-0012 accepts the first daemon-owned producer profile, and ADR-0013 accepts deterministic
 pending accepted-run candidates. Do not split separate
@@ -248,6 +256,8 @@ See [research/README.md](research/README.md) for reading sequences by phase.
 Older Ralph loop plans and `ROADMAP-PLAN.md` are preserved for provenance only. Use
 [`VISION.md`](../VISION.md),
 `spec/RUST-CANONICAL-CONTRACT.md`, and `decisions/0008-dioxus-desktop-host.md` for current guidance.
+`spec/RUST-CANONICAL-CONTRACT.md`, `decisions/0008-dioxus-desktop-host.md`, and
+`decisions/0010-product-role-launch-contract.md` for current guidance.
 `spec/RUST-CANONICAL-CONTRACT.md`, `decisions/0008-dioxus-desktop-host.md`,
 `decisions/0010-product-role-launch-contract.md`,
 `decisions/0011-governed-task-run-lifecycle.md`, and
@@ -279,6 +289,14 @@ Start here:
 4. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Acceptance criteria for current surfaces
 5. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Evidence map and known gaps
 
+### Next: Daemon-Owned Governed-Run Evidence/Decision Lifecycle
+
+1. [0010-product-role-launch-contract.md](decisions/0010-product-role-launch-contract.md) — Live preflight boundary and explicit next lifecycle
+2. [VISION.md](../VISION.md) — Ten-step governed workflow and unresolved lifecycle/hierarchy decisions
+3. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — Live foundations and contract boundary
+4. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Enforcement and authority boundary map
+5. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Acceptance criteria for current surfaces
+6. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Evidence map and known gaps
 ### Next: Complete Launched-Runtime Governed Workflow
 
 1. [0013-deterministic-accepted-run-memory-candidates.md](decisions/0013-deterministic-accepted-run-memory-candidates.md) — Live pending review projection and explicit no-promotion boundary

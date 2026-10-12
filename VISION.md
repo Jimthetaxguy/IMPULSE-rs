@@ -5,6 +5,12 @@
 - **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
 - **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
+- **Updated:** 2026-07-13
+- **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
+- **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
+- **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
+- **Current launch slice:** explicit product role/task preflight and typed compatibility telemetry.
+- **Next governed slice:** daemon-owned task evidence, verification results, and supervisor decisions.
 - **Updated:** 2026-09-02
 - **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
@@ -380,6 +386,10 @@ subsystem:
 8. Project verification runs and records exact evidence.
 9. The supervisor accepts, rejects, or escalates based on evidence; the user sees and controls the decision.
 10. Only verified outcomes become scoped durable memory, with an inspectable reason and source.
+
+The explicit Builder task/role preflight and compatibility telemetry now establish part of steps
+3-5. Daemon-owned task evidence, verification results, supervisor decisions, and durable-memory
+promotion remain the next governed-run slice; the complete workflow is not yet live.
 9. The supervisor recommends acceptance, requests changes, or escalates based on evidence; the
    operator explicitly approves or rejects an accept recommendation.
 10. Only accepted, verified outcomes become scoped durable memory, with an inspectable reason and source.
@@ -430,6 +440,11 @@ The following decisions must be resolved together before schema-specific documen
 7. Credential grants, revocation, audit, redaction, and cross-project prevention.
 8. Supervisor scheduling, attention summaries, context budget, and intervention priority.
 9. Verification profiles and who has final approval by impact class.
+ADR-0010 accepts only the explicit product-role/task launch-preflight contract. The following
+broader decisions remain open and must be resolved before schema-specific documents split out:
+
+1. Exact hierarchy/cardinality and durable ids for project, workspace, role, runtime, instance,
+   session, task, pane, and supervisor scope.
 ADR-0010 accepts the product-role/task launch preflight, ADR-0011 accepts the daemon-owned
 governed-task lifecycle, ADR-0012 accepts the first daemon-owned producer profile, and ADR-0013
 accepts the deterministic pending-candidate projection. The following broader decisions remain open
@@ -442,6 +457,10 @@ and must be resolved before schema-specific documents split out:
    discovery, attestation freshness, emulation, and post-launch re-evaluation.
 4. Role contract composition, override, persistence, and migration.
 5. Cross-agent message routing, direct worker communication, acknowledgement, and isolation.
+6. Memory authorship, verification, conflict resolution, correction, forgetting, and inheritance.
+7. Credential grants, revocation, audit, redaction, and cross-project prevention.
+8. Supervisor scheduling, attention summaries, context budget, and intervention priority.
+9. Verification profiles and who has final approval by impact class.
 6. Candidate promotion/dismissal authorization plus memory authorship, semantic verification,
    conflict resolution, correction, forgetting, and inheritance.
 7. Credential grants, revocation, audit, redaction, and cross-project prevention.

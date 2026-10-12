@@ -1,6 +1,7 @@
 # Control-Plane Architecture Boundaries
 
 - **Updated:** 2026-07-12
+- **Updated:** 2026-07-13
 - **Updated:** 2026-10-03
 - **Status:** Active boundary map
 - **North star:** [`../VISION.md`](../VISION.md)
@@ -48,6 +49,7 @@ workbench authority.
 | Runtime | Execution engine/integration | external harness code, desktop runtime, Ion REPL/provider loop | Not an agent instance |
 | Agent instance | One running identity and its status | `AgentRuntime`, `AgentRuntimeSnapshot`, desktop runtime record | Not a session |
 | Session | Bounded persisted work history | daemon create/end session + `.impulse/LIVE_STATE.json`/history | Not necessarily process lifetime |
+| Task | Assignment plus acceptance evidence | delegations, `current_task`, Ion harness `Task` | May span sessions |
 | Task | Assignment plus acceptance evidence | daemon-owned `GovernedTaskRun`; delegations, `current_task`, and Ion harness `Task` remain separate carriers | Governed task id is distinct from agent/session ids; current assignment is immutable and resume/reassignment is future work |
 | Pane | View/input attachment | TUI pane manager and desktop terminal ids | Not an authorization boundary |
 | Workspace target | Filesystem root assigned at launch | desktop `WorkspaceTarget`/`WorkspaceRegistry` | Not the same as global cockpit scope |
@@ -98,6 +100,16 @@ hooks/MCP, and observable outputs.
 It cannot promise control over a vendor's hidden system prompt, proprietary reasoning loop,
 internal context compression, or unsupported tool mechanics. Therefore every future runtime/role
 assignment needs an explicit enforcement-strength result rather than a boolean "supported" flag.
+The current governed desktop launch boundary requires a nonblank task of at most 8,192 UTF-8
+bytes with no NUL byte. It also requires both `workspace.root` and `cwd` to name the same absolute,
+existing canonical directory; that canonical root drives the PTY working directory, trusted
+workspace environment, runtime snapshot, and daemon telemetry. This is launch mediation, not a
+filesystem sandbox.
+
+It cannot promise control over a vendor's hidden system prompt, proprietary reasoning loop,
+internal context compression, or unsupported tool mechanics. The live static preflight therefore
+uses explicit enforcement strengths rather than a boolean "supported" flag; future generalized
+runtime adapters must preserve that honesty while adding discovery and lifecycle semantics.
 
 ## Direction that is not implemented yet
 
@@ -108,6 +120,8 @@ The next architecture ADR must settle these together:
 2. The minimum runtime-adapter operations, optional operations, and emulation rules.
 3. A capability-negotiation result that distinguishes structural, mediated, advisory, and
    unsupported enforcement.
+3. Generalized and dynamic capability negotiation beyond the static desktop preflight, including
+   discovery, attestation freshness, emulation, and post-launch re-evaluation.
 4. Typed message routing and cross-project isolation.
 5. Role-specific credential, context, tool, and verification grants.
 

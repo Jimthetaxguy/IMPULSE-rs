@@ -404,6 +404,7 @@ process, and host-fixture isolation fixes landed.
 - **Managed-agent lifecycle follow-up (2026-07-11):** Replaced daemon `checkout_agent`/`checkin_agent` ownership transfer with one in-place Tokio mutex guard for each bounded logical turn. Concurrent turns now fail fast through protocol-v3 typed Busy, removing double initialization, ghost queued turns, last-writer-wins loss of conversation/recommendation/pane-summary state, and cache loss when a handler future is cancelled. A shared RAII process-group guard also kills harness and `bash_exec` grandchildren on timeout or arbitrary task abort, and every fallback HTTP request carries a local 120-second bound. Eleven focused tests (ten net over the replaced lock-release test) cover Busy wire/client semantics, ordered retry history, abort recovery, provider bounds, process cleanup, and unrelated daemon responsiveness. Full canonical expectation is now 1,889.
 - `cargo clippy`: 0 warnings
 - `cargo fmt --check`: no output (clean)
+**Current canonical projection (2026-07-12):** 1,950 passed, 9 ignored, 0 failed. The verified isolated aggregate worktree reports 1,949 passed with the canonical-checkout-only archive proof explicitly filtered. Package totals are impulse-rs 1,576 (root library target 1,542), ops 44, term 114, desktop 193, and Ion 23.
 **Final-gate evidence:** Do not rely on a checked-in aggregate test count. Run the complete gate on
 the current checkout and record package-level passed, ignored, and failed totals in the commit/PR
 evidence. Default tests must use tracked source/fixtures and remain portable across fresh clones,
@@ -412,6 +413,8 @@ linked worktrees, and CI.
 **Current verification boundaries:** the canonical Rust gate does not by itself prove a real
 provider-backed Ion round trip, cross-platform Linux/Windows behavior, or generalized runtime-role
 enforcement that has not been implemented. The feature-gated Dioxus binary also retains its
+separate host-readiness smoke check. Re-run the full gate on the current checkout before citing the
+aggregate above.
 separate host-readiness smoke check. Re-run the full gate on the current checkout before citing any
 aggregate.
 
@@ -450,6 +453,7 @@ To verify test counts match expectations:
 cd impulse-rs && cargo test --workspace 2>&1 | grep "test result:" | awk '{sum += $4} END {print "Total: " sum " passed"}'
 ```
 Expected canonical checkout projection: 1,948 passed across the 5 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop, impulse-ion), with 9 ignored and 0 failed. The verified isolated worktree without the gitignored reconciliation archive reports 1,947 passed when that one proof is explicitly filtered. Re-run the full gate before treating changed counts as verified; if they change, update both this section and the Architecture section.
+Expected canonical checkout projection: 1,950 passed across the 5 crates (impulse-rs, impulse-ops, impulse-term, impulse-desktop, impulse-ion), with 9 ignored and 0 failed. The verified isolated worktree without the gitignored reconciliation archive reports 1,949 passed when that one proof is explicitly filtered. Re-run the full gate before treating changed counts as verified; if they change, update both this section and the Architecture section.
 Treat the command output as the authoritative count for that checkout. Preserve the complete output
 in final-gate evidence instead of copying a moving aggregate into this guide.
 
@@ -457,6 +461,7 @@ in final-gate evidence instead of copying a moving aggregate into this guide.
 
 1. `cargo build --workspace` — zero warnings
 2. `cargo test --workspace` — all tests pass (1,948 canonical workspace projection expected, 9 ignored; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
+2. `cargo test --workspace` — all tests pass (1,950 canonical workspace projection expected, 9 ignored; verify with `cargo test --workspace 2>&1 | grep "test result:"`)
    - **If count changes**: update this line and the Architecture section above
 2. `cargo test --workspace` — all tests pass; capture the current passed/ignored/failed totals from the command output
 3. `cargo clippy --workspace --all-targets -- -D warnings` — zero warnings

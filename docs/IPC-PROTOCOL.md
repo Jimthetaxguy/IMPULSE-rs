@@ -495,6 +495,7 @@ Returns `AgentAssistResult` with sessions organized by agent role.
 
 ### Search & Retrieval
 
+Protocol v3 does not define daemon request variants for retrieval. `search-history`,
 Protocol v6 does not define daemon request variants for retrieval. `search-history`,
 `search-genome`, `index-memory`, and `retrieval-status` are direct-mode CLI operations; the
 `--daemon` dispatcher tells callers to retry without the flag.

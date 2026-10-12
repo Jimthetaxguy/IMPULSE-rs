@@ -3,6 +3,8 @@ title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
 version: 2.4
 updated: 2026-07-12
+version: 2.6
+updated: 2026-07-13
 version: 2.8
 updated: 2026-09-26
 schema_version: '1.0'
@@ -168,6 +170,9 @@ Historical Ralph loop plans now live under `archive/ralph-plans/` and are proven
 | Total Documents | 134 |
 | Categories | 8 |
 | Decisions (ADRs) | 9 |
+| Total Documents | 136 |
+| Categories | 9 |
+| Decisions (ADRs) | 10 |
 | Total Documents | 141 |
 | Categories | 9 |
 | Decisions (ADRs) | 13 |

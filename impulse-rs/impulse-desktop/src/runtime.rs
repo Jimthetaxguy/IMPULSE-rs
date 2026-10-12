@@ -35,6 +35,7 @@ use crate::bridge::{
 
 /// Tasks are copied into `IMPULSE_TASK`; keep that environment value bounded
 /// and measure the wire-compatible UTF-8 representation rather than chars.
+const MAX_GOVERNED_TASK_BYTES: usize = 8 * 1024;
 const MAX_GOVERNED_TASK_BYTES: usize = impulse_ops::governed_task::MAX_GOVERNED_TASK_BYTES;
 const GOVERNED_GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const GOVERNED_GIT_OUTPUT_LIMIT: usize = 64 * 1024;
@@ -4098,6 +4099,8 @@ mod tests {
     }
 
     #[test]
+    fn test_compatible_assignment_and_task_survive_canonicalized_spawn_snapshot() {
+        let runtime = DesktopRuntime::default();
     fn test_governed_registration_failure_creates_no_pty_and_reserves_no_agent_id() {
         let gateway = Arc::new(TestGovernedTaskGateway::rejecting());
         let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway;
@@ -4376,6 +4379,7 @@ mod tests {
 
     #[test]
     fn test_optional_gap_allows_spawn_and_preserves_degraded_snapshot() {
+        let runtime = DesktopRuntime::default();
         let (runtime, _) = runtime_with_task_gateway();
         let mut request = spawn_request(24, 80, Some("sh"));
         let _workspace = bind_to_temporary_workspace(&mut request);
@@ -4665,6 +4669,7 @@ mod tests {
             true,
         ));
 
+        let env = runtime_env("agent-1", &request, "sh", None);
         let env = runtime_env("agent-1", &request, "sh", None, None, None);
         assert!(env
             .iter()

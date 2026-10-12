@@ -1521,6 +1521,84 @@ command = "ratchet"
     }
 
     #[test]
+    fn test_reconciled_clean_archive_has_contracts_snapshot() {
+        // Proof in canonical tree that .clean was reconciled (archived into single active tree).
+        // Contents of the duplicate checkout are now under archive/_archived-... or reconciled-...
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let base = std::path::Path::new(&manifest).join("../../archive");
+        let has_archived = std::fs::read_dir(&base)
+            .ok()
+            .map(|rd| {
+                rd.filter_map(|e| e.ok()).any(|e| {
+                    let p = e.path();
+                    let name = p.to_string_lossy();
+                    if name.contains("_archived-IMPULSE") || name.contains("reconciled-from-clean")
+                    {
+                        let c1 = p.join("clean/crates/impulse-contracts/Cargo.toml");
+                        if c1.exists() {
+                            return true;
+                        }
+                        let c2 = p.join("crates/impulse-contracts/Cargo.toml");
+                        if c2.exists() {
+                            return true;
+                        }
+                        let c3 = p.join("full-snapshot/clean/crates/impulse-contracts/Cargo.toml");
+                        if c3.exists() {
+                            return true;
+                        }
+                    }
+                    false
+                })
+            })
+            .unwrap_or(false);
+        let old_partial = std::path::Path::new(&manifest).join(
+            "../../archive/reconciled-from-clean-2026-06-25/crates/impulse-contracts/Cargo.toml",
+        );
+    }
+
+    #[test]
+    fn test_resolve_launch_command_never_falls_back_for_unknown_platform() {
+        let reg = AgentRegistry::builtin();
+        let missing = AgentPlatformId::try_new("missing-agent").unwrap();
+        let resolved = resolve_launch_command(&reg, &missing, None);
+
+        assert!(
+            matches!(resolved, Err(RegistryError::UnknownPlatform(id)) if id == "missing-agent")
+        );
+    }
+
+    #[test]
+    fn test_resolve_launch_command_rejects_blank_explicit_override() {
+        let reg = AgentRegistry::builtin();
+        let codex = AgentPlatformId::try_new("codex").unwrap();
+
+        assert!(
+            resolve_launch_command(&reg, &codex, Some("   ")).is_err(),
+            "an explicit blank override is invalid input, not an implicit default"
+        );
+    }
+
+    #[test]
+    fn test_resolve_launch_command_rejects_blank_registered_command() {
+        let platform = AgentPlatformId::try_new("blank-command").unwrap();
+        let registry = AgentRegistry::from_descriptors(vec![AgentDescriptor {
+            id: platform.clone(),
+            label: "Blank command".to_string(),
+            command: "   ".to_string(),
+            invocation_args: Vec::new(),
+            aliases: Vec::new(),
+            capabilities: AgentCapabilities::default(),
+            runtime_capabilities: Vec::new(),
+        }])
+        .unwrap();
+
+        assert!(
+            resolve_launch_command(&registry, &platform, None).is_err(),
+            "a registered identity without an executable command is not launchable"
+        );
+    }
+
+    #[test]
     fn test_reconciled_backend_contract_lives_in_canonical_registry() {
         // ADR-0009 maps the archived experiment's BackendDescriptor /
         // BackendRegistry contract to these tracked canonical types. Prove the

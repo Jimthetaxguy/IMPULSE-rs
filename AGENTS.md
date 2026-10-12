@@ -170,6 +170,7 @@ cargo fmt --all -- --check
 ```
 
 **Expected canonical checkout (2026-07-12 projection):** 1,948 tests passed, 0 failed, 9 ignored. The verified isolated aggregate worktree reports 1,947 passed with `test_reconciled_clean_archive_has_contracts_snapshot` explicitly filtered; the canonical count restores that one checkout-relative proof. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
+**Expected canonical checkout (2026-07-12 projection):** 1,950 tests passed, 0 failed, 9 ignored. The verified isolated aggregate worktree reports 1,949 passed with `test_reconciled_clean_archive_has_contracts_snapshot` explicitly filtered; the canonical count restores that one checkout-relative proof. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
 **Final-gate evidence:** Do not rely on a checked-in aggregate test count. Run the complete gate on
 the current checkout and record passed, ignored, and failed totals in the commit/PR evidence.
 Default tests must use tracked source/fixtures and remain portable across fresh clones, linked
@@ -233,6 +234,7 @@ it before presenting it as current. `docs/spec/TEST-TRACEABILITY.md` owns the cu
 gap assessment.
 
 **Workspace totals (2026-07-12 canonical projection):** 1,948 tests across the 5 workspace crates/packages (impulse-rs: 1,574, ops: 44 including the canonical-checkout archive proof, term: 114, desktop: 193, ion: 23), with 9 ignored and 0 failed. The verified isolated worktree reports 1,947 passed because that one archive proof is filtered. The legacy impulse-gui crate is frozen/excluded from the workspace and its 252 passing tests are not counted.
+**Workspace totals (2026-07-12 canonical projection):** 1,950 tests across the 5 workspace crates/packages (impulse-rs: 1,576, ops: 44 including the canonical-checkout archive proof, term: 114, desktop: 193, ion: 23), with 9 ignored and 0 failed. The verified isolated worktree reports 1,949 passed because that one archive proof is filtered. The legacy impulse-gui crate is frozen/excluded from the workspace and its 252 passing tests are not counted.
 **Workspace totals:** Derive totals from the final `cargo test --workspace` run rather than a static
 projection. The legacy `impulse-gui` crate is frozen and excluded from the canonical workspace gate;
 verify it separately only when legacy compile-maintenance changes require it.

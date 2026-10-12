@@ -53,6 +53,10 @@ session, and pane.
 - **Closest in code:** narrow `AgentRole::{Coordinator, Worker}` plus the concrete
   `SupervisorPermissionPolicy` in `impulse-ops/src/lib.rs`.
 - **Boundary:** a generalized typed role contract is direction for a later ADR, not live today.
+- **Closest in code:** the narrow launch-time `AgentRoleId`/`AgentRoleAssignment` contract plus the
+  concrete `SupervisorPermissionPolicy`. `AgentRole::{Coordinator, Worker}` remains legacy pane and
+  delegation topology, not product-role identity.
+- **Boundary:** generalized role composition and a durable governed-run lifecycle are not live.
 communication, and evidence; independent of model, runtime, process, session, and pane.
 - **Closest in code:** the narrow launch-time `AgentRoleId`/`AgentRoleAssignment` contract plus the
   concrete `SupervisorPermissionPolicy`. `AgentRole::{Coordinator, Worker}` remains legacy pane and
@@ -633,6 +637,7 @@ artifact review, and explicit approval where policy requires it.
 ---
 
 ## Live-versus-direction boundary (2026-07-12)
+## Live-versus-direction boundary (2026-07-13)
 
 - **Live foundation:** PTY lifecycle, daemon workbench truth, managed agent turns, open
   registry-backed desktop platform identity, real Ion desktop launch, daemon-truth terminal
@@ -641,6 +646,11 @@ artifact review, and explicit approval where policy requires it.
 - **Direction:** generalized role contracts, one runtime-adapter interface, explicit capability
   negotiation/enforcement strength, and typed cross-agent messaging. These require an ADR and
   vertical slice; names and schemas are intentionally not frozen here.
+  artifacts, credentials, Ion's native coding REPL/tool loop, and explicit role/task launch
+  preflight with typed compatibility telemetry.
+- **Direction:** daemon-owned task evidence, verification and supervisor decisions; generalized
+  role composition; one runtime-adapter interface; negotiated runtime capabilities; and typed
+  cross-agent messaging.
 Evidence that claimed work holds before a session/task is accepted. Governed profiled verification
 is daemon-observed against the claimed commit in a symlink-free detached source tree with a
 committed regular root `Cargo.lock`. It persists fixed argv plus digests, never raw output;
