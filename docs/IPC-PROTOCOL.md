@@ -1,6 +1,7 @@
 # Impulse IPC Protocol
 
 > Unix domain socket protocol between Impulse daemon and clients (GUI, CLI `--daemon` mode).
+> **Protocol version: 3** — see [Version section](#protocol-version) for upgrade notes.
 > **Protocol version: 9** — see [Version section](#protocol-version) for upgrade notes.
 
 ---
@@ -52,6 +53,8 @@ The daemon reports `protocol_version` in `Ping`/`Status` results.
 
 | Constant | Value | Location |
 |----------|-------|----------|
+| `EXPECTED_PROTOCOL_VERSION` | **3** | GUI client |
+| `PROTOCOL_VERSION` | **3** | Daemon (`src/daemon/protocol.rs`) |
 | `DAEMON_PROTOCOL_VERSION` / `PROTOCOL_VERSION` | **9** | Shared ops contract / daemon protocol |
 
 Current clients do **not** perform a version handshake or preflight-reject a mismatched daemon, and
@@ -492,6 +495,7 @@ Returns `AgentAssistResult` with sessions organized by agent role.
 
 ### Search & Retrieval
 
+Protocol v3 does not define daemon request variants for retrieval. `search-history`,
 Protocol v6 does not define daemon request variants for retrieval. `search-history`,
 `search-genome`, `index-memory`, and `retrieval-status` are direct-mode CLI operations; the
 `--daemon` dispatcher tells callers to retry without the flag.
@@ -513,6 +517,7 @@ All responses use the `DaemonResponse` enum.
 Contains the result as a JSON value. The structure depends on the request.
 
 ```json
+{"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 3}}}
 {"type": "Ok", "data": {"result": {"sessions": 3, "active": 1, "protocol_version": 9}}}
 ```
 

@@ -15,6 +15,7 @@ authors:
 > Contract: [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
+> Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
 > Roadmap contract: Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 
 ---
@@ -43,10 +44,12 @@ Memory is one first-class service, not the whole product. Impulse also owns proc
 ## Desktop Shell Status (as of 2026-07-19)
 
 > **egui / impulse-gui is LEGACY.** It is frozen — no new features. The active retirement plan removes it as dead product code after release automation is made truthful; it is not a functional fallback.
+## Desktop Shell Status (as of 2026-07-12)
 ## Desktop Shell Status (as of 2026-08-17)
 
 > **egui / impulse-gui is LEGACY.** It is frozen — no new features. The active retirement plan removes it as dead product code after release automation is made truthful; it is not treated as a functional fallback.
 
+The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. It is the cockpit, not the source of operational truth: authoritative workbench state and policy live in Rust daemon/control-plane contracts. Tauri-shaped code is retained only as a temporary compatibility adapter.
 The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. It is the cockpit, not the source of operational truth: authoritative workbench state and policy live in Rust daemon/control-plane contracts. Tauri-shaped code is a separate temporary compatibility adapter and remains until a packaged Dioxus app proves the real host bridge and required operator workflows end to end.
 
 - See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for canonical layer boundaries
@@ -108,6 +111,7 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 - **egui workbench** — LEGACY. Frozen. Compile-maintenance only.
 
 **Live versus direction:**
+- Live foundations include PTY lifecycle, daemon-owned workbench truth and telemetry, registry-driven desktop platform identity, Ion as a launchable platform, capability-checked tool registries, supervisor-specific permission policy, and reviewable artifacts.
 - Live foundations include PTY lifecycle, daemon-owned workbench truth and telemetry, registry-driven desktop platform identity, Ion as a launchable platform, capability-checked tool registries, supervisor-specific permission policy, reviewable artifacts, and the profiled governed-task producer lifecycle. A profiled Builder launch records exact acceptance criteria and a daemon-attested clean Git `HEAD`; the daemon derives claims, runs fixed detached Rust verification, and requests strict API-only Supervisor review. Only an operator decision can accept a governed task; process exit and model recommendation never do.
 - `rust_workspace_v1` runs host-trusted Rust code in a detached Git worktree with scrubbed environment, timeouts, output digests, and process-group cleanup. It is not an OS sandbox. Dioxus exposes operator-only Promote and Discard controls (ADR-0019) and still renders evidence plus terminal command guidance for claim, verify, and review — `"$IMPULSE_CONTROL_CLI" --daemon governed-claim` / `governed-verify` / `governed-review` — which remain CLI-driven. The packaged executable is `impulse-rs`; `--daemon` is a required global flag before every governed producer subcommand.
 - Persisted receipts and the per-task lock cover replay/concurrency. Durable `PRODUCER_RESERVATIONS.json` entries now wrap verification, Supervisor review, and ADR-0019 staged-worktree promotion: the side effect and its governed-task receipt are both inside `with_reservation`. Interrupted attempts are reconciled to `NeedsRerun`; the journal does not provide arbitrary side-effect rollback or exactly-once execution, and a panic leaves the reservation open until reconciliation. See `impulse-rs/src/daemon/governed_wiring.rs` and `impulse-rs/src/state/producer_reservation.rs`.
@@ -168,6 +172,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+**Expected canonical checkout (2026-07-12 projection):** 1,950 tests passed, 0 failed, 9 ignored. The verified isolated aggregate worktree reports 1,949 passed with `test_reconciled_clean_archive_has_contracts_snapshot` explicitly filtered; the canonical count restores that one checkout-relative proof. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
 **Final-gate evidence:** Do not rely on a checked-in aggregate test count. Run the complete gate on
 the current checkout and record passed, ignored, and failed totals in the commit/PR evidence.
 Default tests must use tracked source/fixtures and remain portable across fresh clones, linked
@@ -230,6 +235,7 @@ baseline above predates substantial handler and control-plane coverage added sin
 it before presenting it as current. `docs/spec/TEST-TRACEABILITY.md` owns the current qualitative
 gap assessment.
 
+**Workspace totals (2026-07-12 canonical projection):** 1,950 tests across the 5 workspace crates/packages (impulse-rs: 1,576, ops: 44 including the canonical-checkout archive proof, term: 114, desktop: 193, ion: 23), with 9 ignored and 0 failed. The verified isolated worktree reports 1,949 passed because that one archive proof is filtered. The legacy impulse-gui crate is frozen/excluded from the workspace and its 252 passing tests are not counted.
 **Workspace totals:** Derive totals from the final `cargo test --workspace` run rather than a static
 projection. The legacy `impulse-gui` crate is frozen and excluded from the canonical workspace gate;
 verify it separately only when legacy compile-maintenance changes require it.

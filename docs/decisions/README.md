@@ -1,6 +1,7 @@
 ---
 title: Architecture Decision Records
 description: Decision index separating current control-plane authority from accepted historical phase-era scope
+version: '1.1'
 version: '1.5'
 status: active
 phase: all
@@ -8,6 +9,8 @@ type: reference
 category: architecture
 audience: builder
 tags: [decisions, adr, architecture]
+updated: 2026-07-13
+last_updated: 2026-07-13
 updated: 2026-09-26
 last_updated: 2026-09-26
 ---

@@ -58,6 +58,16 @@ impl Drop for ProcessGroupGuard {
             return;
         }
 
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            // SAFETY: `pgid` came from the child created with
+            // `process_group(0)`, so `-pgid` targets that isolated process
+            // group. SIGKILL is best-effort; ESRCH simply means it already
+            // exited. No Rust memory is shared with the signal operation.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
         self.kill_group();
     }
 }

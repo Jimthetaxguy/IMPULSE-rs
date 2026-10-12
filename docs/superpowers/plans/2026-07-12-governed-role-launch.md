@@ -145,4 +145,5 @@ canonical suite passed 1,996 tests with 9 ignored and 0 filtered; documentation 
 - [x] Obtain a fresh task-spec review; fix every accepted finding and re-review.
 - [x] Obtain a fresh broad maintainability/security review; fix every accepted finding and re-review.
 - [x] Re-run the full verification gate after the final review fix.
+- [ ] Fast-forward the reviewed linear commit stack onto `agent/control-plane-vision-integration`, push that PR branch, and verify PR #13 remains mergeable and green.
 - [x] Preserve the original feature branch, transplant the reviewed linear stack onto current `origin/main` as `agent/governed-role-launch-pr`, push it, and open follow-up PR #14.
