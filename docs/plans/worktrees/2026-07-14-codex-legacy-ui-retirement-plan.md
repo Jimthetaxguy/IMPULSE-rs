@@ -1,11 +1,11 @@
 ---
 title: Legacy UI retirement planning lane
 description: Replace the stale EGUI decommission plan with a current, evidence-backed three-track retirement contract
-updated: 2026-07-14
+updated: 2026-07-19
 type: doc
 category: planning
 phase: all
-status: complete
+status: active
 audience: builders
 tags: [worktree, cleanup, egui, dioxus, tauri, release]
 ---
@@ -15,17 +15,18 @@ tags: [worktree, cleanup, egui, dioxus, tauri, release]
 ## Lane Facts
 
 - Owner: Codex (`codex/legacy-ui-retirement-plan`).
-- Base: `agent/governed-runtime-producers` at `52bb410`.
-- Scope: documentation and read-only inventory only.
+- Base: `origin/main` at `2504557`.
+- Scope: documentation and read-only inventory only. Owned paths are `AGENTS.md`,
+  `docs/LONG-RANGE-ENHANCEMENTS.md`, this work card, and `docs/plans/EGUI-DECOMMISSION.md`.
 - Canonical output: [`../EGUI-DECOMMISSION.md`](../EGUI-DECOMMISSION.md).
-- No UI source, Cargo dependency, release job, compatibility adapter, branch history, or local
-  generated artifact was removed or rewritten in this lane.
+- No UI source, Cargo dependency, release job, compatibility adapter, or generated local artifact
+  was removed in this lane. The stale stacked PR history was rebuilt from current `main`; its exact
+  previous head is preserved at `backup/pr17-legacy-ui-retirement-plan-2026-07-19`.
 
 ## Goal
 
 Turn the old EGUI-only plan into an executable retirement contract for every nonfunctional UI path
-without weakening the active Dioxus cockpit, ratatui surface, CLI, PTY backend, daemon authority, or
-stacked governed-runtime work.
+without weakening the active Dioxus cockpit, ratatui surface, CLI, PTY backend, or daemon authority.
 
 ## Acceptance Criteria
 
@@ -39,6 +40,8 @@ stacked governed-runtime work.
 - Historical documents remain provenance rather than being rewritten to force a literal zero-hit
   repository scan.
 - Existing roadmap markers continue to describe current code until physical removal lands.
+- The PR contains only the retirement-plan delta, not prerequisite implementation already merged
+  through PRs #14, #18, and #19.
 
 ## Audit Decisions
 
@@ -53,6 +56,10 @@ stacked governed-runtime work.
 - Disabled “coming soon” controls and artifact actions that only record local intent are not
   functional UI; the plan applies a wire-it-or-remove-it contract to retained shells.
 - Static aggregate test counts are not acceptance criteria; live verification output is.
+- The unmerged `codex/dioxus-egui-retirement` branch is successor implementation evidence, not
+  current `main` truth; it must be forward-ported after PRs #21/#22 before reuse.
+- The docs gate exposed `LONG-RANGE-ENHANCEMENTS.md` as both date-stale and authority-stale. It is
+  retained as historical provenance rather than date-bumped as an active roadmap.
 
 ## Verification
 

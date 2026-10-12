@@ -1,12 +1,12 @@
 ---
 title: Legacy UI Retirement Plan
 description: Gated retirement of the nonfunctional egui surface, unwired affordances, and temporary Tauri compatibility adapter while preserving Dioxus, ratatui, CLI, PTY, and daemon authority
-version: '2.0'
+version: '2.1'
 type: doc
 category: roadmap
 phase: all
 status: active
-updated: 2026-07-14
+updated: 2026-07-19
 audience: builders
 tags: [roadmap, decommission, egui, eframe, dioxus, tauri, desktop, cleanup]
 authors:
@@ -40,19 +40,34 @@ invokes those contracts; it never becomes a second control plane.
 
 ## Verified Baseline
 
-Verified on `agent/governed-runtime-producers` at `52bb410` on 2026-07-14.
+Verified on `origin/main` at `2504557` on 2026-07-19, after PR #21's desktop startup/folder-picker
+fixes and PR #22's voice-engine integration. This plan describes merged repository truth only.
+The unmerged `codex/dioxus-egui-retirement` branch contains later packaging, cockpit, and
+dead-affordance work, but none of that work is counted as shipped here.
 
 | Surface | Live fact | Retirement consequence |
 |---|---|---|
 | `impulse-gui` | Excluded leaf crate; 43 files and 14,998 Rust lines | Remove the entire crate after recovery proof; do not port it feature-for-feature |
 | `impulse-term` egui layer | `default = ["egui"]` still activates `eframe` in normal workspace resolution | Removing it materially reduces the active dependency graph |
 | Framework-neutral terminal core | `backend.rs`, `context.rs`, and `paste.rs`; Dioxus already uses `default-features = false` | Preserve and strengthen this boundary |
-| Dioxus host | `LiveDesktopApp` and the Rust eval bridge are implemented and wired | Keep as the graphical product surface |
+| Dioxus host | `LiveDesktopApp` and the Rust eval bridge are implemented; PR #21 added bounded host-adapter resolution and the native folder-picker path | Keep as the graphical product surface; those fixes do not by themselves prove packaged lifecycle parity |
 | Dioxus host smoke | Browser smoke replaces the pending bootstrap with a test host API | Useful contract proof, but not packaged real-bridge acceptance |
 | Dioxus dead affordances | Disabled `Cmd-K` and `Settings` buttons say “coming soon”; artifact action buttons only record a local status string | Hide/remove until backed by a real typed operation, or wire and prove them |
 | macOS release | Release workflow calls a script that expects excluded `impulse-gui` output | Broken/stale release claim must be repaired or removed before EGUI deletion |
 | Tauri adapter | Optional Cargo feature, event sink, cfg wrappers, JS fallback, and legacy smoke remain | Retire in a distinct tranche after Dioxus acceptance |
 | Agent automation | Project skill and Ralph state still route future work toward EGUI | Neutralize before deleting code to prevent resurrection |
+
+## Relevance After Current-Main Reconciliation
+
+| Original PR concern | 2026-07-19 verdict | Consequence |
+|---|---|---|
+| Remove frozen `impulse-gui` and the `impulse-term` EGUI layer | **Still relevant** | Both remain in source; `impulse-term` still enables `egui` by default on `main` |
+| Repair the macOS release path before legacy deletion | **Still relevant** | The release job still invokes a bundler that expects the excluded `impulse-gui` binary |
+| Remove or wire dead Dioxus affordances | **Still relevant** | `Cmd-K`, `Settings`, and local-only artifact intents remain on `main` |
+| Retire Tauri together with EGUI | **Rejected coupling** | Tauri stays a separate later tranche with its own packaged-host acceptance gate |
+| Replay the governed-role/task/producer stack carried by the old PR branch | **Superseded** | PRs #14, #18, and #19 already integrated those capabilities into `main` |
+| Update `docs/ROADMAP-PLAN.md` as an active roadmap | **Superseded** | That document is explicitly historical; this active plan and the canonical contract own current truth |
+| Treat `codex/dioxus-egui-retirement` as completed work | **Not current truth** | The branch is unmerged and behind current `main`; it must be forward-ported and reverified before its results can satisfy any checkbox below |
 
 ## Removal Policy
 
@@ -225,7 +240,7 @@ all still compile and pass.
 
 ### R5 — Make the canonical contract describe removal
 
-- [ ] Add the next ADR (`0013`) recording EGUI removal, the chosen release path, preserved surfaces,
+- [ ] Add ADR `0014` recording EGUI removal, the chosen release path, preserved surfaces,
   recovery reference, and the fact that Tauri compatibility remains separate.
 - [ ] In the same implementation PR that physically removes EGUI, flip the exact roadmap marker
   from `Legacy=egui compile-maintenance only` to `Legacy=egui removed` everywhere enforced by the
