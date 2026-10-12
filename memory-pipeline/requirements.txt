@@ -1,5 +1,10 @@
 # Memory Pipeline Dependencies (Phase 2)
-# For cross-session persistence and semantic retrieval
+# For cross-session persistence and semantic retrieval.
+#
+# Production semantic search requires sentence-transformers (and torch). Without
+# them, retrieval_embed.py exits with an error unless IMPULSE_EMBED_ALLOW_FAKE=1
+# is set — that path emits deterministic SHA-256 vectors and must never be used
+# for real semantic quality without an explicit operator opt-in.
 
 sentence-transformers==2.2.2
 torch==2.1.0

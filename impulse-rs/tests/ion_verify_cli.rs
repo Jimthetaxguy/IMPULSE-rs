@@ -27,21 +27,7 @@ fn impulse_rs_dir() -> PathBuf {
 /// Creates a throwaway git repo with one empty commit, so `--diff-ref HEAD`
 /// resolves via `git rev-parse` inside `run_ion_verify`.
 fn init_git_repo() -> tempfile::TempDir {
-    let dir = tempfile::TempDir::new().expect("failed to create tempdir");
-    let run = |args: &[&str]| {
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(dir.path())
-            .args(args)
-            .status()
-            .expect("failed to run git");
-        assert!(status.success(), "git {args:?} failed");
-    };
-    run(&["init", "--quiet"]);
-    run(&["config", "user.email", "test@example.com"]);
-    run(&["config", "user.name", "Test"]);
-    run(&["commit", "--allow-empty", "--quiet", "-m", "init"]);
-    dir
+    impulse_rs::test_git_repo::init_git_repo_with_empty_commit()
 }
 
 fn run_ion_verify_cli(repo: &Path, gate_script: &Path, extra_args: &[&str]) -> Output {

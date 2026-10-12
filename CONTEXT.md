@@ -15,10 +15,12 @@
 ## What Impulse is
 
 Impulse is a **terminal-native local control plane and harness manager for AI software-engineering
-agents**. It manages heterogeneous runtimes and supplies memory, tools, telemetry, handoffs,
-policy, credentials, artifacts, and verification. Claude Code, Codex, and similar CLIs retain their
-internal loops; Ion is the native runtime. Dioxus is the cockpit, while daemon/runtime contracts
-remain authoritative. Memory is one platform service, not the whole product.
+agents**. It launches and scopes heterogeneous runtimes, supervises their work, and holds completion
+to observed evidence and human approval. Shared services include tools, telemetry, handoffs,
+policy, credentials, artifacts, verification, and memory. Claude Code, Codex, and similar CLIs
+retain their internal loops; Ion is the native runtime. Dioxus, ratatui, and the CLI are operator
+surfaces; daemon/runtime contracts remain authoritative. Memory is one platform service, not the
+whole product.
 
 Workspace: `impulse-rs/` (Cargo workspace). Main crates: `impulse-rs`, `impulse-ops`,
 `impulse-term`, `impulse-desktop`, and `impulse-ion`; `impulse-gui` is legacy/frozen.

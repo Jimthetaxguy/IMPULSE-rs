@@ -297,6 +297,7 @@ mod tests {
     /// `crate::test_support` (see that module's doc comment for why a
     /// per-file lock is insufficient).
     use crate::test_support::ion_gate_launcher_env_lock as env_lock;
+    use crate::test_git_repo::init_git_repo_with_empty_commit;
     use chat::test_support::{EchoProvider, MissingKeyProvider};
 
     /// A `ChatState` that always fails with `AgentError::MissingApiKey`,
@@ -311,21 +312,7 @@ mod tests {
     }
 
     fn init_git_repo() -> tempfile::TempDir {
-        let dir = tempfile::TempDir::new().expect("failed to create tempdir");
-        let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
-                .args(args)
-                .status()
-                .expect("failed to run git");
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run(&["init", "--quiet"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test"]);
-        run(&["commit", "--allow-empty", "--quiet", "-m", "init"]);
-        dir
+        init_git_repo_with_empty_commit()
     }
 
     #[tokio::test]
