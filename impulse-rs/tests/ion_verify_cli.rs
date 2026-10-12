@@ -35,6 +35,7 @@ fn impulse_rs_dir() -> PathBuf {
 /// `#[cfg(test)]`-gated module regardless of visibility -- this is a
 /// deliberate, minimal, kept-in-sync copy, not a missed consolidation.
 fn init_git_repo() -> tempfile::TempDir {
+    impulse_rs::test_git_repo::init_git_repo_with_empty_commit()
     let dir = tempfile::TempDir::new().expect("failed to create tempdir");
     let run = |args: &[&str]| {
         let output = Command::new("git")

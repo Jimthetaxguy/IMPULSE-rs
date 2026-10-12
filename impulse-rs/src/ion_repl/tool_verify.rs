@@ -159,6 +159,11 @@ mod tests {
     /// per-file lock is insufficient).
     use crate::test_support::init_git_repo;
     use crate::test_support::ion_gate_launcher_env_lock as env_lock;
+    use crate::test_git_repo::init_git_repo_with_empty_commit;
+
+    fn init_git_repo() -> tempfile::TempDir {
+        init_git_repo_with_empty_commit()
+    }
 
     #[test]
     fn test_name_and_usage() {

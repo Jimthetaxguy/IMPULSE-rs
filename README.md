@@ -49,6 +49,8 @@ proprietary runtime internals. Memory is a governed platform service, not the wh
 >
 > **Live today:** PTY lifecycle, daemon workbench truth, registry-backed platform identity,
 > capability-checked tools, governed-task producers (`rust_workspace_v1`), accepted-run memory
+> candidates (review queue — not auto-written to `GENOME.md`), and Ion's native REPL/tool loop.
+> Worker claim, verifier evidence, supervisor judgment, and operator approval stay separate.
 > candidates (review queue — not auto-written to `GENOME.md`), Ion's native REPL/tool loop under
 > the ADR-0017 loop contract, and Ion's read-only `document_read` tool for spreadsheets and Word
 > files. Worker claim, verifier evidence, supervisor judgment, and operator approval stay separate.

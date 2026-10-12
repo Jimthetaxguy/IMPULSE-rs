@@ -93,6 +93,10 @@
 //! call site, not a queued/async dispatch system, so the TOCTOU concern
 //! `ensure_grant_covers` defends against in ROSA doesn't apply here) and it
 //! carries no `RiskClass` taxonomy, only the matched `GuardAction` if any.
+//! **Tool-result channel:** bounded tool output returned to the model is scanned
+//! with [`GuardTarget::ToolCall`] after execution (see [`sanitize_tool_result_for_model`]).
+//! **Still out of scope:** scanning the system prompt or other injected context
+//! before the model decides to request a tool call.
 //! **Deliberately out of scope (unchanged from the original deferred
 //! note):** this only scans the tool call's own arguments at confirmation
 //! time -- it does NOT scan the system prompt or injected context (e.g. text
@@ -857,6 +861,14 @@ impl ToolExecutor for ReplToolExecutor<'_> {
             // gated tool -- structurally documenting that `run()` only
             // executes downstream of a minted approval.
             Some(tool) => match tool.run(input, self.ctx).await {
+                Ok(outcome) => ToolExecutionResult {
+                    content: sanitize_tool_result_for_model(&outcome, &GuardConfig::default()),
+                    is_error: !outcome.ok,
+                },
+                Err(err) => ToolExecutionResult {
+                    content: format!("{err:#}"),
+                    is_error: true,
+                },
                 Ok(outcome) => {
                     let raw = raw_tool_result_content(&outcome);
                     ToolExecutionResult {
@@ -984,6 +996,53 @@ fn raw_tool_result_content(outcome: &ToolOutcome) -> String {
     }
 }
 
+const MAX_TOOL_RESULT_BYTES: usize = 32_768;
+
+fn truncate_tool_result(content: String) -> String {
+    if content.len() <= MAX_TOOL_RESULT_BYTES {
+        return content;
+    }
+    let mut end = MAX_TOOL_RESULT_BYTES;
+    while end > 0 && !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[truncated: tool output exceeded {MAX_TOOL_RESULT_BYTES} bytes]",
+        &content[..end]
+    )
+}
+
+/// Bounds tool output size and scans the returned text with
+/// [`GuardTarget::ToolCall`] before it enters model context.
+fn sanitize_tool_result_for_model(outcome: &ToolOutcome, config: &GuardConfig) -> String {
+    let bounded = truncate_tool_result(tool_result_content(outcome));
+    if let Some(verdict) = guard_scan(GuardTarget::ToolCall, &bounded, config) {
+        match verdict.action {
+            GuardAction::Block => {
+                tracing::warn!(
+                    rule_id = %verdict.rule_id,
+                    "withholding tool output from model context"
+                );
+                return format!(
+                    "[tool output withheld: guardrail `{}` — {}]",
+                    verdict.rule_id, verdict.reason
+                );
+            }
+            GuardAction::Warn => {
+                return format!(
+                    "[guardrail `{}`: {}]\n{}",
+                    verdict.rule_id, verdict.reason, bounded
+                );
+            }
+            GuardAction::Log => {
+                tracing::info!(
+                    rule_id = %verdict.rule_id,
+                    "tool output matched log-tier guardrail"
+                );
+            }
+        }
+    }
+    bounded
 /// 8 lowercase hex characters, unique per call (a `uuid::Uuid::new_v4`
 /// prefix -- `uuid` is already a workspace dependency, no new one added).
 /// Not a security token; just enough entropy that tool content cannot
@@ -1317,6 +1376,7 @@ mod tests {
     };
     use super::*;
     use crate::error::AgentError;
+    use crate::test_git_repo::init_git_repo_with_empty_commit;
 
     #[tokio::test]
     async fn test_turn_sends_message_and_returns_provider_reply() {
@@ -1737,6 +1797,7 @@ mod tests {
         // ReplTool via the stub gate -> tool_result -> final reply), not
         // just a single-shot request/response.
         let _guard = crate::test_support::ion_gate_launcher_env_lock();
+        let repo = init_git_repo_with_empty_commit();
         let repo = crate::test_support::init_git_repo();
         let stub_gate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fakes/ion-verify-stub-gate.sh");
@@ -1966,6 +2027,24 @@ mod tests {
         assert_eq!(no_verdict_grant.guard_action(), None);
     }
 
+    #[test]
+    fn test_truncate_tool_result_bounds_length() {
+        let huge = "x".repeat(MAX_TOOL_RESULT_BYTES + 100);
+        let truncated = truncate_tool_result(huge);
+        assert!(truncated.len() < MAX_TOOL_RESULT_BYTES + 100);
+        assert!(truncated.contains("[truncated: tool output exceeded"));
+    }
+
+    #[test]
+    fn test_sanitize_tool_result_withholds_credential_shaped_output() {
+        let outcome = ToolOutcome {
+            rendered: "api_key=abcdefghijklmnopqrstuvwxyz".to_string(),
+            payload: serde_json::json!({}),
+            ok: true,
+        };
+        let sanitized = sanitize_tool_result_for_model(&outcome, &GuardConfig::default());
+        assert!(sanitized.contains("tool output withheld"));
+        assert!(sanitized.contains("block-tool-output-secret"));
     // ------------------------------------------------------------------
     // Stage 1: sandbox-escape escalation, untrusted tool-output envelope,
     // and the per-turn untrusted_seen escalation.

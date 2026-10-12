@@ -7,6 +7,13 @@ use super::types::{GuardAction, GuardRule, GuardTarget};
 /// Returns the set of built-in guardrail rules that ship with Impulse.
 ///
 /// These rules provide safety defaults for common dangerous operations:
+/// - 6 Block rules: force-push main, bulk git add, rm -rf root, SQL DROP,
+///   writing a hardcoded secret to a file, credential-shaped tool output
+/// - 4 Warn rules: binary staging, artifact staging, .env staging, chmod 777
+/// - 1 Log rule: deploy/publish/release commands
+///
+/// All rules target Bash commands except `block-write-secret` (`FileWrite`) and
+/// `block-tool-output-secret` (`ToolCall`). All are enabled by default and marked as builtin.
 /// - 5 Block rules: force-push main, bulk git add, rm -rf root, SQL DROP,
 ///   writing a hardcoded secret to a file
 /// - 7 Warn rules: binary staging, artifact staging, .env staging,
@@ -111,6 +118,22 @@ pub fn builtin_rules() -> Vec<GuardRule> {
                 "Load secrets from environment variables or a secrets manager instead of \
                  hardcoding them."
                     .to_string(),
+            ),
+            enabled: true,
+            builtin: true,
+        },
+        GuardRule {
+            id: "block-tool-output-secret".to_string(),
+            pattern:
+                r#"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['"]?[A-Za-z0-9/\+_\-]{16,}"#
+                    .to_string(),
+            action: GuardAction::Block,
+            target: GuardTarget::ToolCall,
+            reason: "Tool output appears to contain credential-shaped material that must not \
+                     flow back into model context."
+                .to_string(),
+            suggestion: Some(
+                "Redact secrets from command output before returning them to the model.".to_string(),
             ),
             enabled: true,
             builtin: true,
@@ -293,6 +316,7 @@ mod tests {
     #[test]
     fn test_default_rules_all_enabled() {
         let rules = builtin_rules();
+        assert_eq!(rules.len(), 11, "Expected exactly 11 built-in rules");
         assert_eq!(rules.len(), 13, "Expected exactly 13 built-in rules");
         for rule in &rules {
             assert!(rule.enabled, "Rule '{}' should be enabled", rule.id);
@@ -465,6 +489,29 @@ mod tests {
         assert!(
             !GuardEngine::has_blocking(&results),
             "block-write-secret must not fire for Bash target"
+        );
+    }
+
+    #[test]
+    fn test_blocks_credential_shaped_tool_output() {
+        let engine = GuardEngine::new(&builtin_rules()).unwrap();
+
+        let results = engine.evaluate(
+            "ANTHROPIC_API_KEY=sk-ant-abcdef0123456789ABCDEF",
+            &GuardTarget::ToolCall,
+        );
+        assert!(
+            GuardEngine::has_blocking(&results),
+            "Should block credential-shaped tool output"
+        );
+
+        let results = engine.evaluate(
+            "ANTHROPIC_API_KEY=sk-ant-abcdef0123456789ABCDEF",
+            &GuardTarget::Bash,
+        );
+        assert!(
+            !GuardEngine::has_blocking(&results),
+            "block-tool-output-secret must not fire for Bash target"
         );
     }
 
