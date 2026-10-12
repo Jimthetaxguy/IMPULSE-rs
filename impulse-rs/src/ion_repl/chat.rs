@@ -1317,6 +1317,7 @@ mod tests {
     };
     use super::*;
     use crate::error::AgentError;
+    use crate::test_git_repo::init_git_repo_with_empty_commit;
 
     #[tokio::test]
     async fn test_turn_sends_message_and_returns_provider_reply() {
