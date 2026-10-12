@@ -1,5 +1,5 @@
 ---
-status: active
+status: superseded
 phase: 1-2
 audience: builder
 tags: [guide, integration, recipes]
@@ -7,6 +7,10 @@ last_updated: 2026-02-20
 ---
 
 # Integration Cookbook: End-to-End Impulse Workflows
+
+> **Historical TypeScript/Bun guide — superseded.** These phase-era recipes describe the former
+> memory-plugin architecture. Use [`../../VISION.md`](../../VISION.md) and
+> [`../spec/RUST-CANONICAL-CONTRACT.md`](../spec/RUST-CANONICAL-CONTRACT.md) for the current system.
 
 > **Version:** 1.1 | **Status:** Recipes | **Updated:** 2026-02-21
 > **Purpose:** Show how Phase 1, 1.5, 2 frameworks work together in real scenarios

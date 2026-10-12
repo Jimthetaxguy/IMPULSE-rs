@@ -1,5 +1,5 @@
 ---
-status: active
+status: superseded
 phase: 1
 audience: builder
 tags: [guide, deployment, npm]
@@ -7,6 +7,10 @@ last_updated: 2026-02-20
 ---
 
 # Deployment Framework: From Dev to Production
+
+> **Historical SWARM/TypeScript deployment design — superseded.** It is not a deployment contract
+> for the current local Rust product. Current executable and external-system boundaries are
+> documented in [`../../README.md`](../../README.md) and the canonical Rust contract.
 
 > **Version:** 1.0 | **Status:** Design | **Updated:** 2026-02-20
 > **Scope:** Docker, Kubernetes, CI/CD (GitHub Actions), monitoring, SLOs

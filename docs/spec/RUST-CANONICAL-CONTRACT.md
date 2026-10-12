@@ -3,6 +3,8 @@ title: Rust Canonical Product Contract
 description: Authoritative product contract for Impulse based on impulse-rs
 version: '1.8'
 updated: 2026-07-12
+version: '2.1'
+updated: 2026-09-14
 type: specification
 category: core
 phase: all
@@ -28,6 +30,8 @@ authors:
 Impulse is a terminal-native **local control plane and harness manager** for AI
 software-engineering agents. It launches and manages coding runtimes, supervises their operating
 conditions, and provides shared memory, tools, telemetry, messaging/handoffs, policy, credentials,
+software-engineering agents. It launches and monitors coding runtimes, provides a supervisor
+action surface, and supplies shared memory, tools, telemetry, messaging/handoffs, policy, credentials,
 artifacts, and verification. Claude Code, Codex, and similar CLIs retain their proprietary internal
 loops; Ion is the Impulse-native direct-provider/tool-loop runtime.
 
@@ -47,6 +51,17 @@ Core outcomes:
 - Multi-workspace + multi-agent orchestration surface (observable registration and launch/monitoring of agents across project spaces)
 
 ## 2) Desktop Shell Contract (Updated 2026-07-12)
+- Capability-checked dynamic tools and a supervisor-specific action/permission policy foundation
+- Daemon-owned governed tasks with profiled pre-PTY registration, exact acceptance criteria,
+  daemon-attested clean Git subjects, derived producer records, and operator-required acceptance
+- Deterministic, pending accepted-run memory candidates with provenance-rich read-only review and
+  no automatic `GENOME`/`HISTORY` mutation
+- Operationally safe session lifecycle with recorded endings and optional API-level verification gates
+- Human-visible observability through CLI, ratatui TUI, and the Dioxus Desktop cockpit
+- Desktop workspace registry plus multi-agent launch/observation surfaces; daemon-side
+  multi-workspace routing remains incomplete
+
+## 2) Desktop Shell Contract (Updated 2026-07-13)
 
 > **This section supersedes all prior references to the EGUI workbench as the active desktop product.**
 
@@ -72,6 +87,7 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 | Phase | Goal | Status |
 |---|---|---|
 | 0 | Documentation contract reset | Completed; Plan 6 is correcting residual active-doc drift |
+| 0 | Documentation contract reset | Complete |
 | 1 | Keep PTY/process lifecycle usable independently of render surface | Core backend live; optional egui renderer still retained for legacy compatibility |
 | 2 | Static Dioxus shell skeleton | Complete foundation |
 | 3 | Dioxus Desktop launch scaffold + live terminal bridge (PTY → xterm.js) | Live host/bridge foundation; operational hardening continues |
@@ -86,6 +102,9 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 | **Now** | Rust control-plane foundation: daemon truth, PTY lifecycle, memory/tools/policy/artifacts, Dioxus cockpit, Ion native runtime | Active |
 | **Next** | Prove one governed supervisor + builder vertical slice and define the hierarchy/enforcement ADR | Active |
 | **Later** | General role contracts, runtime capability negotiation, typed agent messaging, and multi-project supervisor attention | Planned |
+| **Now** | Rust control-plane foundation, daemon-owned governed runtime producers, and deterministic accepted-run review candidates | Active |
+| **Next** | Add stronger same-user actor authorization and one full launched Builder/Supervisor workflow proof | Active |
+| **Later** | Wire candidate promotion/dismissal daemon/UI/runtime surfaces, general role contracts, runtime capability negotiation, typed agent messaging, and multi-project supervisor attention | Planned |
 | **Legacy** | egui / `impulse-gui` compile-maintenance only | Frozen |
 
 ### Out of Scope for Current Contract
@@ -107,6 +126,15 @@ Historical migration sequence: `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md`
 | Pane | Cockpit view/input attachment | TUI panes and desktop terminal ids; never an authority boundary |
 | Workspace target | Explicit filesystem execution root | Desktop `WorkspaceTarget`/`WorkspaceRegistry` |
 | Project | Governance scope for memory, artifacts, policy, and verification | Project-scoped `.impulse/` state and `ProjectOpsSnapshot`; often maps 1:1 to a workspace today |
+| Role | Obligations, permissions, tools, context, communication, and verification duties | Open `AgentRoleId`/`AgentRoleAssignment` for narrow launch requirements; legacy coordinator/worker `AgentRole` topology; concrete `SupervisorPermissionPolicy`; generalized role composition is not implemented |
+| Runtime | External harness or native engine that executes a role | External agent harness calls, desktop PTY runtime, and Ion native provider/tool loop; no common adapter trait yet |
+| Agent instance | One running identity with runtime, role, scope, process state, and telemetry | `AgentRuntime`/`AgentRuntimeSnapshot` and desktop runtime records |
+| Session | Bounded persisted work history | Daemon session lifecycle and `.impulse/` history/state |
+| Task | Assignment plus acceptance/verification criteria | `GovernedTaskRun` is a durable daemon-owned identity distinct from agent/session ids; it carries bounded criteria, typed claims/evidence/verdicts/decisions, and independent execution/review state. Reassignment/resume is not implemented |
+| Pane | Cockpit view/input attachment | TUI panes and desktop terminal ids; never an authority boundary |
+| Workspace target | Explicit filesystem execution root | Desktop `WorkspaceTarget`/`WorkspaceRegistry` |
+| Project | Governance scope for memory, artifacts, policy, and verification | Project-scoped `.impulse/` state and `ProjectOpsSnapshot`; often maps 1:1 to a workspace today |
+| Memory candidate | Review proposal derived from accepted episodic evidence | `AcceptedRunMemoryCandidate` is a deterministic review projection with status-preserving state-layer decisions; it remains distinct from promoted records and never writes `GENOME` |
 
 ### Platform Service Contract
 
@@ -122,71 +150,164 @@ release remains a separate operation.
 A future adapter contract must report required, optional, emulated, and unsupported operations plus
 enforcement strength. Mandatory role requirements must eventually block an incompatible launch;
 advisory degradation must be visible. The schema is reserved for the hierarchy/enforcement ADR.
+a builtin launchable platform. Repository tests exercise that implementation; release packaging
+and distribution remain separate contracts.
+
+[ADR-0010](../decisions/0010-product-role-launch-contract.md) makes one narrow product-role launch
+contract live. `AgentRoleAssignment` carries an open
+product-role id plus caller-supplied launch requirements. Trusted Rust-owned registry metadata
+declares conservative wrapper support using ordered `unsupported`, `advisory`, `mediated`, and
+`structural` strengths. Dioxus previews a fixed initial Builder profile; `DesktopRuntime` reloads
+the current registry and re-evaluates the request before agent-id reservation or PTY creation.
+Unsatisfied mandatory requirements block, while optional gaps remain allowed but degraded. The
+task, assignment, and compatibility result remain observable through runtime and daemon telemetry.
+This static preflight does not attest model-internal behavior, and canonical working-directory
+mediation is not a filesystem sandbox.
+
+[ADR-0011](../decisions/0011-governed-task-run-lifecycle.md) adds the next narrow operating
+contract. A governed launch proposes a distinct task ID and must receive authoritative daemon
+registration before PTY creation. The daemon persists the run in `.impulse/GOVERNED_TASKS.json`,
+serializes expected-revision/idempotency-key mutations, and keeps execution state separate from
+review state. Worker claims, verifier records, supervisor verdicts, and operator decisions remain
+distinct typed records; only current passing verification can be recommended, and only an explicit
+operator approval creates `accepted`. Dioxus renders daemon snapshots and uses an acknowledged host
+command without optimistic task updates. Desktop launch/exit intent uses a bounded, owner-only,
+cross-process-locked project outbox written before daemon I/O. The outbox covers queued intent and
+ambiguous transport, but not abrupt desktop death before exit intent exists; runtime leases and
+orphan reconciliation remain downstream. Missing targets stay queued until a future durable
+registration-tombstone/expiry policy can prove they cannot appear.
+
+[ADR-0012](../decisions/0012-daemon-owned-governed-runtime-producers.md) closes the first automatic
+producer path. A profiled Dioxus Builder launch supplies exact acceptance criteria and
+`rust_workspace_v1`; both desktop and daemon require the canonical Git root to be clean at a
+committed `HEAD`, and the daemon independently matches the initial OID before registration. The
+shared registration contract requires the exact Builder role plus a matching nonblocked
+compatibility result recomputed from the daemon-owned runtime registry; caller-supplied
+compatibility cannot strengthen or replace it. The profiled runtime receives
+project/task/socket/control-CLI/profile routing;
+ordinary and unprofiled panes have inherited producer-routing variables removed. External agents submit only a
+summary and artifact IDs through `"$IMPULSE_CONTROL_CLI" --daemon governed-claim`; Ion can instead invoke its typed
+`governed_submit_claim` tool. The daemon derives the assigned Worker and clean current subject.
+
+`rust_workspace_v1` verifies the claimed commit in a detached worktree with fixed format,
+locked-workspace-check, locked-strict-Clippy, and locked-workspace-test argv. The profile requires a
+committed, regular, non-symlink root `Cargo.lock` and rejects source-tree symlinks. The daemon
+scrubs the environment, bounds time, streams output into digests/counts/truncation flags, and uses
+bounded post-kill reaping before transferring any lingering child to a background reaper.
+Production governed records
+retain no output preview. The detached subject must remain clean after the fixed commands, and a
+bounded before/after byte manifest covers ignored source-tree paths as well as Git-visible paths;
+Git administration and the external Cargo target directory are excluded. These measures do not
+create an OS sandbox: Rust build scripts, proc macros, and tests are host-trusted code.
+
+Supervisor review is one API-only, tool-free, history-free, temperature-zero turn. Its strict
+contract-versioned envelope must bind the exact task revision, claim, verification, subject, and
+acceptance-criteria digest. Generic external harness mode fails closed before spawning because it
+cannot guarantee a structurally read-only review. Dioxus renders evidence and terminal command
+guidance for claim, verification, and Supervisor review. ADR-0019's operator-only staged-worktree
+Promote/Discard controls are live; they are separate from memory-candidate decisions. Only the
+operator can record final acceptance.
+
+All governed mutations route through the single project-bound daemon writer. Expected-revision CAS
+and atomic replacement do not authorize two daemon processes to write the same ledger.
+
+On ledger load, the daemon validates canonical task/project/workspace identity, replays the
+contiguous typed record/event chain, and requires exactly one valid idempotency receipt for every
+revision. Forged materialized states, broken history, missing receipts, and malformed persisted
+evidence fail closed before becoming workbench truth.
+
+That receipt contract deduplicates persisted requests, and one per-task daemon lock serializes live
+producer and lifecycle mutations. Durable, owner-only `PRODUCER_RESERVATIONS.json` entries now cover
+verification, Supervisor review, and ADR-0019 staged-worktree promotion. In
+[`governed_wiring.rs`](../../impulse-rs/src/daemon/governed_wiring.rs), `reserved_producer` runs the
+side effect and its governed-task receipt persistence inside one `with_reservation` closure;
+release follows that durable result. A same-revision open reservation is refused, and interrupted
+attempts reconcile to `NeedsRerun` with a task event and `pending_rerun_reason` on a subsequent
+producer acknowledgement. This detects interrupted work; it does not roll back arbitrary effects
+or guarantee exactly-once execution. A panic leaves the reservation open for reconciliation rather
+than treating it as an ordinary returned error. See
+[`producer_reservation.rs`](../../impulse-rs/src/state/producer_reservation.rs).
+
+This is not a generalized role/runtime contract. Typed actor kinds remain provenance, not proof of
+a client's authority. [ADR-0018](../decisions/0018-socket-actor-provenance.md) now gates socket
+operator decisions with kernel peer credentials plus a per-daemon-run operator capability;
+[`actor_provenance.rs`](../../impulse-rs/src/daemon/actor_provenance.rs) classifies the connection,
+and the daemon stamps authentication provenance before persisting the decision. Launched runtimes
+are not handed that capability. A same-UID process that deliberately discovers and reads the
+capability file remains inside the explicit threat-model limit; this is not cryptographic
+separation from an adversary running as the same user.
+Unprofiled caller-composed evidence retains its existing validation boundary; profiled automatic
+records are derived by the daemon and cannot enter through generic mutations. One daemon adapter
+remains bound to one project, project identity is currently
+directory-name-derived, tasks cannot be reassigned/resumed, review errors are not yet structured CAS
+codes, and global task/receipt collections are not paginated or archived.
+
+[ADR-0013](../decisions/0013-deterministic-accepted-run-memory-candidates.md) makes accepted-run
+eligibility visible without treating it as semantic truth. After an approval is durably committed to
+`GOVERNED_TASKS.json`, the daemon derives one versioned candidate in owner-only
+`MEMORY_CANDIDATES.json`. The candidate deterministically binds the accepted revision, task and
+criteria, subject, evidence/decision/artifact IDs, successful command digests, runtime routing, and
+source assurance. Its proposed text excludes worker claim prose and Supervisor/operator rationales.
+The digest is over exact JSON bytes emitted by a fixed ordered, versioned source struct with no maps
+or floats; it does not semantically normalize Unicode.
+
+The candidate ledger is a materialized view rather than a second acceptance authority. Identical
+request replay and daemon startup repair missing projections; orphaned, duplicate-task, malformed,
+or source-mismatched records fail closed. ADR-0013's initial slice had only `pending_review` and
+added no mutation endpoint. Accepted/rejected governed-task decisions remain terminal, so an
+accepted source cannot later be rejected and orphan its candidate.
+
+[ADR-0020](../decisions/0020-scoped-memory-promotion-and-dismissal.md), still recorded as `review`,
+has an implemented state and request-type slice. It preserves candidate promotion/dismissal status
+across re-derivation, records promoted facts in append-only, hash-chained `MEMORY.jsonl`, and renders
+them into a separate `GENOME_PROJECTION.md`; `GENOME.md` remains hand-curated and `HISTORY.jsonl`
+is not rewritten. The state method orders log append, candidate-ledger commit, and projection
+rebuild with explicit replay/recovery semantics; these artifacts are not one cross-file transaction.
+See [`state/memory_candidate.rs`](../../impulse-rs/src/state/memory_candidate.rs),
+[`state/memory_record.rs`](../../impulse-rs/src/state/memory_record.rs), and
+[`memory_wiring.rs`](../../impulse-rs/impulse-ops/src/memory_wiring.rs). The request/ack types are
+not a registered daemon endpoint: `DecideMemoryCandidate`, Dioxus Memory Promote/Dismiss controls,
+and Ion memory integration remain deferred. This source-state description does not mark the ADR
+accepted or claim an end-to-end memory-promotion workflow.
+
+A future generalized/dynamic adapter contract must still define runtime discovery, optional and
+emulated operations, attestation freshness, and post-launch re-evaluation. General role
+composition, stronger same-user actor authorization, producer profiles beyond Rust, and a complete
+launched Builder/Supervisor proof remain outside this slice. End-to-end candidate promotion/dismissal
+still requires the daemon, Dioxus, and runtime wiring above; its state-layer artifact boundary is
+already implemented separately from hand-curated GENOME.
 
 ## 4) Public Interface Contract
 
 ### CLI Contract (Stable)
 
-Primary commands that must remain documented and regression-tested:
+The executable command registry is defined by Clap in `impulse-rs/src/cli.rs` and exposed by
+`impulse-rs --help`. The current public commands are:
 
-**Session lifecycle:**
-- `session-start`
-- `session-end --verify`
-- `track-write`
-- `track-tool`
+- **Lifecycle and state:** `daemon`, `run`, `init`, `session-start`, `session-end`, `track-write`,
+  `track-tool`, `list-sessions`, `session-info`, `session-conflicts`, `status`, `debug`,
+  `conflict-history`, `history`, `genome`, `add-decision`, `activity`, `summary`, `health`,
+  `system`, `analyze`, `config`
+- **Context, memory, and coordination:** `chat`, `orchestrate`, `handoff`, `sync-context`,
+  `compute-injection`, `verify`, `search-history`, `search-genome`, `index-memory`,
+  `retrieval-status`, `steward`, `swarm`
+- **Agent and platform integration:** `hooks`, `validate-hooks`, `list-providers`,
+  `agent-configure`, `agent-status`, `agent-query`, `guard`, `ion-verify`, `governed-claim`,
+  `governed-verify`, `governed-review`, `governed-promote`, `governed-discard`, `mcp serve`
 
-**Info and status:**
-- `status`
-- `history`
-- `genome`
-- `activity`
-- `summary`
-- `health`
-- `system`
-- `analyze`
+The packaged executable is `impulse-rs`. All five listed `governed-*` subcommands are daemon-only;
+installed invocations use `impulse-rs --daemon governed-*`, while governed panes preserve their
+exact injected executable path through `"$IMPULSE_CONTROL_CLI" --daemon governed-*` only when they
+carry a governed verification profile. `governed-promote` and `governed-discard` additionally require
+an operator-class connection and act on ADR-0019 staged worktrees, not memory candidates.
+- **Tools and content:** `tools`, `tooling-list`, `tooling-describe`, `tooling-run`,
+  `tooling-schema`, `tooling-validate`, `tooling-reload`, `docs`, `model`, `office`,
+  `credentials`, `extract`, `calc`, `exec`
+- **Build and source operations:** `sweep`, `wipe`, `clean-all`, `sccache-setup`, `build-health`,
+  `sem-diff`, `sem-blame`, `sem-impact`, `sem-status`, `analytics`
+- **Machine-readable extension surfaces:** `describe`, `schema`, `plugin-list`, `plugin-invoke`
 
-**Retrieval and search:**
-- `index-memory`
-- `search-history`
-- `search-genome`
-- `retrieval-status`
-
-**Orchestration and context:**
-- `orchestrate`
-- `handoff`
-- `sync-context`
-- `hooks`
-- `verify`
-
-**Stewardship:**
-- `steward` (subcommands: status, analyze, compact, approve, reject)
-
-**Tool and model management:**
-- `tools` (subcommands: list, init, update)
-- `docs` (subcommands: list, fetch)
-- `model`
-- `credentials` (subcommands: set, get, list, proxy)
-
-**Build hygiene:**
-- `sweep` — clean build artifacts
-- `wipe` — deep clean including caches
-- `clean-all` — comprehensive workspace cleanup
-- `sccache-setup` — configure shared compilation cache
-- `build-health` — report build system health metrics
-
-**Dynamic tooling:**
-- `tooling-list` — list registered dynamic tools
-- `tooling-describe` — describe a specific tool's schema and capabilities
-- `tooling-run` — execute a dynamic tool by name with parameters
-
-**Supervisor:**
-- `panes` — list active terminal panes with context summaries
-
-**Utilities:**
-- `calc`
-- `exec`
-- `run` (TUI mode)
-- `config`
+The exact direct/daemon support matrix and flags live in [`docs/CLI-COMMANDS.md`](../CLI-COMMANDS.md).
 
 ### State and Artifact Contract
 
@@ -196,6 +317,12 @@ Primary commands that must remain documented and regression-tested:
 | `.impulse/HISTORY.jsonl` | Session history (append-only) | Durable project memory |
 | `.impulse/GENOME.md` | Durable decisions/preferences | Durable project memory |
 | `.impulse/config.json` | Runtime configuration | Durable config |
+| `.impulse/GOVERNED_TASKS.json` | Daemon-owned governed task records plus idempotency receipts | Durable project control-plane state; atomically replaced at mode `0600` |
+| `.impulse/PRODUCER_RESERVATIONS.json` | Producer intent, receipt references, and interrupted-attempt recovery | Owner-only durable journal; reserved before verification/review/staged promotion effects |
+| `.impulse/MEMORY_CANDIDATES.json` | Accepted-run review projections plus status-preserving decision receipts | Owner-only local control-plane state; atomically replaced at mode `0600`; distinct from curated memory |
+| `.impulse/MEMORY.jsonl` | Append-only, hash-chained promoted-record log | Implemented ADR-0020 state-layer artifact; daemon/UI/runtime decision wiring remains deferred |
+| `.impulse/GENOME_PROJECTION.md` | Derived rendering of committed memory records | Regenerated from the separate log; never merged into hand-curated `GENOME.md` |
+| `.impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json` | Bounded write-ahead desktop launch/exit intent awaiting daemon reconciliation | Durable local recovery state; cross-process sibling lock, mode `0600`, removed/emptied after acknowledgment |
 | `.impulse/context/current-task.md` | Shared current context | Generated via `sync-context` |
 | `.impulse/context/handoff-*.md` | Tool handoff artifacts | Generated via `handoff` |
 | `.impulse/context/routing-log.jsonl` | Orchestration log | Append-only audit |
@@ -206,6 +333,12 @@ Primary commands that must remain documented and regression-tested:
 | `.impulse/embeddings/*` | Optional embedding temp artifacts | Runtime cache (gitignored) |
 | `.impulse/retrieval.lock` | Indexing lock guard | Runtime safety artifact |
 | `.impulse/projects/<project_id>/agents/<agent_id>/artifacts/*` | Project-organized operator artifacts | Durable workbench artifacts |
+
+At a repository-root `.impulse`, `impulse-rs init` idempotently adds only runtime-owned state,
+socket, retrieval-cache, governed-task/candidate ledger/temp, and Desktop-outbox/temp paths to `.gitignore`. It
+never adds `.impulse/` as a blanket rule: `GENOME.md`, `HISTORY.jsonl`, `config.json`, and
+`impulse-capabilities.json` remain deliberate durable project artifacts unless an existing
+operator-owned blanket rule already hides them. Init preserves and warns about that broader rule.
 
 ### Desktop Shell Host Contract (Terminal Bridge — Additive)
 
@@ -220,6 +353,7 @@ The desktop shell communicates with the Rust backend through a Dioxus host adapt
 | `terminal_resize` | Resize PTY and vt100 parser |
 | `terminal_close` | Kill PTY and clean up session |
 | `terminal_focus` | Notify backend of focus change |
+| `governed_task_mutate` | Submit an acknowledged revisioned governed-task mutation and return daemon-owned state |
 | `native_island_request` | Request a narrow macOS-native island and receive a serializable result DTO |
 
 **Events (backend → frontend):**
@@ -232,7 +366,7 @@ The desktop shell communicates with the Rust backend through a Dioxus host adapt
 | `ops_update` | Daemon ProjectOpsSnapshot update |
 | native island result | Returned through `native_island_request`; native code does not own session, memory, terminal, or artifact state |
 
-### Daemon Workbench IPC Contract (Preserved — Unchanged)
+### Daemon Workbench IPC Contract (Authoritative — Extended in v6)
 
 The daemon is the authoritative source for workbench surfaces:
 
@@ -240,6 +374,7 @@ The daemon is the authoritative source for workbench surfaces:
 - `Agents`
 - `Context`
 - `Artifacts`
+- governed task evidence and decision cards in the Supervisor view
 - sidebar operator alerts
 - status bar workbench summary
 
@@ -260,6 +395,12 @@ Shared workbench model contract:
 - `ProjectOpsSnapshot` is the canonical read model for the daemon-backed workbench.
 - `TerminalOpsReport` is the ephemeral publication model for live terminal telemetry.
 - `AgentRuntime.ephemeral = true` identifies telemetry-only agents that do not currently map to a durable session.
+- `AgentRuntime.governed_task_id` and `governed_task_revision` retain task provenance in
+  runtime telemetry without making the runtime record authoritative for review state.
+- `ProjectOpsSnapshot.governed_tasks` is the authoritative governed-task collection; old payloads
+  deserialize it as empty.
+- `ProjectOpsSnapshot.memory_candidates` is the serde-defaulted read-only accepted-run review
+  collection. It never implies `GENOME` promotion and old payloads deserialize it as empty.
 
 `TerminalOpsReport` fields:
 
@@ -279,6 +420,7 @@ Daemon overlay rules:
 - Purge telemetry-only state after 60 seconds.
 
 ### Daemon IPC Contract (PROTOCOL_VERSION = 3)
+### Daemon IPC Contract (PROTOCOL_VERSION = 6)
 
 The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec: [`docs/IPC-PROTOCOL.md`](../IPC-PROTOCOL.md).
 
@@ -320,6 +462,10 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 **Workbench:**
 - `GetOpsSnapshot`, `SubscribeOps { since_seq? }`, `PublishTerminalOps { report: TerminalOpsReport }`
 - `ListArtifacts { limit? }`, `GetArtifact { artifact_id }`, `RunArtifactAction { artifact_id, action_id, params? }`
+- `RegisterGovernedTask { registration }`, `GetGovernedTask { project_id, task_id }`,
+  `ListGovernedTasks { project_id }`, `MutateGovernedTask { request }`
+- `SubmitGovernedClaim { request }`, `RunGovernedVerification { request }`,
+  `RunGovernedSupervisorReview { request }`
 
 **Chat:**
 - `Chat { session_id, message, inject_mode?, inject_explain? }`
@@ -331,12 +477,12 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 | Session lifecycle tracking | Implemented | `session-start`, `session-end` | Rust unit + integration |
 | File/tool activity tracking | Implemented | `track-write`, `track-tool` | Rust unit + integration |
 | ratatui TUI tabs | Implemented | `run` TUI mode | Rust UI tests |
-| Daemon socket operations | Implemented | `daemon`, `--daemon ...` | Daemon tests |
+| Daemon socket operations | Implemented for selected commands | `daemon`, CLI matrix IPC entries | Daemon tests |
 | Context-aware chat (daemon) | Implemented | `--daemon chat` | Daemon + provider tests |
 | Hook config generation | Implemented | `hooks --platform ...` | Integration tests |
 | Orchestration handoff/context files | Implemented | `orchestrate`, `handoff`, `sync-context` | Rust tests |
 | Verification gate | Implemented | `verify`, `session-end --verify` | Rust tests |
-| Agent harness | Implemented (2026-03-31) | Multiple IPC endpoints | Rust tests |
+| External agent-assistance harness | Implemented foundation | Agent assistance/review IPC endpoints | Rust tests |
 | Retrieval indexing + keyword search | Implemented | `index-memory`, `search-history`, `search-genome` | Rust unit + integration |
 | Semantic search (feature-flagged) | Implemented (fallback-safe) | `search-* --mode semantic` | Rust unit + integration |
 | Review-first context injection | Implemented (additive) | daemon chat + orchestrate/handoff/sync-context | Rust unit + integration |
@@ -350,6 +496,15 @@ The daemon exposes a JSON-line Unix socket protocol (`impulse.sock`). Full spec:
 | Registry-backed open desktop platform identity | Implemented foundation | `AgentRegistry`, `AgentPlatformId`, desktop/MCP/host | Registry + desktop tests |
 | General role contract | Direction, not implemented | Future ADR | Not applicable |
 | Common runtime adapter + capability negotiation | Direction, not implemented | Future ADR | Not applicable |
+| Supervisor-specific action policy | Implemented foundation | `SupervisorPermissionPolicy`, `RunSupervisorAction` | Ops + daemon tests |
+| Ion native coding runtime | Implemented foundation | `ion` REPL, provider/tool loop, approvals/guardrails | Rust unit + CLI tests |
+| Registry-backed open desktop platform identity | Implemented foundation | `AgentRegistry`, `AgentPlatformId`, desktop/MCP/host | Registry + desktop tests |
+| Product-role launch preflight | Implemented narrow foundation | `AgentRoleId`, `AgentRoleAssignment`, static registry support, Dioxus preview, `DesktopRuntime` pre-PTY gate | Ops + desktop runtime/contract tests |
+| Daemon-owned governed-task lifecycle | Implemented narrow foundation | `GovernedTaskRun`, governed workbench IPC, persistent ledger, desktop acknowledged gateway/outbox, Supervisor evidence cards | Ops/state/daemon/desktop contract and recovery tests |
+| Daemon-owned governed runtime producers | Implemented first profile | `rust_workspace_v1`, governed CLI/Ion claim, detached verification, strict API Supervisor review | Handler proof covers review/operator; real daemon/CLI/restart proof stops at `awaiting_supervisor` |
+| Accepted-run memory candidates | Implemented review-only foundation | `AcceptedRunMemoryCandidate`, deterministic candidate ledger/reconciliation, protocol-v6 snapshot, Dioxus Memory view | Ops contract, state/restart/tamper, snapshot, and desktop SSR tests |
+| General role contract | Direction, not implemented | Future ADR | Not applicable |
+| Common dynamic runtime adapter + generalized capability negotiation | Direction, not implemented | Future ADR | Not applicable |
 | Typed cross-agent message bus | Partial delegations/handoffs only | `delegation`, `orchestration`, daemon contracts | Rust tests |
 | **Dioxus desktop shell** | **Live host/bridge foundation; hardening continues** | Dioxus Desktop + xterm.js | Desktop contract/host tests + smoke |
 | **Tauri-shaped host adapter** | **LEGACY — compatibility only** | Optional gated bridge | Remove after Dioxus host command/event parity |
@@ -376,6 +531,10 @@ Contributor verification before completion remains mandatory even though the ses
 
 External runtime enforcement is limited to launch conditions, working-directory/project scoping,
 and supported integration seams. Structural filesystem isolation depends on runtime/sandbox support.
+supported integration seams, and the daemon-owned task transition boundary. Structural filesystem
+isolation depends on runtime/sandbox support. The daemon socket directory/socket/PID file are
+restricted to the local user (`0700`/`0600`/`0600`), which protects the OS-user boundary but does
+not authenticate distinct roles among processes owned by that user.
 The product must not infer that a role is satisfied merely because a prompt was injected or a pane
 was labeled. Ion can support deeper structural enforcement because Impulse owns its tool/model loop,
 but it remains subject to the explicit policies and gaps documented in code and `VISION.md`.
@@ -387,13 +546,19 @@ but it remains subject to the explicit policies and gaps documented in code and 
 The following files define product truth and must be updated together for contract changes:
 - `VISION.md` (living product north star and target-state boundary)
 - `docs/spec/RUST-CANONICAL-CONTRACT.md` (authoritative contract)
+- `CONTEXT.md` (stable project vocabulary and live/direction boundary)
 - `AGENTS.md` (operator-facing guidance)
 - `CLAUDE.md` (project technical context)
 - `docs/INDEX.md` (navigation + source-of-truth routing)
 - `docs/SUMMARY.yaml` (navigation source)
 - `docs/SUMMARY.md` (high-level map)
 - `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` (desktop contract)
+- `docs/spec/USER-STORY-MAP.md` and `docs/spec/TEST-TRACEABILITY.md` (acceptance and evidence map)
 - `docs/decisions/0008-dioxus-desktop-host.md` (desktop ADR)
+- `docs/decisions/0010-product-role-launch-contract.md` and
+  `docs/decisions/0011-governed-task-run-lifecycle.md` (governed launch/lifecycle authority)
+- `docs/decisions/0012-daemon-owned-governed-runtime-producers.md` (profiled producer authority)
+- `docs/decisions/0013-deterministic-accepted-run-memory-candidates.md` (accepted-run review projection authority)
 
 ### Required Update Checklist for Any Interface Change
 
@@ -417,6 +582,10 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 | Integration | Every stable CLI command | 26 tests | PARTIAL |
 
 **Workspace totals (2026-07-12 canonical projection):** 1,948 tests across the 5 workspace crates/packages (impulse-rs 1,574, ops 44 including the canonical-checkout archive proof, term 114, desktop 193, ion 23); 9 ignored, 0 failed. The verified isolated worktree without the gitignored reconciliation archive reports 1,947 passed with that one proof explicitly filtered.
+**Workspace totals:** The final `cargo test --workspace` output for the current checkout is the
+authority; record its package-level passed, ignored, and failed totals in commit/PR evidence rather
+than freezing a moving aggregate in this contract. Default tests must depend only on tracked source
+and fixtures so fresh clones, linked worktrees, and CI execute the same gate.
 
 ### Required Test Patterns
 

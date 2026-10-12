@@ -9,6 +9,7 @@ use crate::envelope;
 
 pub const PRODUCT_DESCRIPTION: &str =
     "Terminal-native local control plane and harness manager for AI coding agents";
+    "Feed the impulse to build — a terminal-native local control plane and harness manager for AI coding agents";
 
 #[derive(Parser)]
 #[command(name = "impulse-rs")]
@@ -44,6 +45,57 @@ pub enum McpCommands {
         /// TCP port when using --transport tcp
         #[arg(long)]
         port: Option<u16>,
+    },
+}
+
+/// Voice engine subcommands — primary backend is ElevenLabs Agent.
+#[derive(Subcommand)]
+pub enum VoiceCommands {
+    /// Show the primary voice provider (ElevenLabs Agent) and docs pointer
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List tools exposed to the ElevenLabs agent (policy + registry)
+    ListTools {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Invoke an ElevenLabs-shaped client tool against the real ToolRegistry
+    ToolCall {
+        /// Case-sensitive Impulse tool id (e.g. system_info). Ignored with --stdin.
+        #[arg(long)]
+        name: Option<String>,
+        /// JSON parameters object
+        #[arg(long, default_value = "{}")]
+        params: String,
+        /// Correlation id for the agent turn
+        #[arg(long)]
+        tool_call_id: Option<String>,
+        /// Confirm mutating tools (file_write, bash_exec, …)
+        #[arg(long)]
+        confirmed: bool,
+        /// Read a full ElevenLabs client-tool JSON body from stdin
+        #[arg(long)]
+        stdin: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print operator documentation for the voice tool bridge
+    Docs,
+    /// Export ElevenLabs client-tool schemas from the live ToolRegistry
+    Schema {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Serve registry-backed voice tools (MCP-shaped: stdio/tcp JSON-line or HTTP webhook)
+    Serve {
+        /// Transport: stdio | tcp | webhook (default: webhook)
+        #[arg(long, default_value = "webhook")]
+        transport: String,
+        /// Port for tcp / webhook (default: 8787)
+        #[arg(long, default_value_t = 8787)]
+        port: u16,
     },
 }
 
@@ -452,6 +504,11 @@ pub enum Commands {
         #[command(subcommand)]
         subcommand: McpCommands,
     },
+    /// ElevenLabs-first voice engine (tool calls into Impulse)
+    Voice {
+        #[command(subcommand)]
+        subcommand: VoiceCommands,
+    },
     /// Configure the Impulse Agent (LLM-powered coordination)
     AgentConfigure {
         /// LLM provider: anthropic, openai, minimax
@@ -605,6 +662,93 @@ pub enum Commands {
         #[arg(long, default_value = "Verify the pending diff.")]
         description: String,
         /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit a closed-loop Builder claim through the project daemon.
+    GovernedClaim {
+        /// Project id injected by Impulse (`IMPULSE_PROJECT_ID`) when omitted.
+        #[arg(long)]
+        project_id: Option<String>,
+        /// Governed task id injected by Impulse (`IMPULSE_GOVERNED_TASK_ID`) when omitted.
+        #[arg(long)]
+        task_id: Option<String>,
+        /// Builder-authored completion summary. Actor and Git subject are daemon-derived.
+        #[arg(long)]
+        summary: String,
+        /// Project artifact IDs supporting the claim.
+        #[arg(long = "artifact-id")]
+        artifact_ids: Vec<String>,
+        /// Output the acknowledged daemon-owned task as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the daemon to execute the governed task's closed verification profile.
+    GovernedVerify {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the configured Impulse Agent to perform a strict governed Supervisor review.
+    GovernedReview {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Internal: renders one PDF's text layer, bounded, in this isolated
+    /// process, and prints it as JSON to stdout. Spawned only by ion's
+    /// `document_read` tool (`ion_repl::tool_document::run_pdf_extraction_child`,
+    /// review round 1 P0-1/P0-2) as a crash- and memory-isolated child --
+    /// never invoked directly by a person. Not a public interface: its
+    /// arguments and output shape may change without notice.
+    #[command(hide = true)]
+    InternalPdfText {
+        /// Path to the PDF to render.
+        path: PathBuf,
+        /// Cumulative character budget across every rendered page.
+        #[arg(long)]
+        max_chars: usize,
+        /// Refuse the PDF above this many pages.
+        #[arg(long)]
+        max_pages: usize,
+        /// Memory-watchdog ceiling in bytes (review round 3, F2). Defaults
+        /// to the production ceiling
+        /// (`ion_repl::tool_document::PDF_CHILD_MEMORY_LIMIT_BYTES`) when
+        /// omitted; overridable only so integration tests can prove the
+        /// watchdog actually fires using a small fixture against a small
+        /// ceiling, rather than needing a genuinely gigabyte-scale bomb in
+        /// the default test suite. `RLIMIT_AS` (set by the parent,
+        /// independent of this flag) is unaffected by this override.
+        #[arg(long)]
+        memory_limit_bytes: Option<u64>,
+    },
+    /// Fast-forward the canonical branch onto an accepted staged outcome (ADR-0019).
+    ///
+    /// Operator-class only. A blocked promotion is reported, not an error: the
+    /// run stays accepted and the staged worktree stays active.
+    GovernedPromote {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reclaim a finished staged worktree (ADR-0019). Operator-class only.
+    GovernedDiscard {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        /// Why the checkout is being reclaimed; recorded on the discard event.
+        #[arg(long, default_value = "operator reclaimed the staged worktree")]
+        reason: String,
         #[arg(long)]
         json: bool,
     },

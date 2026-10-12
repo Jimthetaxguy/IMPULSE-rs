@@ -601,7 +601,9 @@ impl TerminalPanel {
 
     /// Kill the child process.
     pub fn kill(&self) {
-        self.backend.kill();
+        if let Err(error) = self.backend.kill() {
+            log::error!("failed to terminate terminal panel child: {error}");
+        }
     }
 
     /// Get context health for status bar display.

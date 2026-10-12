@@ -15,6 +15,9 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 pub struct Storage {
     base_path: PathBuf,
 }
@@ -53,6 +56,19 @@ impl Storage {
         let path = self.path(filename);
         let json = serde_json::to_string_pretty(data).context("Failed to serialize JSON")?;
         self.atomic_write(&path, json.as_bytes())
+    }
+
+    /// Atomically write security-sensitive JSON with owner-only permissions.
+    ///
+    /// On Unix the unique temp inode is created as `0600` before any content is
+    /// written, so there is no world-readable window before the final rename.
+    /// Other platforms retain the same atomic replacement behavior and rely on
+    /// their native ACLs.
+    pub fn write_private_json<T: Serialize>(&self, filename: &str, data: &T) -> Result<()> {
+        self.ensure_dir()?;
+        let path = self.path(filename);
+        let json = serde_json::to_string_pretty(data).context("Failed to serialize JSON")?;
+        Self::atomic_write_private_path(&path, json.as_bytes())
     }
 
     pub fn append_jsonl(&self, filename: &str, record: &impl Serialize) -> Result<()> {
@@ -148,6 +164,20 @@ impl Storage {
     /// Uses a PID+timestamp-unique temp file to avoid collisions when
     /// multiple processes write concurrently (e.g. parallel hook installs).
     pub fn atomic_write_path(path: &Path, content: &[u8]) -> Result<()> {
+        Self::atomic_write_path_with_mode(path, content, None)
+    }
+
+    /// Atomic write helper for data that must never be exposed through the
+    /// process umask on Unix.
+    pub fn atomic_write_private_path(path: &Path, content: &[u8]) -> Result<()> {
+        Self::atomic_write_path_with_mode(path, content, Some(0o600))
+    }
+
+    fn atomic_write_path_with_mode(
+        path: &Path,
+        content: &[u8],
+        unix_mode: Option<u32>,
+    ) -> Result<()> {
         let unique_suffix = format!(
             "tmp.{}.{}",
             std::process::id(),
@@ -157,8 +187,24 @@ impl Storage {
                 .subsec_nanos()
         );
         let temp_path = path.with_extension(unique_suffix);
-        let mut file = File::create(&temp_path)
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        if let Some(mode) = unix_mode {
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = unix_mode;
+        let mut file = options
+            .open(&temp_path)
             .with_context(|| format!("Failed to create temp file {:?}", temp_path))?;
+        #[cfg(unix)]
+        if let Some(mode) = unix_mode {
+            // `open(mode)` is filtered through the process umask. Tighten or
+            // restore the exact owner-only mode before writing any content.
+            file.set_permissions(fs::Permissions::from_mode(mode))
+                .with_context(|| format!("Failed to restrict temp file {:?}", temp_path))?;
+        }
         file.write_all(content)
             .with_context(|| format!("Failed to write temp file {:?}", temp_path))?;
         file.sync_all()

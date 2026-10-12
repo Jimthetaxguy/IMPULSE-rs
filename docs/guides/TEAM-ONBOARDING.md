@@ -1,5 +1,5 @@
 ---
-status: active
+status: superseded
 phase: all
 audience: contributor
 tags: [guide, onboarding, team]
@@ -7,6 +7,10 @@ last_updated: 2026-02-20
 ---
 
 # Team Onboarding Guide
+
+> **Historical SWARM/TypeScript onboarding — superseded.** New contributors should start with
+> [`../../README.md`](../../README.md), [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md), and
+> [`COLLABORATIVE-AGENTIC-CODING.md`](COLLABORATIVE-AGENTIC-CODING.md).
 
 > **Version:** 1.0 | **Status:** Ready | **Updated:** 2026-02-20
 > **Estimated Duration:** 2-3 days | **Target Audience:** New developers

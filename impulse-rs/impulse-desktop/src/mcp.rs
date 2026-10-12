@@ -1382,4 +1382,43 @@ mod tests {
             .is_some_and(|message| message.contains("unknown agent platform")));
         assert!(context.runtime().snapshot_agents().is_empty());
     }
+
+    #[test]
+    fn test_mcp_governed_spawn_rejects_assignment_without_task_via_runtime_gate() {
+        let registry = McpToolRegistry::with_builtins();
+        let context = ctx();
+        let result = registry.invoke(
+            "impulse.agent_spawn",
+            Some("supervisor".to_string()),
+            json!({
+                "agent_id": "mcp-task-required",
+                "platform": "missing-agent",
+                "command": "definitely-not-an-impulse-executable",
+                "rows": 24,
+                "cols": 80,
+                "role_assignment": {
+                    "role": "builder",
+                    "requirements": [{
+                        "capability": "workspace.target",
+                        "minimum_enforcement": "mediated",
+                        "mandatory": true
+                    }]
+                }
+            }),
+            true,
+            &context,
+        );
+
+        assert!(
+            matches!(result, Err(McpError::Tool { message, .. }) if message.contains("role assignment requires a nonblank task")),
+            "MCP spawn must expose the authoritative runtime task gate"
+        );
+        let audit = registry.audit_for("supervisor");
+        assert_eq!(audit.len(), 1);
+        assert!(!audit[0].ok);
+        assert!(audit[0].result["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("role assignment requires a nonblank task")));
+        assert!(context.runtime().snapshot_agents().is_empty());
+    }
 }

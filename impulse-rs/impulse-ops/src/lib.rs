@@ -6,9 +6,26 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod agent_registry;
+pub mod governed_task;
+pub mod governed_wiring;
+pub mod memory_candidate;
+/// ADR-0020 promotion/dismissal wire contract (request types only).
+pub mod memory_wiring;
+pub mod operator_capability;
+pub mod role_assignment;
 
 /// Shared daemon protocol version for GUI/operator workbench compatibility.
 pub const DAEMON_PROTOCOL_VERSION: u32 = 3;
+///
+/// v7 (ADR-0018) adds the connection-scoped `PresentOperatorCapability`
+/// request and the operator-class requirement on `RecordOperatorDecision`.
+/// v8 (ADR-0019) adds the staged-worktree and promotion mutations plus the
+/// `world_scope` registration field.
+/// v9 (this lane) adds the `PromoteGovernedOutcome` and
+/// `DiscardGovernedStagedWorktree` requests, staged materialization inside
+/// `RegisterGovernedTask`, and the flattened producer acknowledgements that
+/// carry `replayed` plus a reservation's `pending_rerun_reason`.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
@@ -25,6 +42,12 @@ pub enum OpsError {
 pub enum WorkbenchDaemonRequest {
     Ping,
     Status,
+    /// Present this daemon run's operator capability (ADR-0018).
+    ///
+    /// Connection-scoped: an operator surface sends it once immediately after
+    /// connecting, before any request that mints acceptance. Governed panes
+    /// never receive the capability, so a launched runtime cannot send this.
+    PresentOperatorCapability(crate::operator_capability::OperatorCapabilityPresentation),
     ListSessions,
     CreateSession {
         name: String,
@@ -65,6 +88,37 @@ pub enum WorkbenchDaemonRequest {
         action_id: String,
         #[serde(default)]
         params: serde_json::Value,
+    },
+    RegisterGovernedTask {
+        registration: governed_task::GovernedTaskRegistration,
+    },
+    GetGovernedTask {
+        project_id: String,
+        task_id: governed_task::GovernedTaskId,
+    },
+    ListGovernedTasks {
+        project_id: String,
+    },
+    MutateGovernedTask {
+        request: governed_task::GovernedTaskMutationRequest,
+    },
+    SubmitGovernedClaim {
+        request: governed_task::GovernedClaimRequest,
+    },
+    RunGovernedVerification {
+        request: governed_task::GovernedVerificationRequest,
+    },
+    RunGovernedSupervisorReview {
+        request: governed_task::GovernedSupervisorReviewRequest,
+    },
+    /// Fast-forward the canonical branch onto an accepted staged outcome
+    /// (ADR-0019). Operator-class only.
+    PromoteGovernedOutcome {
+        request: governed_wiring::GovernedPromotionRequest,
+    },
+    /// Reclaim a finished staged worktree (ADR-0019). Operator-class only.
+    DiscardGovernedStagedWorktree {
+        request: governed_wiring::GovernedStagedWorktreeDiscardRequest,
     },
     GuardList,
     GetConflictHistory,
@@ -608,7 +662,10 @@ impl AgentStatus {
     }
 }
 
-/// Role of an agent in a coordinator/worker delegation pattern.
+/// Legacy topology role in a coordinator/worker delegation pattern.
+///
+/// This is intentionally distinct from [`role_assignment::AgentRoleId`], which
+/// identifies an open product-role contract independent of pane topology.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentRole {
@@ -678,6 +735,12 @@ pub struct AgentRuntime {
     pub label: String,
     pub backend_kind: String,
     pub session_id: Option<String>,
+    /// Durable daemon-owned task identity, distinct from agent/session routing ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governed_task_id: Option<governed_task::GovernedTaskId>,
+    /// Last daemon lifecycle revision observed by this runtime surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub governed_task_revision: Option<u64>,
     #[serde(default)]
     pub ephemeral: bool,
     pub working_directory: String,
@@ -694,6 +757,12 @@ pub struct AgentRuntime {
     /// Role in coordinator/worker pattern.
     #[serde(default)]
     pub role: Option<AgentRole>,
+    /// Explicit product-role contract assigned to this agent runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_assignment: Option<role_assignment::AgentRoleAssignment>,
+    /// Runtime capability evaluation captured for the product-role assignment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_compatibility: Option<role_assignment::RoleCompatibility>,
     /// Grouping label for agent pool display.
     #[serde(default)]
     pub group: Option<String>,
@@ -833,6 +902,13 @@ pub struct ProjectOpsSnapshot {
     /// Active and recent delegations for the agent pool view.
     #[serde(default)]
     pub delegations: Vec<DelegationSummary>,
+    /// Daemon-owned governed task truth. Legacy snapshots omit this field.
+    #[serde(default)]
+    pub governed_tasks: Vec<governed_task::GovernedTaskSnapshot>,
+    /// Review-only semantic proposals derived from accepted governed runs.
+    /// Legacy protocol payloads omit this field.
+    #[serde(default)]
+    pub memory_candidates: Vec<memory_candidate::AcceptedRunMemoryCandidate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

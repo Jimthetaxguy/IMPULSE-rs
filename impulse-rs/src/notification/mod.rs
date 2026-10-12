@@ -163,11 +163,7 @@ impl NotificationEvent {
             NotificationEvent::ToolUsed { agent_id, .. } => Some(agent_id),
             NotificationEvent::AgentError { agent_id, .. } => Some(agent_id),
             NotificationEvent::ContextInjected { agent_id, .. } => Some(agent_id),
-            NotificationEvent::AgentHandoff {
-                from_agent,
-                to_agent: _,
-                ..
-            } => Some(from_agent.as_str()),
+            NotificationEvent::AgentHandoff { from_agent, .. } => Some(from_agent.as_str()),
             NotificationEvent::MultiAgentDetected { .. } => None,
             NotificationEvent::AgentBecameActive { agent_id, .. } => Some(agent_id),
             NotificationEvent::AgentBecameIdle { agent_id, .. } => Some(agent_id),

@@ -5,7 +5,7 @@ version: '0.1'
 updated: 2026-06-30
 type: research
 category: architecture
-status: approved-for-planning
+status: accepted
 tags: [rosa, sites-map, maplibre, provenance, phase1, globe]
 ---
 

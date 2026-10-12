@@ -16,6 +16,7 @@ authors:
 > Collaboration playbook: [`docs/guides/COLLABORATIVE-AGENTIC-CODING.md`](docs/guides/COLLABORATIVE-AGENTIC-CODING.md)
 > Canonical stack: Rust (impulse-rs)
 > Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
+> Roadmap contract: Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 
 ---
 
@@ -41,17 +42,19 @@ Memory is one first-class service, not the whole product. Impulse also owns proc
 ---
 
 ## Desktop Shell Status (as of 2026-07-12)
+## Desktop Shell Status (as of 2026-08-17)
 
-> **egui / impulse-gui is LEGACY.** It is frozen — no new features. It will be removed after the Dioxus desktop host reaches parity.
+> **egui / impulse-gui is LEGACY.** It is frozen — no new features. The active retirement plan removes it as dead product code after release automation is made truthful; it is not treated as a functional fallback.
 
 The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. It is the cockpit, not the source of operational truth: authoritative workbench state and policy live in Rust daemon/control-plane contracts. Tauri-shaped code is retained only as a temporary compatibility adapter.
+The chosen desktop stack is **Dioxus Desktop + xterm.js terminal bridge**. It is the cockpit, not the source of operational truth: authoritative workbench state and policy live in Rust daemon/control-plane contracts. Tauri-shaped code is a separate temporary compatibility adapter and remains until a packaged Dioxus app proves the real host bridge and required operator workflows end to end.
 
 - See `docs/spec/DESKTOP-SHELL-ARCHITECTURE.md` for canonical layer boundaries
 - See `docs/spec/DESKTOP-STACK-TRADEOFFS.md` for the full option evaluation
 - See `docs/decisions/0008-dioxus-desktop-host.md` for the active ADR
 - See `docs/decisions/0007-desktop-shell-stack.md` for the superseded Tauri-era ADR
 - See `docs/plans/TAURI-DIOXUS-MIGRATION-HANDOFF.md` for historical migration context; do not use it as the next product goal
-- See `docs/plans/EGUI-DECOMMISSION.md` for the active, gated plan to fully remove the egui surface (frozen `impulse-gui` crate + `impulse-term` egui rendering layer) once the Dioxus host is operationally authoritative
+- See `docs/plans/EGUI-DECOMMISSION.md` for the active retirement plan: remove EGUI, remove unwired affordances from retained shells, then retire Tauri compatibility after packaged Dioxus acceptance
 
 **Do not add new code to `impulse-gui`.** If you touch `impulse-term`, keep new PTY/process behavior framework-neutral and do not expand its optional egui rendering surface.
 
@@ -106,6 +109,10 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 
 **Live versus direction:**
 - Live foundations include PTY lifecycle, daemon-owned workbench truth and telemetry, registry-driven desktop platform identity, Ion as a launchable platform, capability-checked tool registries, supervisor-specific permission policy, and reviewable artifacts.
+- Live foundations include PTY lifecycle, daemon-owned workbench truth and telemetry, registry-driven desktop platform identity, Ion as a launchable platform, capability-checked tool registries, supervisor-specific permission policy, reviewable artifacts, and the profiled governed-task producer lifecycle. A profiled Builder launch records exact acceptance criteria and a daemon-attested clean Git `HEAD`; the daemon derives claims, runs fixed detached Rust verification, and requests strict API-only Supervisor review. Only an operator decision can accept a governed task; process exit and model recommendation never do.
+- `rust_workspace_v1` runs host-trusted Rust code in a detached Git worktree with scrubbed environment, timeouts, output digests, and process-group cleanup. It is not an OS sandbox. Dioxus exposes operator-only Promote and Discard controls (ADR-0019) and still renders evidence plus terminal command guidance for claim, verify, and review — `"$IMPULSE_CONTROL_CLI" --daemon governed-claim` / `governed-verify` / `governed-review` — which remain CLI-driven. The packaged executable is `impulse-rs`; `--daemon` is a required global flag before every governed producer subcommand.
+- Persisted receipts and the per-task lock cover replay/concurrency. Durable `PRODUCER_RESERVATIONS.json` entries now wrap verification, Supervisor review, and ADR-0019 staged-worktree promotion: the side effect and its governed-task receipt are both inside `with_reservation`. Interrupted attempts are reconciled to `NeedsRerun`; the journal does not provide arbitrary side-effect rollback or exactly-once execution, and a panic leaves the reservation open until reconciliation. See `impulse-rs/src/daemon/governed_wiring.rs` and `impulse-rs/src/state/producer_reservation.rs`.
+- ADR-0020's implemented state and request-type contracts add status-preserving candidate promotion/dismissal, the promoted-record log (`MEMORY.jsonl`), and its separate `GENOME_PROJECTION.md`. Its daemon decision endpoint, Dioxus Memory Promote/Dismiss controls, and Ion memory integration remain deferred; this is distinct from the live ADR-0019 staged-worktree controls. `GENOME.md` stays hand-curated. ADR-0020 remains recorded as `review`; implementation facts do not ratify the proposal.
 - A general `RoleContract`, common runtime-adapter trait, and capability-negotiation contract are product direction, not implemented facts. Do not claim every runtime is structurally governed.
 
 **Data in `.impulse/`:**
@@ -116,6 +123,9 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 | `GENOME.md` | Decisions & preferences | Committed |
 | `LIVE_STATE.json` | Active session state | Ephemeral |
 | `config.json` | Configuration | Committed |
+| `GOVERNED_TASKS.json` | Governed task records + idempotency receipts | Durable local control-plane state |
+| `PRODUCER_RESERVATIONS.json` | Producer side-effect intent, receipt references, and interrupted-attempt recovery | Durable local recovery state |
+| `DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json` | Ambiguous launch/exit mutations awaiting daemon reconciliation | Durable local recovery state |
 | `retrieval.db` | Search index | Rebuildable |
 
 ---
@@ -160,11 +170,21 @@ cargo fmt --all -- --check
 ```
 
 **Expected canonical checkout (2026-07-12 projection):** 1,948 tests passed, 0 failed, 9 ignored. The verified isolated aggregate worktree reports 1,947 passed with `test_reconciled_clean_archive_has_contracts_snapshot` explicitly filtered; the canonical count restores that one checkout-relative proof. Update counts in this file, CLAUDE.md, and RUST-CANONICAL-CONTRACT.md when they change.
+**Final-gate evidence:** Do not rely on a checked-in aggregate test count. Run the complete gate on
+the current checkout and record passed, ignored, and failed totals in the commit/PR evidence.
+Default tests must use tracked source/fixtures and remain portable across fresh clones, linked
+worktrees, and CI.
 
 ### Code Requirements
 
 1. New modules need unit tests in a `mod tests` block — not just one happy-path test
-2. New CLI commands go in `src/main.rs` with clap derive
+2. New CLI commands are declared as `clap::Subcommand` variants of `Commands` in
+   `impulse-rs/src/cli.rs` (`main.rs` is a thin entrypoint: it only calls `cli::Cli::parse()` and
+   dispatches). The handler is shared, not duplicated per execution mode: `direct_dispatch.rs` and
+   `daemon_dispatch.rs` both match on the same `cli::Commands` variant, routing daemon-only
+   commands to an explicit direct-mode refusal rather than a second implementation; a command also
+   exposed from the `ion` binary (`src/bin/ion.rs`) needs a matching variant on `ion`'s own
+   minimal `IonCommand` enum whose handler still calls the ONE shared function in `handlers::`.
 3. New dynamic tools implement the `DynamicTool` trait in `src/tooling/`
 4. File operations must use atomic writes (temp + rename)
 5. Error handling must use `Result<T>` — never `unwrap()` on user-facing paths
@@ -213,6 +233,9 @@ it before presenting it as current. `docs/spec/TEST-TRACEABILITY.md` owns the cu
 gap assessment.
 
 **Workspace totals (2026-07-12 canonical projection):** 1,948 tests across the 5 workspace crates/packages (impulse-rs: 1,574, ops: 44 including the canonical-checkout archive proof, term: 114, desktop: 193, ion: 23), with 9 ignored and 0 failed. The verified isolated worktree reports 1,947 passed because that one archive proof is filtered. The legacy impulse-gui crate is frozen/excluded from the workspace and its 252 passing tests are not counted.
+**Workspace totals:** Derive totals from the final `cargo test --workspace` run rather than a static
+projection. The legacy `impulse-gui` crate is frozen and excluded from the canonical workspace gate;
+verify it separately only when legacy compile-maintenance changes require it.
 
 High-risk coverage priorities (despite substantial source-local unit coverage):
 - End-to-end parity between `daemon_dispatch` and `direct_dispatch` for every stable command.

@@ -3,7 +3,7 @@ name = "impulse-ion"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
-description = "Ion harness contract v0 — transport-agnostic HarnessRequest/HarnessResponse types"
+description = "Transport-agnostic contracts and process adapter for the Impulse-native Ion runtime"
 license = "MIT"
 
 [dependencies]

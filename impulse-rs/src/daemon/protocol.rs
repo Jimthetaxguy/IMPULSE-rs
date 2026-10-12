@@ -13,11 +13,18 @@ pub const PROTOCOL_VERSION: u32 = impulse_ops::DAEMON_PROTOCOL_VERSION;
 
 pub(crate) const SOCKET_NAME: &str = "impulse.sock";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum DaemonRequest {
     Ping,
     Status,
+    /// Present this daemon run's operator capability (ADR-0018).
+    ///
+    /// Connection-scoped: a successful presentation raises *this* connection to
+    /// operator class and has no effect on any other connection. Requests that
+    /// mint acceptance (`MutateGovernedTask` with `RecordOperatorDecision`, and
+    /// the lifecycle marks of a profiled task) are rejected without it.
+    PresentOperatorCapability(impulse_ops::operator_capability::OperatorCapabilityPresentation),
     CreateSession {
         name: String,
         platform: Option<String>,
@@ -106,6 +113,40 @@ pub enum DaemonRequest {
         action_id: String,
         #[serde(default)]
         params: serde_json::Value,
+    },
+    RegisterGovernedTask {
+        registration: impulse_ops::governed_task::GovernedTaskRegistration,
+    },
+    GetGovernedTask {
+        project_id: String,
+        task_id: impulse_ops::governed_task::GovernedTaskId,
+    },
+    ListGovernedTasks {
+        project_id: String,
+    },
+    MutateGovernedTask {
+        request: impulse_ops::governed_task::GovernedTaskMutationRequest,
+    },
+    SubmitGovernedClaim {
+        request: impulse_ops::governed_task::GovernedClaimRequest,
+    },
+    RunGovernedVerification {
+        request: impulse_ops::governed_task::GovernedVerificationRequest,
+    },
+    RunGovernedSupervisorReview {
+        request: impulse_ops::governed_task::GovernedSupervisorReviewRequest,
+    },
+    /// Fast-forward the canonical branch onto an accepted staged outcome
+    /// (ADR-0019). Operator-class only: this is the step that makes a
+    /// Builder's work canonical. A blocked promotion is a successful response
+    /// carrying the typed outcome, not an error.
+    PromoteGovernedOutcome {
+        request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+    },
+    /// Reclaim a finished staged worktree (ADR-0019). Operator-class only: it
+    /// destroys work.
+    DiscardGovernedStagedWorktree {
+        request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
     },
     /// Request AI coordination assistance via the Impulse Agent.
     /// When `insights` is provided, they are formatted into a structured
@@ -246,6 +287,7 @@ pub(crate) fn request_type_name(req: &DaemonRequest) -> &'static str {
     match req {
         DaemonRequest::Ping => "Ping",
         DaemonRequest::Status => "Status",
+        DaemonRequest::PresentOperatorCapability(_) => "PresentOperatorCapability",
         DaemonRequest::CreateSession { .. } => "CreateSession",
         DaemonRequest::EndSession { .. } => "EndSession",
         DaemonRequest::TrackFile { .. } => "TrackFile",
@@ -269,6 +311,15 @@ pub(crate) fn request_type_name(req: &DaemonRequest) -> &'static str {
         DaemonRequest::ListArtifacts { .. } => "ListArtifacts",
         DaemonRequest::GetArtifact { .. } => "GetArtifact",
         DaemonRequest::RunArtifactAction { .. } => "RunArtifactAction",
+        DaemonRequest::RegisterGovernedTask { .. } => "RegisterGovernedTask",
+        DaemonRequest::GetGovernedTask { .. } => "GetGovernedTask",
+        DaemonRequest::ListGovernedTasks { .. } => "ListGovernedTasks",
+        DaemonRequest::MutateGovernedTask { .. } => "MutateGovernedTask",
+        DaemonRequest::SubmitGovernedClaim { .. } => "SubmitGovernedClaim",
+        DaemonRequest::RunGovernedVerification { .. } => "RunGovernedVerification",
+        DaemonRequest::RunGovernedSupervisorReview { .. } => "RunGovernedSupervisorReview",
+        DaemonRequest::PromoteGovernedOutcome { .. } => "PromoteGovernedOutcome",
+        DaemonRequest::DiscardGovernedStagedWorktree { .. } => "DiscardGovernedStagedWorktree",
         DaemonRequest::AgentAssist { .. } => "AgentAssist",
         DaemonRequest::GuardEvaluate { .. } => "GuardEvaluate",
         DaemonRequest::GuardList => "GuardList",
@@ -297,6 +348,40 @@ mod tests {
     #[test]
     fn test_protocol_version_is_three() {
         assert_eq!(PROTOCOL_VERSION, 3);
+    fn test_protocol_version_is_nine() {
+        // v7 (ADR-0018) adds PresentOperatorCapability and the operator-class
+        // requirement on RecordOperatorDecision. v8 (ADR-0019) adds the
+        // staged-worktree world scope: the MaterializeStagedWorktree /
+        // DiscardStagedWorktree / RecordPromotion mutations and the promotion
+        // outcome they carry. v9 makes those reachable over the socket:
+        // PromoteGovernedOutcome, DiscardGovernedStagedWorktree, staged
+        // materialization inside RegisterGovernedTask, and the flattened
+        // producer acknowledgements carrying `replayed` plus a reservation's
+        // `pending_rerun_reason`.
+        assert_eq!(PROTOCOL_VERSION, 9);
+    }
+
+    #[test]
+    fn test_present_operator_capability_round_trips_and_never_leaks_into_the_type_name() {
+        let request = DaemonRequest::PresentOperatorCapability(
+            impulse_ops::operator_capability::OperatorCapabilityPresentation {
+                token: "a".repeat(64),
+            },
+        );
+        let json = serde_json::to_string(&request).unwrap();
+        // The newtype variant keeps the struct-variant wire shape exactly.
+        assert!(json.contains(r#""data":{"token":"#));
+        let parsed: DaemonRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            DaemonRequest::PresentOperatorCapability(ref presentation)
+                if presentation.token == "a".repeat(64)
+        ));
+        assert_eq!(
+            request_type_name(&request),
+            "PresentOperatorCapability",
+            "the traced request name must never carry the token"
+        );
     }
 
     // ── request_type_name ───────────────────────────────────────────────
@@ -756,6 +841,9 @@ mod tests {
         match request {
             impulse_ops::WorkbenchDaemonRequest::Ping => "Ping",
             impulse_ops::WorkbenchDaemonRequest::Status => "Status",
+            impulse_ops::WorkbenchDaemonRequest::PresentOperatorCapability(_) => {
+                "PresentOperatorCapability"
+            }
             impulse_ops::WorkbenchDaemonRequest::ListSessions => "ListSessions",
             impulse_ops::WorkbenchDaemonRequest::CreateSession { .. } => "CreateSession",
             impulse_ops::WorkbenchDaemonRequest::EndSession { .. } => "EndSession",
@@ -773,6 +861,27 @@ mod tests {
                 "RunSupervisorAction"
             }
             impulse_ops::WorkbenchDaemonRequest::RunArtifactAction { .. } => "RunArtifactAction",
+            impulse_ops::WorkbenchDaemonRequest::RegisterGovernedTask { .. } => {
+                "RegisterGovernedTask"
+            }
+            impulse_ops::WorkbenchDaemonRequest::GetGovernedTask { .. } => "GetGovernedTask",
+            impulse_ops::WorkbenchDaemonRequest::ListGovernedTasks { .. } => "ListGovernedTasks",
+            impulse_ops::WorkbenchDaemonRequest::MutateGovernedTask { .. } => "MutateGovernedTask",
+            impulse_ops::WorkbenchDaemonRequest::SubmitGovernedClaim { .. } => {
+                "SubmitGovernedClaim"
+            }
+            impulse_ops::WorkbenchDaemonRequest::RunGovernedVerification { .. } => {
+                "RunGovernedVerification"
+            }
+            impulse_ops::WorkbenchDaemonRequest::RunGovernedSupervisorReview { .. } => {
+                "RunGovernedSupervisorReview"
+            }
+            impulse_ops::WorkbenchDaemonRequest::PromoteGovernedOutcome { .. } => {
+                "PromoteGovernedOutcome"
+            }
+            impulse_ops::WorkbenchDaemonRequest::DiscardGovernedStagedWorktree { .. } => {
+                "DiscardGovernedStagedWorktree"
+            }
             impulse_ops::WorkbenchDaemonRequest::GuardList => "GuardList",
             impulse_ops::WorkbenchDaemonRequest::GetConflictHistory => "GetConflictHistory",
             impulse_ops::WorkbenchDaemonRequest::ClearResolvedConflicts => "ClearResolvedConflicts",
@@ -834,6 +943,111 @@ mod tests {
             action_id: "review".into(),
             params: serde_json::json!({}),
         });
+        let registration = impulse_ops::governed_task::GovernedTaskRegistration::builder(
+            "request-1",
+            "task-1",
+            "demo",
+            "/tmp/demo",
+            "prove governed lifecycle",
+            "agent-1",
+            "codex",
+        )
+        .build()
+        .unwrap();
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::RegisterGovernedTask { registration },
+        );
+        let task_id = impulse_ops::governed_task::GovernedTaskId::try_new("task-1").unwrap();
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::GetGovernedTask {
+            project_id: "demo".into(),
+            task_id: task_id.clone(),
+        });
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::ListGovernedTasks {
+            project_id: "demo".into(),
+        });
+        assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::MutateGovernedTask {
+            request: impulse_ops::governed_task::GovernedTaskMutationRequest {
+                request_id: impulse_ops::governed_task::GovernedRequestId::try_new("request-2")
+                    .unwrap(),
+                project_id: "demo".into(),
+                task_id,
+                expected_revision: 0,
+                mutation: impulse_ops::governed_task::GovernedTaskMutation::MarkRunning {
+                    actor: impulse_ops::governed_task::GovernedActor {
+                        kind: impulse_ops::governed_task::GovernedActorKind::System,
+                        id: "desktop".into(),
+                    },
+                },
+            },
+        });
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::SubmitGovernedClaim {
+                request: impulse_ops::governed_task::GovernedClaimRequest {
+                    request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                        "request-claim",
+                    )
+                    .unwrap(),
+                    project_id: "demo".into(),
+                    task_id: impulse_ops::governed_task::GovernedTaskId::try_new("task-1").unwrap(),
+                    expected_revision: 1,
+                    summary: "done".into(),
+                    artifact_ids: Vec::new(),
+                },
+            },
+        );
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::RunGovernedVerification {
+                request: impulse_ops::governed_task::GovernedVerificationRequest {
+                    request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                        "request-verify",
+                    )
+                    .unwrap(),
+                    project_id: "demo".into(),
+                    task_id: impulse_ops::governed_task::GovernedTaskId::try_new("task-1").unwrap(),
+                    expected_revision: 2,
+                },
+            },
+        );
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::RunGovernedSupervisorReview {
+                request: impulse_ops::governed_task::GovernedSupervisorReviewRequest {
+                    request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                        "request-review",
+                    )
+                    .unwrap(),
+                    project_id: "demo".into(),
+                    task_id: impulse_ops::governed_task::GovernedTaskId::try_new("task-1").unwrap(),
+                    expected_revision: 3,
+                },
+            },
+        );
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::PromoteGovernedOutcome {
+                request: impulse_ops::governed_wiring::GovernedPromotionRequest {
+                    request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                        "request-promote",
+                    )
+                    .unwrap(),
+                    project_id: "demo".into(),
+                    task_id: impulse_ops::governed_task::GovernedTaskId::try_new("task-1").unwrap(),
+                    expected_revision: 4,
+                },
+            },
+        );
+        assert_shared_request_compatible(
+            impulse_ops::WorkbenchDaemonRequest::DiscardGovernedStagedWorktree {
+                request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                    request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
+                        "request-discard",
+                    )
+                    .unwrap(),
+                    project_id: "demo".into(),
+                    task_id: impulse_ops::governed_task::GovernedTaskId::try_new("task-1").unwrap(),
+                    expected_revision: 5,
+                    reason: "the run was rejected".into(),
+                },
+            },
+        );
         assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::GuardList);
         assert_shared_request_compatible(impulse_ops::WorkbenchDaemonRequest::GetConflictHistory);
         assert_shared_request_compatible(

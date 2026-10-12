@@ -1,22 +1,30 @@
 ---
 title: Front Matter Schema
 description: YAML front matter schema for Impulse documentation
-version: '1.0'
-updated: 2026-02-23
+version: '1.1'
+updated: 2026-07-12
 type: schema
+status: active
 ---
 
 # Front Matter Schema
 
 This document defines the standard YAML front matter for all Impulse documentation files.
 
-## Required Fields
+## Recommended Active-Document Fields
+
+The validator accepts partial front matter so point-in-time and legacy records remain readable.
+New or actively maintained documents should carry these fields:
 
 | Field         | Type   | Description                      |
 | ------------- | ------ | -------------------------------- |
 | `title`       | string | Document title                   |
 | `description` | string | Brief description (50-200 chars) |
 | `updated`     | date   | Last update date (YYYY-MM-DD)    |
+
+Living guides, specifications, schemas, and references are checked for staleness. Point-in-time
+ADRs, research, vision records, phase records, and documents with non-authoritative status are
+exempt; do not date-bump them merely to silence validation.
 
 ## Optional Fields
 
@@ -44,6 +52,7 @@ type:
   - metadata # Metadata/navigation
   - schema # Schema definition
   - doc # General document
+  - reference # Durable reference material
 ```
 
 ## Phase Enum
@@ -51,9 +60,11 @@ type:
 ```yaml
 phase:
   - phase1 # Core infrastructure
+  - phase1.5 # Coordination-era records
   - phase2 # Persistence
   - phase3 # Semantic search
   - all # Cross-phase
+  - historical # Historical-only material
 ```
 
 ## Status Enum
@@ -65,6 +76,9 @@ status:
   - active # Currently used
   - deprecated # No longer maintained
   - complete # Finished
+  - superseded # Replaced by a newer authority
+  - archive # Retained for provenance only
+  - accepted # Accepted decision or research outcome
 ```
 
 ## Example: Complete Front Matter
@@ -104,16 +118,16 @@ updated: 2026-02-23
 Use this schema to validate front matter in documentation files:
 
 ```bash
-# Check all docs have valid front matter
-grep -L "^---" docs/**/*.md
+# Metadata, links, freshness, and product-contract drift
+python3 docs/validate_docs.py --all
 
-# Extract and validate YAML
-python3 -c "import yaml; yaml.safe_load(open('docs/example.md').read())"
+# Machine-readable output (same validation result)
+python3 docs/validate_docs.py --all --json
 ```
 
 ## Quick Reference
 
-| Document             | Required Fields                                                                              | Typical Type     |
+| Document             | Recommended Fields                                                                           | Typical Type     |
 | -------------------- | -------------------------------------------------------------------------------------------- | ---------------- |
 | AGENTS.md            | title, description, version, updated, type, category, phase, status, tags, audience, authors | agent_guidelines |
 | INDEX.md             | title, description, updated, status, phase, audience, tags                                   | doc              |

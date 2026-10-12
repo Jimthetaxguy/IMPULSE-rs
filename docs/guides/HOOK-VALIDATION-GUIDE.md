@@ -1,20 +1,20 @@
 ---
 title: Hook Validation Guide
 description: Prove the real Claude Code memory loop before trusting higher-level GUI behavior
-version: '1.0'
-updated: 2026-03-05
+version: '1.1'
+updated: 2026-07-12
 type: guide
 category: validation
 phase: all
 status: active
 audience: builder
 tags: [hooks, validation, claude-code, memory-loop]
-last_updated: 2026-03-05
+last_updated: 2026-07-12
 ---
 
 # Hook Validation Guide
 
-Impulse should not claim cross-session memory works until the real Claude hook loop is proven with evidence.
+Impulse should not claim cross-session memory works until the real Claude hook loop is proven with evidence. This is a focused validation lane for one shared platform service; it is not the whole-product roadmap or a substitute for the governed supervisor/builder slice.
 
 ## Goal
 

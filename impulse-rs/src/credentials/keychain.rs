@@ -22,6 +22,7 @@ use crate::credentials::{CredentialError, CredentialProviderType, CredentialStat
 static KEYCHAIN_INTERACTION_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct KeychainProvider {
+    #[cfg(target_os = "macos")]
     service_name: String,
 }
 
@@ -90,6 +91,7 @@ fn with_noninteractive_keychain<T>(
 impl KeychainProvider {
     pub fn new() -> Self {
         Self {
+            #[cfg(target_os = "macos")]
             service_name: "com.impulse-rs".to_string(),
         }
     }

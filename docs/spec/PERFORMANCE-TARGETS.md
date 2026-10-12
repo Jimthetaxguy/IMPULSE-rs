@@ -1,5 +1,5 @@
 ---
-status: active
+status: superseded
 phase: 1-2
 audience: builder
 tags: [spec, performance, benchmarks]
@@ -7,6 +7,10 @@ last_updated: 2026-02-20
 ---
 
 # Performance Targets: Impulse Plugin
+
+> **Historical reference — superseded.** These hook/plugin budgets do not define the current Rust
+> control plane. Use [`RUST-CANONICAL-CONTRACT.md`](RUST-CANONICAL-CONTRACT.md) for implemented
+> boundaries; new control-plane budgets require measured baselines and an explicit contract update.
 
 > **Version:** 1.0 | **Updated:** 2026-02-20
 > **Principle:** The plugin must be invisible. Any latency the developer can feel is a bug.

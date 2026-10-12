@@ -1,5 +1,5 @@
 ---
-status: active
+status: superseded
 phase: 1
 audience: builder
 tags: [guide, security, review]
@@ -7,6 +7,10 @@ last_updated: 2026-02-20
 ---
 
 # Security Review: Impulse Plugin
+
+> **Historical TypeScript/Bun review — superseded.** Retained for threat-model provenance, not as
+> an audit of the current Rust control plane. Start with
+> [`../ARCHITECTURE-CLARIFICATION.md`](../ARCHITECTURE-CLARIFICATION.md) and the live Rust tests.
 
 > **Version:** 1.0 | **Status:** Complete | **Updated:** 2026-02-20
 > **Scope:** All 4 hooks, file operations, LLM extraction prompt

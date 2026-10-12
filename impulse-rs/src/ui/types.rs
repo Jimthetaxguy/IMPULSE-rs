@@ -146,6 +146,7 @@ impl TuiState {
                 c.impulse_agent_api_key.as_deref(),
                 c.impulse_agent_model.as_deref(),
                 c.impulse_agent_harness.as_deref(),
+                c.impulse_agent_escalate_model.as_deref(),
             )
         });
 

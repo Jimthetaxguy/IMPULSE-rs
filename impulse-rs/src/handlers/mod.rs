@@ -17,6 +17,7 @@ pub mod describe;
 pub mod direct_dispatch;
 pub mod guard;
 pub mod injection_handlers;
+pub mod internal_pdf_text;
 pub mod ion;
 pub mod memory;
 pub mod office;
@@ -27,6 +28,7 @@ pub mod session;
 pub mod stewardship_handlers;
 pub mod system;
 pub mod tooling_handlers;
+pub mod voice_handlers;
 
 // Re-export all shared helpers so existing `use super::X` imports keep working.
 pub(crate) use common::*;

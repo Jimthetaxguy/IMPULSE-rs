@@ -1,9 +1,9 @@
 ---
 title: Desktop Shell Architecture
 status: active
-version: 1.0.0
+version: 1.1.0
 created: 2026-04-15
-updated: 2026-06-14
+updated: 2026-07-15
 ---
 
 # Desktop Shell Architecture
@@ -45,7 +45,7 @@ RUST BACKEND (impulse-desktop / impulse-term)
           | Unix socket / local IPC |
 
 DAEMON (impulse-rs binary)
-  Session lifecycle, context extraction, memory pipeline,
+  Session + governed-task lifecycle, context extraction, memory pipeline,
   agent coordination, snapshot publishing
 ```
 
@@ -75,6 +75,10 @@ DAEMON (impulse-rs binary)
 - Subscribes to host events (`terminal_output`, `ops_update`, etc.) and routes them to the correct xterm.js instance or UI component
 - Sends user actions (keyboard input, resize, tab switch, session commands) as host commands to the backend
 - **Does not hold authoritative state.** All panel data (sessions, context, artifacts, supervisor) is read from daemon snapshots, not from frontend-local shadow copies
+- The governed Builder launcher collects exact acceptance criteria and selects the closed
+  `rust_workspace_v1` profile. Profiled evidence cards show
+  `"$IMPULSE_CONTROL_CLI" --daemon governed-verify` and
+  `"$IMPULSE_CONTROL_CLI" --daemon governed-review`; producer buttons are not part of the current host surface.
 
 ### Terminal Panes (xterm.js)
 
@@ -94,15 +98,22 @@ DAEMON (impulse-rs binary)
 
 - Owns PTY spawn, stdin/stdout, resize (SIGWINCH), env injection, and session lifecycle
 - Exposes `TerminalBackend` and `WriteQueue` as the authoritative PTY interface
-- Has no rendering dependency - the `eframe` dependency must be removed before desktop wiring begins
+- Keeps new PTY/process behavior framework-neutral; the optional egui renderer is frozen legacy
+  compatibility and must not receive new product behavior
 - `backend.rs`, `context.rs`, and session logic are reusable by both the ratatui path and the desktop path
 
 ### impulse-ops / Daemon
 
-- Source of truth for all session, context, artifact, and supervisor state
-- Publishes `ProjectOpsSnapshot` and `TerminalOpsReport` snapshots
+- Source of truth for all session, governed-task, context, artifact, and supervisor state
+- Accepts desktop-authored `TerminalOpsReport` telemetry through `PublishTerminalOps`, overlays it
+  onto durable workbench truth, and returns `ProjectOpsSnapshot`/`OpsSubscription` read models
 - Desktop shell panels read exclusively from daemon state, never from frontend-local shadow state
 - Daemon reconnect must restore desktop shell state cleanly without a full restart
+- Protocol v5 owns profiled claim, detached verification, and strict API Supervisor-review
+  producers. The desktop cannot compose actor, subject, evidence, or verdict payloads for them.
+- Protocol v6 additively exposes deterministic accepted-run candidates through the serde-defaulted
+  `ProjectOpsSnapshot.memory_candidates` read model. The Memory view has no candidate mutation or
+  `GENOME` promotion authority.
 
 ### ratatui (standalone)
 
@@ -152,19 +163,56 @@ Pane container resized (CSS layout change)
 ### Daemon State Path
 
 ```
-Daemon publishes ProjectOpsSnapshot / TerminalOpsReport
-  -> Dioxus host receives via daemon IPC subscription
+Desktop runtime publishes TerminalOpsReport
+  -> daemon overlays fresh terminal telemetry onto durable workbench truth
+  -> SubscribeOps returns ProjectOpsSnapshot / OpsSubscription
+  -> Dioxus host receives the authoritative read model
   -> Backend emits ops_update host event {snapshot}
   -> Dioxus component subscribes to ops_update
   -> Component re-renders from new snapshot
   -> Side panels (context, artifacts, supervisor) update
 ```
 
+### Governed Task Decision Path
+
+```text
+Profiled Builder launch in Dioxus
+  -> exact task + acceptance criteria + rust_workspace_v1
+  -> desktop observes clean canonical Git HEAD
+  -> daemon independently re-attests HEAD and registers before PTY spawn
+  -> desktop injects project/task/socket/control-CLI/profile routing
+
+Builder terminal or Ion tool
+  -> "$IMPULSE_CONTROL_CLI" --daemon governed-claim / governed_submit_claim
+     (summary + artifact ids only)
+  -> daemon derives Worker + clean subject
+  -> "$IMPULSE_CONTROL_CLI" --daemon governed-verify runs fixed Rust commands in a detached checkout
+  -> "$IMPULSE_CONTROL_CLI" --daemon governed-review runs strict tool-free/stateless API Supervisor review
+  -> ops_update renders daemon-owned evidence
+
+Operator action in Dioxus
+  -> governed_task_mutate host command
+  -> acknowledged desktop daemon client
+  -> daemon expected-revision/idempotency transition
+  -> authoritative GovernedTaskRun response + next ops_update
+  -> card re-renders; no optimistic task state
+```
+
 ---
 
-## Terminal Bridge API
+## Terminal and Governed Bridge Subset
 
-This is the full public interface between the Dioxus frontend and the Rust backend. It must stay thin.
+This table documents the terminal, governed-task, and native-island subset used in the data flows
+above. The complete current host-command manifest is `host_commands::HOST_INVOKE_COMMANDS`; it also
+contains the `agent_*`, workspace, MCP, review, and supervisor command families. All host commands
+must remain thin adapters over backend-owned state and policy.
+
+There are intentionally no `governed_verify` or `governed_review` host commands in this table.
+Profiled cards guide the operator to the routed control CLI inside the governed terminal. The
+packaged executable is `impulse-rs`; `$IMPULSE_CONTROL_CLI` retains the exact injected executable
+path, and the global `--daemon` flag must precede the producer subcommand. Adding
+producer buttons requires a separate acknowledged host-command contract; UI-authored automatic
+producer records are forbidden.
 
 ### Commands (frontend -> backend)
 
@@ -175,6 +223,7 @@ This is the full public interface between the Dioxus frontend and the Rust backe
 | `terminal_resize` | `{session_id, cols, rows}` | Resize PTY and parser |
 | `terminal_close` | `{session_id}` | Kill PTY and clean up session |
 | `terminal_focus` | `{session_id}` | Notify backend of focus change |
+| `governed_task_mutate` | `{request: GovernedTaskMutationRequest}` | Apply an acknowledged revisioned task transition and return daemon-owned state |
 | `native_island_request` | `{request_id, kind, payload}` | Invoke a narrow native macOS island and return a serialized result |
 
 ### Events (backend -> frontend)
@@ -194,4 +243,11 @@ This is the full public interface between the Dioxus frontend and the Rust backe
 2. **Panel state comes from daemon, not from terminal scraping.** Context, artifacts, and supervisor panels are populated from `ops_update` snapshots.
 3. **ratatui stays functional.** No migration step should break the standalone ratatui operator surface.
 4. **egui is not extended.** The `impulse-gui` crate receives only compile-maintenance.
-5. **The desktop shell is additive.** Daemon contracts are not changed to serve the desktop.
+5. **The desktop shell does not fork authority.** Shared daemon contracts may evolve for product
+   capabilities such as governed tasks, but desktop-only shadow state or policy is forbidden.
+6. **Task decisions are acknowledged.** The UI waits for daemon-owned state and never treats a
+   terminal exit or optimistic click result as task acceptance.
+7. **Profiled producer truth is daemon-owned.** Dioxus supplies launch criteria and renders results;
+   it never supplies automatic claim actor/subject, command evidence, or Supervisor verdict.
+8. **Verification is host-trusted, not sandboxed.** The detached `rust_workspace_v1` checkout still
+   executes project-authored Rust build scripts, proc macros, and tests on the host.

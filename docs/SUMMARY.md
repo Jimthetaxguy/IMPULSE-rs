@@ -3,6 +3,8 @@ title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
 version: 2.4
 updated: 2026-07-12
+version: 2.8
+updated: 2026-09-26
 schema_version: '1.0'
 ---
 
@@ -13,6 +15,7 @@ schema_version: '1.0'
 | Guide | Description | Start Here |
 | ----- | ----------- | ---------- |
 | [VISION.md](../VISION.md) | Living product north star and complete governed vertical slice | ✅ Yes |
+| [VISION.md](../VISION.md) | Living product north star and target governed vertical slice | ✅ Yes |
 | [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) | Authoritative product contract | ✅ Yes |
 | [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) | Rust-first user stories and acceptance criteria | ✅ Yes |
 | [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) | Current story-to-test coverage map | ✅ Yes |
@@ -25,6 +28,7 @@ schema_version: '1.0'
 ## Active Track
 
 Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
+Roadmap contract: Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 
 `HONEST-ROADMAP.md` is a historical hook/memory validation register, not the current product
 roadmap or whole-product risk authority.
@@ -47,6 +51,7 @@ roadmap or whole-product risk authority.
 ### Next
 
 - [VISION.md](../VISION.md) — governed supervisor/builder slice and hierarchy/enforcement ADR
+- [VISION.md](../VISION.md) — stronger same-user actor authorization, full launched Builder/Supervisor proof, later candidate promotion/dismissal, and remaining hierarchy/enforcement ADRs
 - [spec/USER-STORY-MAP.md](spec/USER-STORY-MAP.md)
 - [spec/TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)
 
@@ -63,8 +68,6 @@ roadmap or whole-product risk authority.
 - [spec/RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md)
 - [spec/USER-STORY-MAP.md](spec/USER-STORY-MAP.md)
 - [spec/TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)
-- [spec/COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md)
-- [spec/PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)
 
 ### Roadmap
 
@@ -99,13 +102,28 @@ roadmap or whole-product risk authority.
 
 ### Guides
 
-- [guides/TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md)
 - [guides/COLLABORATIVE-AGENTIC-CODING.md](guides/COLLABORATIVE-AGENTIC-CODING.md)
-- [guides/BEST-PRACTICES.md](guides/BEST-PRACTICES.md)
-- [guides/ERROR-HANDLING-GUIDE.md](guides/ERROR-HANDLING-GUIDE.md)
-- [guides/DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md)
+- [guides/HOOK-VALIDATION-GUIDE.md](guides/HOOK-VALIDATION-GUIDE.md)
+- [guides/RUST-MULTI-AGENT-PATTERNS.md](guides/RUST-MULTI-AGENT-PATTERNS.md)
+- [FRONTMATTER-SCHEMA.md](FRONTMATTER-SCHEMA.md)
+
+### Historical Reference
+
+- [spec/COMPETITIVE-POSITIONING.md](spec/COMPETITIVE-POSITIONING.md)
+- [spec/PERFORMANCE-TARGETS.md](spec/PERFORMANCE-TARGETS.md)
+- [guides/SECURITY-REVIEW.md](guides/SECURITY-REVIEW.md)
 - [guides/INTEGRATION-COOKBOOK.md](guides/INTEGRATION-COOKBOOK.md)
+- [guides/SYNTHETIC-TESTING-GUIDE.md](guides/SYNTHETIC-TESTING-GUIDE.md)
+- [guides/BEST-PRACTICES.md](guides/BEST-PRACTICES.md)
 - [guides/DEPLOYMENT-FRAMEWORK.md](guides/DEPLOYMENT-FRAMEWORK.md)
+- [guides/TEAM-ONBOARDING.md](guides/TEAM-ONBOARDING.md)
+- [guides/TESTING-STRATEGY-ENHANCEMENTS.md](guides/TESTING-STRATEGY-ENHANCEMENTS.md)
+- [guides/RELEASE-NOTES-TEMPLATE.md](guides/RELEASE-NOTES-TEMPLATE.md)
+- [guides/DATABASE-GUIDE.md](guides/DATABASE-GUIDE.md)
+- [guides/PERFORMANCE-PROFILING.md](guides/PERFORMANCE-PROFILING.md)
+- [guides/CLI-REFERENCE-ENHANCEMENTS.md](guides/CLI-REFERENCE-ENHANCEMENTS.md)
+- [guides/ERROR-HANDLING-GUIDE.md](guides/ERROR-HANDLING-GUIDE.md)
+- [guides/TESTING-FRAMEWORK.md](guides/TESTING-FRAMEWORK.md)
 - [guides/TOOLS-STATUS.md](guides/TOOLS-STATUS.md)
 
 ### Decisions (ADRs)
@@ -120,6 +138,17 @@ roadmap or whole-product risk authority.
 - [decisions/0007-desktop-shell-stack.md](decisions/0007-desktop-shell-stack.md)
 - [decisions/0008-dioxus-desktop-host.md](decisions/0008-dioxus-desktop-host.md)
 - [decisions/0009-reconcile-impulse-copies.md](decisions/0009-reconcile-impulse-copies.md)
+- [decisions/0010-product-role-launch-contract.md](decisions/0010-product-role-launch-contract.md)
+- [decisions/0011-governed-task-run-lifecycle.md](decisions/0011-governed-task-run-lifecycle.md)
+- [decisions/0012-daemon-owned-governed-runtime-producers.md](decisions/0012-daemon-owned-governed-runtime-producers.md)
+- [decisions/0013-deterministic-accepted-run-memory-candidates.md](decisions/0013-deterministic-accepted-run-memory-candidates.md)
+- [decisions/0014-work-item-and-comparative-settlement.md](decisions/0014-work-item-and-comparative-settlement.md)
+- [decisions/0015-harness-owned-step-model.md](decisions/0015-harness-owned-step-model.md)
+- [decisions/0017-canonical-loop-contract.md](decisions/0017-canonical-loop-contract.md)
+- [decisions/0018-socket-actor-provenance.md](decisions/0018-socket-actor-provenance.md)
+- [decisions/0019-builder-staged-worktree-world-scope.md](decisions/0019-builder-staged-worktree-world-scope.md)
+- [decisions/0020-scoped-memory-promotion-and-dismissal.md](decisions/0020-scoped-memory-promotion-and-dismissal.md)
+- [decisions/0021-monty-sandbox-for-calculator-and-python-exec.md](decisions/0021-monty-sandbox-for-calculator-and-python-exec.md)
 
 ### Session Logs
 
@@ -139,6 +168,9 @@ Historical Ralph loop plans now live under `archive/ralph-plans/` and are proven
 | Total Documents | 134 |
 | Categories | 8 |
 | Decisions (ADRs) | 9 |
+| Total Documents | 141 |
+| Categories | 9 |
+| Decisions (ADRs) | 13 |
 | Phases | 3 |
 | Status | Active Development |
 

@@ -6,7 +6,15 @@ use impulse_desktop::{
     AgentPlatformId, AgentSpawnRequest, AgentWriteRequest, DesktopEvent, DesktopEventSink,
     DesktopRuntime, LocalSupervisorAction, SupervisorLocalActionRequest, TerminalCloseRequest,
     TerminalFocusRequest, TerminalResizeRequest, WeakDesktopRuntime, WorkspaceTarget,
+    DesktopRuntime, GovernedRoutingMetadata, GovernedTaskGateway, LocalSupervisorAction,
+    SupervisorLocalActionRequest, TerminalCloseRequest, TerminalFocusRequest,
+    TerminalResizeRequest, WeakDesktopRuntime, WorkspaceTarget,
 };
+use impulse_ops::governed_task::{
+    ApprovalPolicy, GovernedExecutionState, GovernedRequestId, GovernedReviewState, GovernedTaskId,
+    GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration, GovernedTaskRun,
+};
+use impulse_ops::role_assignment::{canonical_governed_builder_assignment, AgentRoleAssignment};
 use serde_json::json;
 
 #[derive(Default)]
@@ -141,7 +149,106 @@ fn shell_spawn(agent_id: &str, script: &str) -> AgentSpawnRequest {
         rows: 24,
         cols: 80,
         role: None,
+        task: None,
+        role_assignment: None,
+        acceptance_criteria: Vec::new(),
+        verification_profile: None,
         target: None,
+    }
+}
+
+fn governed_builder_assignment() -> AgentRoleAssignment {
+    canonical_governed_builder_assignment()
+}
+
+#[derive(Default)]
+struct TestGovernedGateway {
+    tasks: Mutex<HashMap<GovernedTaskId, GovernedTaskRun>>,
+}
+
+impl GovernedTaskGateway for TestGovernedGateway {
+    fn register(&self, registration: GovernedTaskRegistration) -> Result<GovernedTaskRun, String> {
+        let task = GovernedTaskRun {
+            id: registration.task_id,
+            revision: 0,
+            project_id: registration.project_id,
+            workspace_root: registration.workspace_root,
+            task: registration.task,
+            acceptance_criteria: registration.acceptance_criteria,
+            approval_policy: ApprovalPolicy::OperatorRequired,
+            world_scope: Default::default(),
+            verification_profile: registration.verification_profile,
+            role_assignment: registration.role_assignment,
+            role_compatibility: registration.role_compatibility,
+            runtime_id: registration.runtime_id,
+            agent_id: registration.agent_id,
+            session_id: registration.session_id,
+            initial_subject_revision: registration.initial_subject_revision,
+            staged_worktree: None,
+            promotions: vec![],
+            execution_state: GovernedExecutionState::Registered,
+            review_state: GovernedReviewState::AwaitingClaim,
+            claims: Vec::new(),
+            verifications: Vec::new(),
+            supervisor_verdicts: Vec::new(),
+            operator_decisions: Vec::new(),
+            events: Vec::new(),
+            created_at: impulse_ops::now_rfc3339(),
+            updated_at: impulse_ops::now_rfc3339(),
+        };
+        self.tasks
+            .lock()
+            .expect("task gateway mutex poisoned")
+            .insert(task.id.clone(), task.clone());
+        Ok(task)
+    }
+
+    fn mutate(&self, request: GovernedTaskMutationRequest) -> Result<GovernedTaskRun, String> {
+        let mut tasks = self.tasks.lock().expect("task gateway mutex poisoned");
+        let task = tasks
+            .get_mut(&request.task_id)
+            .ok_or_else(|| "task missing".to_string())?;
+        if task.revision != request.expected_revision {
+            return Err("revision conflict".to_string());
+        }
+        task.execution_state = match request.mutation {
+            GovernedTaskMutation::MarkRunning { .. } => GovernedExecutionState::Running,
+            GovernedTaskMutation::MarkLaunchFailed { .. } => GovernedExecutionState::LaunchFailed,
+            GovernedTaskMutation::MarkRuntimeExited { .. } => GovernedExecutionState::RuntimeExited,
+            _ => return Err("unsupported test mutation".to_string()),
+        };
+        task.revision += 1;
+        Ok(task.clone())
+    }
+
+    fn mutate_current(
+        &self,
+        project_id: &str,
+        task_id: &GovernedTaskId,
+        request_id: GovernedRequestId,
+        mutation: GovernedTaskMutation,
+    ) -> Result<GovernedTaskRun, String> {
+        let current = self
+            .tasks
+            .lock()
+            .expect("task gateway mutex poisoned")
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| "task missing".to_string())?;
+        self.mutate(GovernedTaskMutationRequest {
+            request_id,
+            project_id: project_id.to_string(),
+            task_id: task_id.clone(),
+            expected_revision: current.revision,
+            mutation,
+        })
+    }
+
+    fn routing_metadata(&self) -> Option<GovernedRoutingMetadata> {
+        Some(GovernedRoutingMetadata {
+            socket_path: "/tmp/impulse-test.sock".to_string(),
+            control_cli: "/tmp/impulse-test-cli".to_string(),
+        })
     }
 }
 
@@ -461,6 +568,158 @@ fn test_desktop_runtime_snapshot_carries_workspace_and_builtin_mcp_tools() {
 }
 
 #[test]
+fn test_ungoverned_cross_workspace_spawn_does_not_receive_daemon_control_routing() {
+    const HELPER_ENV: &str = "IMPULSE_ROUTING_ISOLATION_TEST_HELPER";
+    if std::env::var_os(HELPER_ENV).is_none() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("locate desktop runtime test binary"),
+        )
+        .args([
+            "--exact",
+            "test_ungoverned_cross_workspace_spawn_does_not_receive_daemon_control_routing",
+            "--nocapture",
+        ])
+        .env(HELPER_ENV, "1")
+        .env("IMPULSE_SOCKET_PATH", "/tmp/parent-leak.sock")
+        .env("IMPULSE_CONTROL_CLI", "/bin/echo")
+        .output()
+        .expect("run routing-isolation subprocess");
+        assert!(
+            output.status.success(),
+            "poisoned-parent routing isolation failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let workspace = tempfile::tempdir().expect("temporary ungoverned workspace");
+    let sink = Arc::new(RecordingSink::default());
+    let gateway: Arc<dyn GovernedTaskGateway> = Arc::new(TestGovernedGateway::default());
+    let runtime = DesktopRuntime::builder()
+        .with_event_sink(sink.clone())
+        .with_governed_task_gateway(gateway)
+        .build();
+    let mut request = shell_spawn(
+        "ungoverned-cross-workspace",
+        "printf '%s|%s' \"${IMPULSE_SOCKET_PATH-unset}\" \"${IMPULSE_CONTROL_CLI-unset}\"; sleep 0.1",
+    );
+    request.cwd = Some(workspace.path().display().to_string());
+    request.workspace = Some(WorkspaceTarget::from_root(
+        workspace.path().display().to_string(),
+    ));
+
+    runtime
+        .spawn_agent(request)
+        .expect("ordinary cross-workspace agent should launch");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let output = String::from_utf8_lossy(&terminal_output(&sink, "ungoverned-cross-workspace"))
+            .to_string();
+        if output.contains("unset|unset") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ordinary agent output did not prove routing isolation: {output:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_directory() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("temporary workspace parent");
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("create governed workspace");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(args)
+            .status()
+            .expect("run Git fixture command");
+        assert!(status.success(), "git {args:?} failed");
+    };
+    git(&["init", "--quiet"]);
+    git(&["config", "user.email", "test@example.com"]);
+    git(&["config", "user.name", "Impulse Test"]);
+    git(&["commit", "--allow-empty", "--quiet", "-m", "initial"]);
+    let alias = temp.path().join("workspace-alias");
+    symlink(&workspace, &alias).expect("create workspace symlink");
+    let canonical = workspace.canonicalize().expect("canonical workspace");
+    let canonical_text = canonical.display().to_string();
+
+    let sink = Arc::new(RecordingSink::default());
+    let gateway: Arc<dyn GovernedTaskGateway> = Arc::new(TestGovernedGateway::default());
+    let runtime = DesktopRuntime::builder()
+        .with_event_sink(sink.clone())
+        .with_governed_task_gateway(gateway)
+        .build();
+    let mut request = shell_spawn(
+        "canonical-workspace-agent",
+        "printf '%s|%s|%s|%s|%s|%s|%s' \"$PWD\" \"$IMPULSE_WORKSPACE_ROOT\" \"$IMPULSE_GOVERNED_TASK_ID\" \"$IMPULSE_PROJECT_ID\" \"$IMPULSE_SOCKET_PATH\" \"$IMPULSE_CONTROL_CLI\" \"$IMPULSE_GOVERNED_VERIFICATION_PROFILE\"",
+    );
+    request.cwd = Some(alias.display().to_string());
+    request.workspace = Some(WorkspaceTarget {
+        root: workspace.display().to_string(),
+        label: Some("governed workspace".to_string()),
+        purpose: None,
+        project_notes: None,
+    });
+    request.task = Some("prove canonical workspace binding".to_string());
+    request.role_assignment = Some(governed_builder_assignment());
+    request.acceptance_criteria = vec!["routing metadata is exact".to_string()];
+    request.verification_profile =
+        Some(impulse_ops::governed_task::GovernedVerificationProfile::RustWorkspaceV1);
+
+    let snapshot = runtime
+        .spawn_agent(request)
+        .expect("symlink-equivalent paths must bind to one canonical workspace");
+    assert_eq!(snapshot.cwd.as_deref(), Some(canonical_text.as_str()));
+    assert_eq!(
+        snapshot
+            .workspace
+            .as_ref()
+            .map(|target| target.root.as_str()),
+        Some(canonical_text.as_str())
+    );
+    let telemetry = impulse_desktop::daemon_ops::agent_runtime_from_snapshot(&snapshot);
+    assert_eq!(telemetry.working_directory, canonical_text);
+    assert_eq!(telemetry.governed_task_id, snapshot.governed_task_id);
+
+    let expected_output = format!(
+        "{canonical_text}|{canonical_text}|{}|workspace|/tmp/impulse-test.sock|/tmp/impulse-test-cli|rust_workspace_v1",
+        snapshot
+            .governed_task_id
+            .as_ref()
+            .expect("governed task id")
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        let output = String::from_utf8_lossy(&terminal_output(&sink, "canonical-workspace-agent"))
+            .to_string();
+        if output.contains(&expected_output) {
+            runtime
+                .close_agent(TerminalCloseRequest {
+                    session_id: snapshot.agent_id,
+                })
+                .ok();
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    panic!(
+        "expected PTY cwd and trusted workspace env to use `{canonical_text}`, got `{}`",
+        String::from_utf8_lossy(&terminal_output(&sink, "canonical-workspace-agent"))
+    );
+}
+
+#[test]
 fn test_terminal_harness_spawn_request_binds_workspace_and_default_tools() {
     let request = AgentSpawnRequest::terminal_harness(
         "codex-harness",
@@ -601,6 +860,10 @@ fn test_desktop_runtime_spawns_real_default_ion_sibling_without_override() {
         rows: 24,
         cols: 80,
         role: None,
+        task: None,
+        role_assignment: None,
+        acceptance_criteria: Vec::new(),
+        verification_profile: None,
         target: None,
     };
 

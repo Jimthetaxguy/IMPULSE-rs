@@ -1,0 +1,24 @@
+{
+  "tools": [
+    {
+      "type": "client",
+      "config": "tool_configs/impulse_config_get.json",
+      "id": "tool_0401kxmm3eq3ezgt6jyg52nncn28"
+    },
+    {
+      "type": "client",
+      "config": "tool_configs/impulse_health_check.json",
+      "id": "tool_2201kxmm3etee4may4w6erszr217"
+    },
+    {
+      "type": "client",
+      "config": "tool_configs/impulse_steward_status.json",
+      "id": "tool_1101kxmm3ewyfkstpadw11nsq0v8"
+    },
+    {
+      "type": "client",
+      "config": "tool_configs/impulse_system_info.json",
+      "id": "tool_4701kxmm3ezbetwb91k61e11hngg"
+    }
+  ]
+}

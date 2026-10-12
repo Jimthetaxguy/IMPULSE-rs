@@ -313,6 +313,12 @@ pub(crate) fn build_tool_context(
     let resolution_root = tool_resolution_root(impulse_dir);
     tooling::ToolContext {
         impulse_dir: impulse_dir.to_path_buf(),
+        // Review round 6: CLI/daemon/MCP-originated contexts have no
+        // separate "project vs. explicitly-configured home" distinction --
+        // mirror `impulse_dir` exactly, matching this field's behavior
+        // before it existed. Only `ion_repl::ReplContext::
+        // sandbox_tool_context` sets this independently.
+        project_impulse_dir: impulse_dir.to_path_buf(),
         session_id,
         allowed_capabilities: tool_capabilities(allow_all_capabilities),
         timeout_ms: config.tool_execution_default_timeout_ms,

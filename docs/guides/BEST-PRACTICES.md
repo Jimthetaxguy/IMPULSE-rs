@@ -1,5 +1,5 @@
 ---
-status: active
+status: superseded
 phase: 1
 audience: builder
 tags: [guide, conventions, coding]
@@ -7,6 +7,11 @@ last_updated: 2026-02-20
 ---
 
 # Best Practices for Impulse Development
+
+> **Historical TypeScript/Bun guide — superseded.** Use
+> [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md),
+> [`COLLABORATIVE-AGENTIC-CODING.md`](COLLABORATIVE-AGENTIC-CODING.md), and the canonical Rust
+> contract for current engineering practice.
 
 > **Version:** 1.0 | **Status:** Reference | **Updated:** 2026-02-20
 

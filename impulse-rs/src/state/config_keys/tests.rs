@@ -25,6 +25,7 @@ fn default_config_has_expected_values() {
     assert!(!c.conflict_webhook_enabled);
     assert!(c.impulse_agent_api_key.is_none());
     assert!(c.impulse_agent_provider.is_none());
+    assert!(c.impulse_agent_escalate_model.is_none());
     assert!(c.context_lifecycle_enabled);
     assert_eq!(c.context_lifecycle_poll_secs, 5);
     assert_eq!(c.tool_execution_default_timeout_ms, 30_000);
@@ -524,6 +525,27 @@ fn list_shows_not_set_for_optional_agent_fields() {
     assert_eq!(map.get("impulse_agent_harness").unwrap(), "(not set)");
     assert_eq!(map.get("impulse_agent_api_key").unwrap(), "(not set)");
     assert_eq!(map.get("impulse_agent_model").unwrap(), "(default)");
+    assert_eq!(
+        map.get("impulse_agent_escalate_model").unwrap(),
+        "(not set)"
+    );
+}
+
+#[test]
+fn set_impulse_agent_escalate_model_optional_string() {
+    let mut c = Config::default();
+    assert!(c.impulse_agent_escalate_model.is_none());
+    assert!(c.set("impulse_agent_escalate_model", "claude-opus-4-6"));
+    assert_eq!(
+        c.impulse_agent_escalate_model.as_deref(),
+        Some("claude-opus-4-6")
+    );
+    assert_eq!(
+        c.get("impulse_agent_escalate_model").as_deref(),
+        Some("claude-opus-4-6")
+    );
+    assert!(c.set("impulse_agent_escalate_model", "none"));
+    assert!(c.impulse_agent_escalate_model.is_none());
 }
 
 // ── resolve_field_name ──────────────────────────────────────────────

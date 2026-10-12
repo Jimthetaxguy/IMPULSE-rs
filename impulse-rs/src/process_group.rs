@@ -27,6 +27,29 @@ impl ProcessGroupGuard {
     pub(crate) fn disarm(&mut self) {
         self.armed = false;
     }
+
+    /// Kill the isolated process group immediately and disarm Drop cleanup.
+    /// Used by subprocess runners that must close piped stdout/stderr before
+    /// awaiting their bounded capture tasks after a timeout.
+    pub(crate) fn kill_now(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.kill_group();
+        self.armed = false;
+    }
+
+    fn kill_group(&self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            // SAFETY: `pgid` came from a child created with
+            // `process_group(0)`, so `-pgid` targets only that isolated
+            // process group. ESRCH means it already exited.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
 }
 
 impl Drop for ProcessGroupGuard {
@@ -45,5 +68,6 @@ impl Drop for ProcessGroupGuard {
                 libc::kill(-pgid, libc::SIGKILL);
             }
         }
+        self.kill_group();
     }
 }

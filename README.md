@@ -23,7 +23,64 @@ Using several coding agents today usually means several unrelated terminals, per
 - **Role and policy foundations** — Enforces a concrete supervisor permission policy today; generalized runtime-independent role contracts are the next control-plane boundary
 - **Typed platform tools** — Exposes capability-checked Rust tools through native registries, MCP, and runtime-specific bridges
 - **Session tracking** — Records files touched, tools used, and decisions made
+**Local control plane for terminal-native coding agents.**
+
+Impulse names both the creative urge to make something and the force that sets work in motion.
+The product protects that urge from dissolving into terminal sprawl, repeated context setup,
+silent conflicts, and unverified "done" — while keeping you in command of launches, policy, and
+acceptance.
+
+Impulse is a Rust-first **local control plane and harness manager** for AI software-engineering
+agents. It places Claude Code, Codex, Ion, and other runtimes in explicit workspaces, supervises
+their processes, and surrounds them with shared tools, telemetry, artifacts, policy, and
+verification. External CLIs keep their internal coding loops; Ion is the Impulse-native runtime.
+Impulse governs the operating conditions around those loops; it does not replace or fully control
+proprietary runtime internals. Memory is a governed platform service, not the whole product.
+
+> **North star:** [`VISION.md`](VISION.md) · **Live contract:**
+> [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
+>
+> **Live today:** PTY lifecycle, daemon workbench truth, registry-backed platform identity,
+> capability-checked tools, governed-task producers (`rust_workspace_v1`), accepted-run memory
+> candidates (review queue — not auto-written to `GENOME.md`), Ion's native REPL/tool loop under
+> the ADR-0017 loop contract, and Ion's read-only `document_read` tool for spreadsheets and Word
+> files. Worker claim, verifier evidence, supervisor judgment, and operator approval stay separate.
+>
+> **Still forming:** generalized role contracts, adapter capability negotiation, explicit memory
+> promotion/dismissal, and stronger structural enforcement across runtimes. See
+> [`VISION.md`](VISION.md) for the live-versus-target boundary.
+
+## Why
+
+Using several coding agents today usually means several unrelated terminals, permission models,
+context stores, and completion claims. Impulse brings those runtimes into one observable,
+governed environment while preserving their terminal-native workflows. The control plane owns
+managed launch, project scoping, coordination, intervention, and evidence-backed completion;
+memory preserves continuity as one service among many. Structural filesystem isolation depends on
+the selected runtime or sandbox rather than on Impulse alone.
+
+## What It Does
+
+**Control plane and governed completion**
+
+- **Managed agent terminals** — Spawns, monitors, writes to, resizes, focuses, and closes PTY-backed agent processes inside explicit workspace roots
+- **Daemon workbench truth** — Serves the authoritative agent, context, artifact, and intervention snapshot over versioned IPC
+- **Role and policy foundations** — Preflights an explicit Builder role/task against conservative launch capabilities and enforces a concrete supervisor permission policy; generalized role composition remains a later boundary
+- **Governed task truth** — Registers a durable task before PTY launch, optionally binds it to exact acceptance criteria plus a daemon-attested clean Git `HEAD`, applies revisioned/idempotent lifecycle mutations, and reserves `accepted` for an explicit operator decision against current passing evidence
+- **Artifacts and verification** — Runs the closed `rust_workspace_v1` profile in a detached Git worktree, persists daemon-derived command digests and outcomes without raw output, and keeps worker claims, verifier results, Supervisor verdicts, and operator decisions as distinct records
+- **External + native runtimes** — Wraps terminal CLIs and provides Ion's direct model/tool loop in the same product
+
+**Platform services**
+
+- **Typed platform tools** — Exposes capability-checked Rust tools through native registries, MCP, and runtime-specific bridges
+- **Credential services** — Selects configured credential providers without treating secret values as agent memory
+- **Multi-agent observability** — Tracks active agents, tasks, terminal telemetry, delegations, and intervention recommendations
+- **Session tracking** — Records files touched, tools used, and decisions made
+
+**Memory and context** (one governed service among many)
+
 - **Persistent memory** — Project genome (decisions/preferences) and session history survive across sessions
+- **Accepted-run review queue** — Derives one versioned, provenance-bearing pending memory candidate from each accepted governed run while keeping `GENOME.md` and `HISTORY.jsonl` unchanged
 - **Context injection** — Relevant past context is surfaced in new sessions via review-first injection
 - **Multi-agent observability** — Tracks active agents, tasks, terminal telemetry, delegations, and intervention recommendations
 - **Retrieval search** — FTS5 keyword search + semantic search across session history and genome
@@ -31,6 +88,8 @@ Using several coding agents today usually means several unrelated terminals, per
 - **Artifacts and verification** — Separates worker claims from observed build/test evidence and reviewable outputs
 - **Credential services** — Selects configured credential providers without treating secret values as agent memory
 - **External + native runtimes** — Wraps terminal CLIs and provides Ion's direct model/tool loop in the same product
+- **Retrieval search** — FTS5 keyword search plus feature-gated, fallback-safe semantic search across session history and genome
+- **Context stewardship** — Monitors context window usage and proposes cleanup strategies
 
 ## Quick Start
 
@@ -55,6 +114,106 @@ The live foundation can launch registered PTY runtimes and project daemon-backed
 cockpit. The complete role-assigned supervisor + builder workflow is the next vertical slice, not
 an undocumented command-line flag. Session, memory, hook, and verification commands remain
 available through `cargo run -- --help`.
+The packaged executable is `impulse-rs`. Governed producer commands are daemon-only global-mode
+invocations: `impulse-rs --daemon governed-claim`, `impulse-rs --daemon governed-verify`, and
+`impulse-rs --daemon governed-review`. A governed pane supplies the exact executable path through
+`$IMPULSE_CONTROL_CLI` only for a profiled governed pane, but the global `--daemon` flag is still
+required. Ordinary and unprofiled panes have inherited producer-routing variables removed.
+Run the injected path as `"$IMPULSE_CONTROL_CLI" --daemon ...` so paths containing spaces remain
+one executable argument.
+
+`impulse-rs init` adds only exact daemon/runtime-owned state, socket, retrieval-cache, governed-task
+and memory-candidate ledger/temp, and Desktop-outbox paths to the repository `.gitignore`; it never
+adds a blanket `.impulse/` rule.
+Durable project inputs such as `.impulse/GENOME.md`, `.impulse/config.json`, and
+`.impulse/impulse-capabilities.json` therefore remain available to commit unless an existing
+operator-owned blanket rule already hides them. Init preserves but warns about that broader rule.
+
+### Release artifacts
+
+Tagged releases contain the `impulse-rs` CLI for macOS (Intel and Apple silicon) and Linux
+(x86_64 and ARM64), with `SHA256SUMS.txt`. The release workflow builds each CLI, smoke-tests
+the renamed executable’s root, daemon, and MCP serve help parsers on its native architecture,
+then verifies the complete four-artifact checksum set. Relevant pull requests run the same build/package checks with read-only permissions;
+GitHub Release publication runs only for pushed `v*` tags.
+
+Desktop `.app` bundles and DMGs are unavailable until the Dioxus packaging and real launch gates
+in [EGUI decommission, Track A / R1](docs/plans/EGUI-DECOMMISSION.md#r1--make-release-state-truthful)
+are satisfied. The old `scripts/build-macos-app.sh` entry point exits with an explanation before
+building or changing artifacts. This CLI-only release path does not satisfy Dioxus operational
+acceptance or unblock Tauri-adapter retirement.
+
+### Governed Builder workflow
+
+In the Dioxus cockpit, use the governed Builder launch path:
+
+1. Register an existing absolute workspace directory.
+2. Choose a runtime from the current platform catalog.
+3. Enter the required task and each exact acceptance criterion.
+4. Commit every workspace change, including `Cargo.lock` when Cargo would otherwise generate it, so
+   the canonical Git worktree root and the later detached verification checkout stay byte-exact.
+5. Launch only after the cockpit reports every mandatory requirement satisfied and the daemon
+   attests the initial commit OID.
+
+Current built-in profiles mediate workspace targeting and process lifecycle. Structural filesystem
+scope is optional and currently unsupported, so the initial Builder profile is allowed but visibly
+degraded. The canonical working directory selects where the process starts; cwd mediation is not a
+filesystem sandbox.
+
+Every governed launch is registered with the daemon before a PTY is created. For the profiled
+Builder path, the child receives project, task, socket, control-CLI, and profile routing through
+its launch environment. The daemon requires the canonical Builder assignment and recomputes its
+runtime compatibility from the daemon-owned registry before accepting the task; caller-supplied
+compatibility cannot strengthen that result. External runtimes can submit intent with
+`"$IMPULSE_CONTROL_CLI" --daemon governed-claim --summary "..."`; Ion can call the typed
+`governed_submit_claim` tool. The daemon derives the assigned Worker and clean Git subject.
+
+The next terminal commands are `"$IMPULSE_CONTROL_CLI" --daemon governed-verify` and
+`"$IMPULSE_CONTROL_CLI" --daemon governed-review`. Verification materializes
+the claimed commit in a detached worktree and runs the fixed `rust_workspace_v1` sequence: format,
+locked workspace check, locked strict Clippy, and locked workspace tests. The profile requires a
+committed, regular, non-symlink root `Cargo.lock`. Passing evidence requires both a clean Git subject and an
+unchanged, bounded before/after byte manifest of the detached source tree, including ignored paths;
+generated source-tree output therefore cannot hide behind `.gitignore`. The v1 profile rejects
+source-tree symlinks so verification cannot follow mutable bytes outside the committed checkout.
+This executes host-trusted Rust build scripts and tests; environment scrubbing, timeouts, output
+hashing, and process-group cleanup do **not** make it an OS sandbox. Supervisor review is an
+API-only, tool-free, history-free, temperature-zero model
+turn whose strict response must bind the current task revision, record IDs, subject, and
+acceptance-criteria digest. A generic external harness configuration fails closed before spawn.
+
+Runtime exit updates execution state but never accepts the work. The Supervisor view renders
+daemon-owned evidence and currently guides the operator to those terminal commands rather than
+exposing producer buttons. A model may recommend acceptance, but only the operator can approve it.
+That is a transition-policy distinction, not strong actor authentication: another process running
+as the same OS user remains inside the current socket trust boundary.
+Accepted and rejected operator outcomes are terminal; a later opposite decision cannot rewrite that
+result or orphan a staged candidate.
+After approval, the daemon persists the accepted task first and then derives one pending candidate
+in owner-only `.impulse/MEMORY_CANDIDATES.json`. That file is a deterministic materialized view of
+accepted governed evidence, not a second acceptance authority. An identical acceptance replay or
+daemon-start reconciliation repairs a missing projection; orphaned or source-mismatched candidates
+fail closed. The candidate deliberately excludes worker claim prose and Supervisor/operator
+rationales. Its ID hashes the exact JSON bytes from a fixed ordered, versioned source struct (no
+maps, floats, or Unicode semantic normalization), and its source assurance distinguishes
+daemon-profiled evidence from caller-composed evidence without overstating declared operator identity.
+
+The Dioxus Memory view exposes these candidates as **Pending review — not stored in GENOME**. V1
+has no promote, edit, or dismiss action. Candidate staging never mutates `GENOME.md` or
+`HISTORY.jsonl`; explicit semantic promotion/dismissal remains a later contract.
+Persisted request receipts make replay idempotent and the per-task daemon lock prevents concurrent
+duplicate producer execution. This is not crash-safe exactly-once execution: if the daemon exits
+after a command/model side effect but before its receipt is durably stored, a retry can run that
+producer again. A durable producer reservation journal remains the next reliability boundary.
+The next forcing function is one process-level workflow that launches Builder and Supervisor
+runtimes through acceptance and observes exactly one staged candidate. Stronger same-user actor
+authorization and multi-workspace daemon routing remain open; explicit candidate promotion and
+dismissal come later. Session, memory, hook, and verification commands remain available through
+`cargo run -- --help`.
+
+The current desktop daemon attachment is single-project: a governed launch must target the project
+root bound to the running daemon. Registering additional cockpit workspace entries does not yet
+provide cross-project daemon routing.
 
 ## Architecture
 
@@ -95,6 +254,11 @@ available through `cargo run -- --help`.
 | `orchestrate` / `handoff` | Cross-tool context sharing |
 | `run` | Launch the 10-tab ratatui workbench |
 | `daemon` | Run the foreground control-plane daemon listener |
+| `governed-claim` | Ask the daemon to derive a Builder claim from the current routed task and clean Git subject |
+| `governed-verify` | Ask the daemon to run the task's fixed verification profile |
+| `governed-review` | Ask the configured API Supervisor to produce a strict, revision-bound verdict |
+
+The three governed commands in this table require the global `--daemon` flag before the subcommand.
 
 See `cargo run -- --help` for the full command list.
 
@@ -112,6 +276,7 @@ See `cargo run -- --help` for the full command list.
 ```
 impulse-rs/          # Rust implementation (canonical)
   impulse-ops/       # Shared control-plane protocol, workbench, policy, artifact models
+  impulse-step-model/ # Pure provider-neutral per-step model policy (no app graph)
   impulse-term/      # PTY lifecycle, parser, write queue, terminal context
   impulse-desktop/   # Dioxus cockpit, host bridge, workspace/runtime/MCP adapters
   impulse-ion/       # Ion harness contract + adapter crate
@@ -145,6 +310,9 @@ memory-pipeline/     # Python research tooling
 - **Start here:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **User stories:** [`docs/spec/USER-STORY-MAP.md`](docs/spec/USER-STORY-MAP.md)
 - **Test traceability:** [`docs/spec/TEST-TRACEABILITY.md`](docs/spec/TEST-TRACEABILITY.md)
+- **Governed lifecycle ADR:** [`docs/decisions/0011-governed-task-run-lifecycle.md`](docs/decisions/0011-governed-task-run-lifecycle.md)
+- **Governed producer ADR:** [`docs/decisions/0012-daemon-owned-governed-runtime-producers.md`](docs/decisions/0012-daemon-owned-governed-runtime-producers.md)
+- **Accepted-run candidate ADR:** [`docs/decisions/0013-deterministic-accepted-run-memory-candidates.md`](docs/decisions/0013-deterministic-accepted-run-memory-candidates.md)
 - **Agent guidelines:** [`AGENTS.md`](AGENTS.md)
 - **Meta-Harness synthesis:** [`docs/research/META-HARNESS-RUST-MULTI-AGENT.md`](docs/research/META-HARNESS-RUST-MULTI-AGENT.md)
 - **Rust multi-agent guide:** [`docs/guides/RUST-MULTI-AGENT-PATTERNS.md`](docs/guides/RUST-MULTI-AGENT-PATTERNS.md)
@@ -181,4 +349,6 @@ cargo fmt --all -- --check
 
 ## License
 
-Private — not yet open-sourced.
+This repository is public, but release licensing is not yet coherent: Cargo manifests declare
+MIT while [`impulse-rs/LICENSE`](impulse-rs/LICENSE) contains Apache-2.0. Treat licensing as an
+explicit pre-release decision; this draft PR does not silently choose or rewrite the license.

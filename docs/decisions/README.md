@@ -2,6 +2,7 @@
 title: Architecture Decision Records
 description: Decision index separating current control-plane authority from accepted historical phase-era scope
 version: '1.1'
+version: '1.5'
 status: active
 phase: all
 type: reference
@@ -10,6 +11,8 @@ audience: builder
 tags: [decisions, adr, architecture]
 updated: 2026-07-12
 last_updated: 2026-07-12
+updated: 2026-09-26
+last_updated: 2026-09-26
 ---
 
 # Architecture Decision Records
@@ -36,6 +39,17 @@ registry-backed runtime identity, daemon truth, or the current Now/Next/Later ro
 | [0007](0007-desktop-shell-stack.md) | Desktop shell stack | **Superseded** | Historical only | 2026-04-15 | -- |
 | [0008](0008-dioxus-desktop-host.md) | Dioxus Desktop host | **Accepted** | Current desktop host authority | 2026-06-14 | 0007 |
 | [0009](0009-reconcile-impulse-copies.md) | Reconcile duplicate Impulse codebases | **Accepted** | Current canonical-tree authority | 2026-06-25 | -- |
+| [0010](0010-product-role-launch-contract.md) | Product role launch contract | **Accepted** | Current explicit role/task launch-preflight authority | 2026-07-13 | -- |
+| [0011](0011-governed-task-run-lifecycle.md) | Daemon-owned governed task lifecycle | **Accepted** | Durable evidence/review state and operator-required acceptance | 2026-07-13 | -- |
+| [0012](0012-daemon-owned-governed-runtime-producers.md) | Daemon-owned governed runtime producers | **Accepted** | Clean-Git Builder claims, detached daemon verification, and strict API-only Supervisor review | 2026-07-13 | -- |
+| [0013](0013-deterministic-accepted-run-memory-candidates.md) | Deterministic accepted-run memory candidates | **Accepted** | Owner-only pending review projection and explicit no-promotion boundary | 2026-07-15 | -- |
+| [0014](0014-work-item-and-comparative-settlement.md) | WorkItem identity and comparative settlement | **Proposed** | Proposed planning identity, fan-out effect bound, and four-part settlement record | 2026-08-10 | -- |
+| [0015](0015-harness-owned-step-model.md) | Harness-owned step model choice | **Accepted** | Pure Impulse-owned per-step policy; applications retain inference and semantic authority | 2026-08-17 | -- |
+| [0017](0017-canonical-loop-contract.md) | Canonical loop contract | **Proposed** | Typed loop budgets, breaker-evaluated stop conditions, and termination evidence for Ion tool loops; 0016 reserved by the drafted harness evolution plane | 2026-09-01 | -- |
+| [0018](0018-socket-actor-provenance.md) | Socket actor provenance | **Proposed** | Peer credentials plus a per-run operator capability classify every daemon connection, so only an operator surface can mint `accepted` | 2026-09-02 | -- |
+| [0019](0019-builder-staged-worktree-world-scope.md) | Builder staged-worktree world scope | **Proposed** | Declared `WorldScope`, a disposable staged Builder worktree, fast-forward-only promotion after operator acceptance, mediated (never structural) `filesystem.scoped` reporting, and the governed Builder loop binding; 0018 reserved by the socket actor-provenance lane | 2026-09-02 | -- |
+| [0020](0020-scoped-memory-promotion-and-dismissal.md) | Scoped memory promotion and dismissal | **Proposed** | Operator-class promote/dismiss with receipts, an append-only hash-chained `MEMORY.jsonl`, a separate regenerated `GENOME_PROJECTION.md` that never rewrites the hand-curated `GENOME.md`, a status-preserving derivation migration, and promoted-only retrieval indexing | 2026-09-12 | -- |
+| [0021](0021-monty-sandbox-for-calculator-and-python-exec.md) | Monty sandbox for calculator and python_exec | **Proposed** | `calculator`, `python_exec`, `calc`, and `exec` run Python in the in-process Monty interpreter with no filesystem, network, process, or host-function access; typed `fault` classes; MSRV 1.96; `monty-pool` crash isolation deferred | 2026-09-26 | -- |
 
 ## ADR Format
 
