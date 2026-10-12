@@ -1501,6 +1501,7 @@ mod tests {
             Some("test-api-key-for-resolve"),
             Some("claude-sonnet-4-6"),
             None,
+            None,
         );
         assert!(agent.is_some(), "resolve should create an agent");
         let agent = agent.unwrap();
@@ -1517,8 +1518,13 @@ mod tests {
         }
 
         // Resolve with openai + key, no model (should use default)
-        let agent =
-            resolve_from_config(Some("openai"), Some("test-openai-key-not-real"), None, None);
+        let agent = resolve_from_config(
+            Some("openai"),
+            Some("test-openai-key-not-real"),
+            None,
+            None,
+            None,
+        );
         assert!(agent.is_some());
         let agent = agent.unwrap();
         assert!(agent.is_ready());
@@ -1535,7 +1541,7 @@ mod tests {
         );
 
         // Resolve with minimax
-        let agent = resolve_from_config(Some("minimax"), Some("mm-key"), None, None);
+        let agent = resolve_from_config(Some("minimax"), Some("mm-key"), None, None, None);
         assert!(agent.is_some());
         let summary = agent.unwrap().status_summary();
         assert!(summary.contains("minimax"));
@@ -1547,7 +1553,7 @@ mod tests {
         use crate::agent::{resolve_from_config, AgentMode, ImpulseHarness};
 
         // Resolve with claude-code harness
-        let agent = resolve_from_config(None, None, None, Some("claude-code"));
+        let agent = resolve_from_config(None, None, None, Some("claude-code"), None);
         assert!(agent.is_some(), "resolve with harness should return Some");
         let agent = agent.unwrap();
         match agent.config().mode {
@@ -1559,7 +1565,7 @@ mod tests {
         }
 
         // Resolve with opencode harness
-        let agent = resolve_from_config(None, None, None, Some("opencode"));
+        let agent = resolve_from_config(None, None, None, Some("opencode"), None);
         assert!(agent.is_some());
         let agent = agent.unwrap();
         match agent.config().mode {
@@ -1571,7 +1577,13 @@ mod tests {
         }
 
         // Harness takes priority over provider when both specified
-        let agent = resolve_from_config(Some("anthropic"), Some("key"), None, Some("claude-code"));
+        let agent = resolve_from_config(
+            Some("anthropic"),
+            Some("key"),
+            None,
+            Some("claude-code"),
+            None,
+        );
         assert!(agent.is_some());
         assert!(
             matches!(agent.unwrap().config().mode, AgentMode::Harness { .. }),
@@ -1585,18 +1597,18 @@ mod tests {
         use crate::agent::{resolve_from_config, AgentMode, ImpulseAgentConfig};
 
         // No parameters: should return None (disabled)
-        let agent = resolve_from_config(None, None, None, None);
+        let agent = resolve_from_config(None, None, None, None, None);
         assert!(
             agent.is_none(),
             "with no config, resolve_from_config should return None (disabled)"
         );
 
         // Invalid provider: should also return None
-        let agent = resolve_from_config(Some("invalid"), None, None, None);
+        let agent = resolve_from_config(Some("invalid"), None, None, None, None);
         assert!(agent.is_none(), "invalid provider should result in None");
 
         // Invalid harness: should also return None
-        let agent = resolve_from_config(None, None, None, Some("invalid"));
+        let agent = resolve_from_config(None, None, None, Some("invalid"), None);
         assert!(agent.is_none(), "invalid harness should result in None");
 
         // Verify ImpulseAgentConfig::default() is disabled
@@ -1974,6 +1986,9 @@ mod tests {
         assert!(state
             .set_config("impulse_agent_auto_coordinate", "true")
             .unwrap());
+        assert!(state
+            .set_config("impulse_agent_escalate_model", "claude-opus-4-6")
+            .unwrap());
 
         // Verify all fields
         assert_eq!(
@@ -2001,6 +2016,10 @@ mod tests {
             state.get_config("impulse_agent_auto_coordinate").unwrap(),
             Some("true".to_string())
         );
+        assert_eq!(
+            state.get_config("impulse_agent_escalate_model").unwrap(),
+            Some("claude-opus-4-6".to_string())
+        );
 
         // Verify config snapshot has the actual values
         let config = state.config_snapshot().unwrap();
@@ -2016,6 +2035,10 @@ mod tests {
         assert_eq!(config.impulse_agent_harness, Some("opencode".to_string()));
         assert!(config.impulse_agent_auto_review);
         assert!(config.impulse_agent_auto_coordinate);
+        assert_eq!(
+            config.impulse_agent_escalate_model.as_deref(),
+            Some("claude-opus-4-6")
+        );
     }
 
     /// Test: ImpulseAgent.status_summary() correctness for each mode

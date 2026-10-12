@@ -21,7 +21,7 @@ tags: [worktree, lane, handoff, base-url, stale-basis, settlement, adr-0014]
 - Blocked/shared paths: `Cargo.toml`; `Cargo.lock`; `AGENTS.md`; `CONTEXT.md`; `docs/validate_docs.py`; protocol/spec docs; `GovernedTaskRun` / daemon IPC; `.github/workflows/openwiki-update.yml`; `codex/mode-taxonomy-cleanup`; PR #17
 - Plan/spec: land drafts #24 → #25 → #26 onto `main` `12f957c` (ADR-0015 already merged). Drop stowaway commits. Keep ADR-0014 numbering.
 - Verification: isolated `CARGO_TARGET_DIR`; `cargo build --workspace && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check`
-- Latest status: #24 rebased onto `origin/main` from cherry-pick `96455f2`; override origin is logged; OpenWiki/mode-taxonomy stowaways dropped
+- Latest status: stack rebased onto `origin/main` `12f957c`; #24/#25 fixes committed; #26 constructor/ADR index fixes in progress; PR #17 not in this train
 
 ## Decisions
 - 2026-08-17: Do not merge #24 as-is. Cherry-pick only `96455f2`; drop `01a4eb1` (mode-taxonomy) and `a024166` (OpenWiki cron).
