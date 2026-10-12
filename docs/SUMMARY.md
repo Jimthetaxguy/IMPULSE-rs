@@ -3,6 +3,8 @@ title: Documentation Summary
 description: Unified navigation structure for Impulse documentation
 version: 2.6
 updated: 2026-07-13
+version: 2.8
+updated: 2026-09-26
 schema_version: '1.0'
 ---
 
@@ -25,6 +27,7 @@ schema_version: '1.0'
 ## Active Track
 
 Roadmap contract: Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
+Roadmap contract: Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
 
 `HONEST-ROADMAP.md` is a historical hook/memory validation register, not the current product
 roadmap or whole-product risk authority.
@@ -47,6 +50,7 @@ roadmap or whole-product risk authority.
 ### Next
 
 - [VISION.md](../VISION.md) — governed supervisor/builder slice and hierarchy/enforcement ADR
+- [VISION.md](../VISION.md) — stronger same-user actor authorization, full launched Builder/Supervisor proof, later candidate promotion/dismissal, and remaining hierarchy/enforcement ADRs
 - [spec/USER-STORY-MAP.md](spec/USER-STORY-MAP.md)
 - [spec/TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md)
 
@@ -134,6 +138,16 @@ roadmap or whole-product risk authority.
 - [decisions/0008-dioxus-desktop-host.md](decisions/0008-dioxus-desktop-host.md)
 - [decisions/0009-reconcile-impulse-copies.md](decisions/0009-reconcile-impulse-copies.md)
 - [decisions/0010-product-role-launch-contract.md](decisions/0010-product-role-launch-contract.md)
+- [decisions/0011-governed-task-run-lifecycle.md](decisions/0011-governed-task-run-lifecycle.md)
+- [decisions/0012-daemon-owned-governed-runtime-producers.md](decisions/0012-daemon-owned-governed-runtime-producers.md)
+- [decisions/0013-deterministic-accepted-run-memory-candidates.md](decisions/0013-deterministic-accepted-run-memory-candidates.md)
+- [decisions/0014-work-item-and-comparative-settlement.md](decisions/0014-work-item-and-comparative-settlement.md)
+- [decisions/0015-harness-owned-step-model.md](decisions/0015-harness-owned-step-model.md)
+- [decisions/0017-canonical-loop-contract.md](decisions/0017-canonical-loop-contract.md)
+- [decisions/0018-socket-actor-provenance.md](decisions/0018-socket-actor-provenance.md)
+- [decisions/0019-builder-staged-worktree-world-scope.md](decisions/0019-builder-staged-worktree-world-scope.md)
+- [decisions/0020-scoped-memory-promotion-and-dismissal.md](decisions/0020-scoped-memory-promotion-and-dismissal.md)
+- [decisions/0021-monty-sandbox-for-calculator-and-python-exec.md](decisions/0021-monty-sandbox-for-calculator-and-python-exec.md)
 
 ### Session Logs
 
@@ -153,6 +167,9 @@ Historical Ralph loop plans now live under `archive/ralph-plans/` and are proven
 | Total Documents | 136 |
 | Categories | 9 |
 | Decisions (ADRs) | 10 |
+| Total Documents | 141 |
+| Categories | 9 |
+| Decisions (ADRs) | 13 |
 | Phases | 3 |
 | Status | Active Development |
 

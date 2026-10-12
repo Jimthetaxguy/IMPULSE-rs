@@ -5,6 +5,7 @@
 //! - Exposes `screen_text()` and `scrollback_text()` for context extraction
 //! - No TUI (ratatui) dependency — rendering is done by `renderer.rs`
 
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
@@ -29,6 +30,38 @@ const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 /// PTY read buffer size (bytes).
 const PTY_READ_BUFFER_SIZE: usize = 4096;
 
+/// Remove every inherited Impulse control-plane variable before a PTY launch.
+///
+/// `portable_pty::CommandBuilder` starts from the parent process environment.
+/// Omitting a key from a launch request therefore does not isolate it: an
+/// ordinary pane could otherwise inherit a daemon socket, producer CLI, task,
+/// or role identity that belongs to the Desktop process. Explicit launch
+/// metadata is overlaid again after this scrub.
+/// Strip every inherited `IMPULSE_*` key from a command before the caller
+/// overlays the variables a governed pane is *meant* to receive.
+///
+/// The prefix rule is deliberately an allowlist-by-omission: a launched runtime
+/// gets exactly the keys the harness sets afterwards and nothing the harness
+/// process happens to be carrying. That is what keeps `IMPULSE_OPERATOR_CAPABILITY`
+/// (ADR-0018) out of governed panes — a runtime is never handed the capability
+/// that raises a socket connection to operator class, so it cannot approve its
+/// own governed task even though it holds `IMPULSE_SOCKET_PATH`. Callers that
+/// build the explicit overlay must never add that key back.
+fn remove_inherited_impulse_env<I>(command: &mut CommandBuilder, inherited_keys: I)
+where
+    I: IntoIterator<Item = OsString>,
+{
+    for key in inherited_keys {
+        let rendered = key.to_string_lossy();
+        if rendered
+            .get(.."IMPULSE_".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("IMPULSE_"))
+        {
+            command.env_remove(&key);
+        }
+    }
+}
+
 /// Owns a PTY process and its vt100 parser. The reader thread runs in the
 /// background, continuously feeding PTY output into the parser.
 pub struct TerminalBackend {
@@ -47,6 +80,34 @@ pub struct TerminalBackend {
     rows: AtomicU16,
     command: String,
     working_dir: Option<PathBuf>,
+}
+
+/// Owns a child during fallible PTY setup. `portable_pty::Child` does not
+/// promise kill-on-drop, so every error after `spawn_command` must explicitly
+/// terminate and reap the process before returning control to the harness.
+struct SpawnedChildGuard {
+    child: Option<Box<dyn Child + Send + Sync>>,
+}
+
+impl SpawnedChildGuard {
+    fn new(child: Box<dyn Child + Send + Sync>) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn into_inner(mut self) -> Box<dyn Child + Send + Sync> {
+        self.child
+            .take()
+            .expect("spawned child guard must own a child until disarmed")
+    }
+}
+
+impl Drop for SpawnedChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl TerminalBackend {
@@ -113,12 +174,16 @@ impl TerminalBackend {
             cmd.cwd(cwd);
         }
 
-        // Inject environment variables.
+        // CommandBuilder inherits the Desktop environment. Remove all Impulse
+        // routing/identity first, then add only the values authorized for this
+        // specific launch.
+        remove_inherited_impulse_env(&mut cmd, std::env::vars_os().map(|(key, _value)| key));
         for (key, value) in env_vars {
             cmd.env(key, value);
         }
 
         let child = pair.slave.spawn_command(cmd)?;
+        let child_guard = SpawnedChildGuard::new(child);
         // Drop the slave side — the child process owns it now.
         drop(pair.slave);
 
@@ -163,6 +228,7 @@ impl TerminalBackend {
 
         let writer_arc = Arc::new(Mutex::new(writer));
         let write_queue = WriteQueue::new(Arc::clone(&writer_arc));
+        let child = child_guard.into_inner();
 
         Ok(Self {
             writer: writer_arc,
@@ -246,9 +312,13 @@ impl TerminalBackend {
                 false
             }
             Ok(None) => true,
-            Err(_) => {
-                self.alive.store(false, Ordering::Relaxed);
-                false
+            Err(error) => {
+                log::error!(
+                    "failed to poll PTY child for '{}'; retaining last live state: {}",
+                    self.command,
+                    error
+                );
+                true
             }
         }
     }
@@ -308,11 +378,31 @@ impl TerminalBackend {
         f(&mut parser)
     }
 
-    /// Kill the child process.
-    pub fn kill(&self) {
+    /// Terminate and reap the child process.
+    ///
+    /// The backend is marked dead only after `try_wait` or `wait` confirms a
+    /// terminal process state. Kill failures for a still-running process are
+    /// returned to the caller so lifecycle truth cannot claim an exit that did
+    /// not happen.
+    pub fn kill(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut child = self.child.lock();
-        let _ = child.kill();
+        if child.try_wait()?.is_some() {
+            self.alive.store(false, Ordering::Relaxed);
+            return Ok(());
+        }
+        if let Err(kill_error) = child.kill() {
+            // The child may have exited between `try_wait` and `kill`. Confirm
+            // that race before treating the kill error as a live orphan.
+            if child.try_wait()?.is_some() {
+                self.alive.store(false, Ordering::Relaxed);
+                return Ok(());
+            }
+            self.alive.store(true, Ordering::Relaxed);
+            return Err(Box::new(kill_error));
+        }
+        child.wait()?;
         self.alive.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     /// The command that was spawned.
@@ -345,6 +435,18 @@ impl TerminalBackend {
     /// A non-zero value after the terminal is dead indicates the PTY broke unexpectedly.
     pub fn read_error_count(&self) -> u64 {
         self.read_errors.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for TerminalBackend {
+    fn drop(&mut self) {
+        if let Err(error) = self.kill() {
+            log::error!(
+                "failed to terminate and reap PTY child for '{}': {}",
+                self.command,
+                error
+            );
+        }
     }
 }
 
@@ -588,5 +690,67 @@ mod tests {
             10,
             "no message should be interleaved"
         );
+    }
+
+    #[test]
+    fn inherited_impulse_environment_is_removed_before_explicit_overlay() {
+        let mut command = CommandBuilder::new("true");
+        command.env("IMPULSE_SOCKET_PATH", "/tmp/parent.sock");
+        command.env("impulse_control_cli", "/tmp/parent-cli");
+        command.env("PATH", "/usr/bin");
+
+        remove_inherited_impulse_env(
+            &mut command,
+            [
+                OsString::from("IMPULSE_SOCKET_PATH"),
+                OsString::from("impulse_control_cli"),
+                OsString::from("PATH"),
+            ],
+        );
+
+        assert!(command.get_env("IMPULSE_SOCKET_PATH").is_none());
+        assert!(command.get_env("IMPULSE_CONTROL_CLI").is_none());
+        assert_eq!(
+            command.get_env("PATH"),
+            Some(std::ffi::OsStr::new("/usr/bin"))
+        );
+
+        command.env("IMPULSE_SOCKET_PATH", "/tmp/profiled.sock");
+        assert_eq!(
+            command.get_env("IMPULSE_SOCKET_PATH"),
+            Some(std::ffi::OsStr::new("/tmp/profiled.sock"))
+        );
+    }
+
+    #[test]
+    fn operator_capability_never_reaches_a_spawned_pane() {
+        // ADR-0018: a governed pane holds IMPULSE_SOCKET_PATH but must never
+        // hold the capability that would let it approve its own task.
+        let mut command = CommandBuilder::new("true");
+        command.env("IMPULSE_OPERATOR_CAPABILITY", "a".repeat(64));
+        command.env("impulse_operator_capability", "b".repeat(64));
+        command.env("IMPULSE_SOCKET_PATH", "/tmp/parent.sock");
+
+        remove_inherited_impulse_env(
+            &mut command,
+            [
+                OsString::from("IMPULSE_OPERATOR_CAPABILITY"),
+                OsString::from("impulse_operator_capability"),
+                OsString::from("IMPULSE_SOCKET_PATH"),
+            ],
+        );
+
+        assert!(
+            command.get_env("IMPULSE_OPERATOR_CAPABILITY").is_none(),
+            "the operator capability must not survive into a governed pane"
+        );
+
+        // The explicit governed overlay re-adds the socket path and nothing else.
+        command.env("IMPULSE_SOCKET_PATH", "/tmp/profiled.sock");
+        assert_eq!(
+            command.get_env("IMPULSE_SOCKET_PATH"),
+            Some(std::ffi::OsStr::new("/tmp/profiled.sock"))
+        );
+        assert!(command.get_env("IMPULSE_OPERATOR_CAPABILITY").is_none());
     }
 }

@@ -75,6 +75,11 @@ decisions, or the complete governed vertical slice.
   records task evidence, verification results, and supervisor accept/reject/escalate decisions
   before any outcome is treated as complete or promoted to durable memory.
 
+> **Fulfillment note (2026-07-13):** ADR-0011 implements that daemon-owned lifecycle and refines the
+> authority split anticipated above. A supervisor now recommends acceptance, requests changes, or
+> escalates; only a revision-matched operator decision can accept or reject an accept recommendation.
+> Accepted-run memory promotion remains downstream.
+
 ## Validation
 
 This decision is represented when:

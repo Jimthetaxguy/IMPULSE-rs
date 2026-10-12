@@ -28,6 +28,8 @@ pub use bridge::{
 pub use daemon_ops::{
     agent_runtime_from_snapshot, attach_desktop_daemon_ops, DesktopDaemonOpsConfig,
     DesktopDaemonOpsStartError, DEFAULT_HEARTBEAT_INTERVAL,
+    agent_runtime_from_snapshot, attach_desktop_daemon_ops, DesktopDaemonOpsAttachment,
+    DesktopDaemonOpsConfig, DesktopDaemonOpsStartError, DEFAULT_HEARTBEAT_INTERVAL,
 };
 pub use host_commands::{RegisterWorkspaceRequest, ReviewDecisionRequest};
 pub use mcp::{
@@ -45,6 +47,8 @@ pub use runtime::{
     AgentWriteRequest, BuiltInMcpTool, DesktopEvent, DesktopEventSink, DesktopRuntime,
     DesktopRuntimeBuilder, LocalSupervisorAction, SupervisorLocalActionRequest, WeakDesktopRuntime,
     WorkspaceTarget,
+    DesktopRuntimeBuilder, GovernedRoutingMetadata, GovernedTaskGateway, LocalSupervisorAction,
+    SupervisorLocalActionRequest, WeakDesktopRuntime, WorkspaceTarget,
 };
 pub use theme::{
     artifact_status_class, artifact_status_label, format_count, severity_class, status_dot_class,

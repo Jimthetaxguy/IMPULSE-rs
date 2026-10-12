@@ -12,9 +12,13 @@ mod tests {
 
     // Re-import handler functions from the extracted handlers module.
     // super::super = daemon module (tests.rs is daemon::tests, inner mod is daemon::tests::tests)
+    use super::super::actor_provenance::ConnectionClass;
     use super::super::handlers::{
         handle_delegation_request, handle_guard_request, handle_ops_request, handle_plugin_request,
         handle_session_request, handle_status, handle_steward_request,
+        handle_delegation_request, handle_governed_task_request, handle_guard_request,
+        handle_ops_request, handle_plugin_request, handle_session_request, handle_status,
+        handle_steward_request,
     };
 
     /// Test DaemonRequest serialization/deserialization
@@ -752,15 +756,85 @@ mod tests {
 
     // -- Plugin registry initialization test --------------------------------------
 
+    // `init_global_registry` registers the office context provider only when the
+    // `office-support` feature is compiled in (`src/plugin/registry.rs`). Without
+    // it, nothing registers a context provider or an action handler, so the two
+    // variants below assert what each configuration actually produces instead of
+    // one assertion that is only true under the default feature set.
+
+    #[cfg(feature = "office-support")]
     #[test]
-    fn test_plugin_registry_initialized_after_init() {
-        crate::plugin::registry::init_global_registry();
-        let registry = crate::plugin::registry::global_registry();
-        // After init, the office context provider should be registered
+    fn test_init_global_registry_with_office_support_registers_office_provider() {
+        let registry = crate::plugin::registry::init_global_registry();
         let providers = registry.list_context_providers().unwrap();
         assert!(
-            !providers.is_empty(),
-            "init_global_registry should register at least the office context provider"
+            providers.iter().any(|p| p.name == "office"),
+            "init_global_registry should register the office context provider, got {:?}",
+            providers
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        for format in [
+            crate::office::OfficeFormat::Docx,
+            crate::office::OfficeFormat::Xlsx,
+            crate::office::OfficeFormat::Xls,
+            crate::office::OfficeFormat::Csv,
+        ] {
+            assert!(
+                registry.supports_format(format).unwrap(),
+                "office provider should be registered for {}",
+                format.as_str()
+            );
+        }
+    }
+
+    #[cfg(not(feature = "office-support"))]
+    #[test]
+    fn test_init_global_registry_without_office_support_registers_no_plugins() {
+        let registry = crate::plugin::registry::init_global_registry();
+        let providers = registry.list_context_providers().unwrap();
+        assert!(
+            providers.is_empty(),
+            "no context provider is registered without office-support, got {:?}",
+            providers
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            registry.list_action_handlers().unwrap().is_empty(),
+            "no action handler is registered by init_global_registry"
+        );
+    }
+
+    #[test]
+    fn test_init_global_registry_is_idempotent_and_returns_global() {
+        let first = crate::plugin::registry::init_global_registry();
+        let providers_before = first
+            .list_context_providers()
+            .unwrap()
+            .into_iter()
+            .map(|provider| provider.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let second = crate::plugin::registry::init_global_registry();
+        let providers_after = second
+            .list_context_providers()
+            .unwrap()
+            .into_iter()
+            .map(|provider| provider.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            std::ptr::eq(first, second),
+            "init_global_registry must return the single global registry"
+        );
+        assert!(
+            std::ptr::eq(first, crate::plugin::registry::global_registry()),
+            "init_global_registry must return the same instance as global_registry"
+        );
+        assert_eq!(
+            providers_before, providers_after,
+            "re-initializing must not change the provider set"
         );
     }
 
@@ -879,6 +953,103 @@ mod tests {
                 task: "verify daemon truth".to_string(),
             }
         );
+    }
+
+    #[tokio::test]
+    async fn governed_task_wire_handler_registers_mutates_gets_and_lists_authoritative_state() {
+        use impulse_ops::governed_task::{
+            GovernedActor, GovernedActorKind, GovernedExecutionState, GovernedRequestId,
+            GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration,
+            GovernedTaskRun,
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("daemon-project");
+        let impulse_dir = project_root.join(".impulse");
+        std::fs::create_dir_all(&impulse_dir).unwrap();
+        let state = std::sync::Arc::new(crate::state::State::new(impulse_dir).unwrap());
+        let registration = GovernedTaskRegistration::builder(
+            "daemon-register-1",
+            "daemon-task-1",
+            "daemon-project",
+            project_root.display().to_string(),
+            "exercise the real governed task route",
+            "worker-1",
+            "codex",
+        )
+        .build()
+        .unwrap();
+        let wire = serde_json::to_string(&DaemonRequest::RegisterGovernedTask { registration })
+            .expect("serialize register request");
+        let request: DaemonRequest =
+            serde_json::from_str(&wire).expect("deserialize register request");
+
+        let registered =
+            handle_governed_task_request(request, &state, ConnectionClass::Operator).await;
+        let DaemonResponse::Ok { result } = registered else {
+            panic!("expected governed task registration success");
+        };
+        let task: GovernedTaskRun = serde_json::from_value(result).unwrap();
+        assert_eq!(task.revision, 0);
+
+        let running = handle_governed_task_request(
+            DaemonRequest::MutateGovernedTask {
+                request: GovernedTaskMutationRequest {
+                    request_id: GovernedRequestId::try_new("daemon-running-1").unwrap(),
+                    project_id: task.project_id.clone(),
+                    task_id: task.id.clone(),
+                    expected_revision: task.revision,
+                    mutation: GovernedTaskMutation::MarkRunning {
+                        actor: GovernedActor {
+                            kind: GovernedActorKind::System,
+                            id: "daemon-handler-test".to_string(),
+                        },
+                    },
+                },
+            },
+            &state,
+            ConnectionClass::Operator,
+        )
+        .await;
+        let DaemonResponse::Ok { result } = running else {
+            panic!("expected governed task mutation success");
+        };
+        let running: GovernedTaskRun = serde_json::from_value(result).unwrap();
+        assert_eq!(running.revision, 1);
+        assert_eq!(running.execution_state, GovernedExecutionState::Running);
+
+        let fetched = handle_governed_task_request(
+            DaemonRequest::GetGovernedTask {
+                project_id: running.project_id.clone(),
+                task_id: running.id.clone(),
+            },
+            &state,
+            ConnectionClass::Operator,
+        )
+        .await;
+        let DaemonResponse::Ok { result } = fetched else {
+            panic!("expected governed task get success");
+        };
+        assert_eq!(
+            serde_json::from_value::<Option<GovernedTaskRun>>(result)
+                .unwrap()
+                .unwrap(),
+            running
+        );
+
+        let listed = handle_governed_task_request(
+            DaemonRequest::ListGovernedTasks {
+                project_id: "daemon-project".to_string(),
+            },
+            &state,
+            ConnectionClass::Operator,
+        )
+        .await;
+        let DaemonResponse::Ok { result } = listed else {
+            panic!("expected governed task list success");
+        };
+        let tasks: Vec<GovernedTaskRun> = serde_json::from_value(result).unwrap();
+        assert_eq!(tasks, vec![running]);
     }
 
     #[tokio::test]
@@ -1235,12 +1406,41 @@ mod tests {
             Err(_timeout) => {
                 // Timed out = daemon started listening successfully (expected)
                 // Verify stale files were cleaned up
+                use std::os::unix::fs::PermissionsExt;
+
                 assert!(
                     !pid_path.exists() || {
                         // New PID file should contain our PID
                         let pid = tokio::fs::read_to_string(&pid_path).await.unwrap();
                         pid.trim() == std::process::id().to_string()
                     }
+                );
+                assert_eq!(
+                    tokio::fs::metadata(socket_path.parent().unwrap())
+                        .await
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700
+                );
+                assert_eq!(
+                    tokio::fs::metadata(&socket_path)
+                        .await
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
+                );
+                assert_eq!(
+                    tokio::fs::metadata(&pid_path)
+                        .await
+                        .unwrap()
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o600
                 );
             }
         }

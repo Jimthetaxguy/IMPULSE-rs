@@ -159,6 +159,8 @@ pub struct Config {
     pub impulse_agent_api_key: Option<String>,
     /// Impulse Agent: model override
     pub impulse_agent_model: Option<String>,
+    /// Impulse Agent: optional escalate model after verifier/attestation failure
+    pub impulse_agent_escalate_model: Option<String>,
     /// Impulse Agent: CLI harness (claude-code, opencode)
     pub impulse_agent_harness: Option<String>,
     /// Impulse Agent: enable automatic review of cross-pane activity
@@ -281,6 +283,7 @@ impl Default for Config {
             impulse_agent_provider: None,
             impulse_agent_api_key: None,
             impulse_agent_model: None,
+            impulse_agent_escalate_model: None,
             impulse_agent_harness: None,
             impulse_agent_auto_review: false,
             impulse_agent_auto_coordinate: false,

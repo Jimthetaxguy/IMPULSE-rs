@@ -30,6 +30,9 @@ pub const AGENT_RESIZE_COMMAND: &str = "agent_resize";
 pub const AGENT_SNAPSHOT_COMMAND: &str = "agent_snapshot";
 pub const AGENT_SPAWN_COMMAND: &str = "agent_spawn";
 pub const AGENT_WRITE_COMMAND: &str = "agent_write";
+pub const GOVERNED_OUTCOME_PROMOTE_COMMAND: &str = "governed_outcome_promote";
+pub const GOVERNED_STAGED_WORKTREE_DISCARD_COMMAND: &str = "governed_staged_worktree_discard";
+pub const GOVERNED_TASK_MUTATE_COMMAND: &str = "governed_task_mutate";
 pub const LIST_WORKSPACES_COMMAND: &str = "list_workspaces";
 pub const MCP_DESCRIPTORS_COMMAND: &str = "mcp_descriptors";
 pub const MCP_INVOKE_COMMAND: &str = "mcp_invoke";
@@ -52,6 +55,9 @@ pub const HOST_INVOKE_COMMANDS: &[&str] = &[
     AGENT_SNAPSHOT_COMMAND,
     AGENT_SPAWN_COMMAND,
     AGENT_WRITE_COMMAND,
+    GOVERNED_OUTCOME_PROMOTE_COMMAND,
+    GOVERNED_STAGED_WORKTREE_DISCARD_COMMAND,
+    GOVERNED_TASK_MUTATE_COMMAND,
     LIST_WORKSPACES_COMMAND,
     MCP_DESCRIPTORS_COMMAND,
     MCP_INVOKE_COMMAND,
@@ -81,7 +87,10 @@ pub async fn agent_spawn(
     runtime: tauri::State<'_, DesktopRuntime>,
     request: AgentSpawnRequest,
 ) -> Result<AgentRuntimeSnapshot, String> {
-    agent_spawn_inner(&runtime, request)
+    run_runtime_blocking("agent spawn", runtime.inner().clone(), move |runtime| {
+        agent_spawn_inner(runtime, request)
+    })
+    .await
 }
 
 #[cfg(not(feature = "legacy-tauri-runtime"))]
@@ -89,7 +98,10 @@ pub async fn agent_spawn(
     runtime: &DesktopRuntime,
     request: AgentSpawnRequest,
 ) -> Result<AgentRuntimeSnapshot, String> {
-    agent_spawn_inner(runtime, request)
+    run_runtime_blocking("agent spawn", runtime.clone(), move |runtime| {
+        agent_spawn_inner(runtime, request)
+    })
+    .await
 }
 
 fn agent_spawn_inner(
@@ -97,6 +109,20 @@ fn agent_spawn_inner(
     request: AgentSpawnRequest,
 ) -> Result<AgentRuntimeSnapshot, String> {
     runtime.spawn_agent(request).map_err(err_to_string)
+}
+
+async fn run_runtime_blocking<T, F>(
+    label: &'static str,
+    runtime: DesktopRuntime,
+    operation: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&DesktopRuntime) -> Result<T, String> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || operation(&runtime))
+        .await
+        .map_err(|error| format!("{label} worker failed: {error}"))?
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -118,6 +144,103 @@ pub async fn agent_write(
 
 fn agent_write_inner(runtime: &DesktopRuntime, request: AgentWriteRequest) -> Result<(), String> {
     runtime.write_agent(request).map_err(err_to_string)
+}
+
+/// Acknowledged governed-task mutation. The Unix request is blocking, so the
+/// host runs it on Tokio's blocking pool rather than the Dioxus async worker.
+#[cfg(feature = "legacy-tauri-runtime")]
+#[tauri::command]
+pub async fn governed_task_mutate(
+    state: tauri::State<'_, DesktopShellState>,
+    request: impulse_ops::governed_task::GovernedTaskMutationRequest,
+) -> Result<impulse_ops::governed_task::GovernedTaskRun, String> {
+    governed_task_mutate_runtime(std::sync::Arc::clone(&state.inner().runtime), request).await
+}
+
+#[cfg(not(feature = "legacy-tauri-runtime"))]
+pub async fn governed_task_mutate(
+    state: &DesktopShellState,
+    request: impulse_ops::governed_task::GovernedTaskMutationRequest,
+) -> Result<impulse_ops::governed_task::GovernedTaskRun, String> {
+    governed_task_mutate_runtime(std::sync::Arc::clone(&state.runtime), request).await
+}
+
+async fn governed_task_mutate_runtime(
+    runtime: std::sync::Arc<DesktopRuntime>,
+    request: impulse_ops::governed_task::GovernedTaskMutationRequest,
+) -> Result<impulse_ops::governed_task::GovernedTaskRun, String> {
+    tokio::task::spawn_blocking(move || {
+        runtime.mutate_governed_task(request).map_err(err_to_string)
+    })
+    .await
+    .map_err(|error| format!("governed task command worker failed: {error}"))?
+}
+
+/// Fast-forward the canonical branch onto an accepted staged outcome
+/// (ADR-0019, protocol v9).
+///
+/// A blocked promotion is a recorded `Ok`; a typed refusal is a distinct `Ok`
+/// carrying the unchanged task and remedy. Transport or invalid responses are `Err`.
+#[cfg(feature = "legacy-tauri-runtime")]
+#[tauri::command]
+pub async fn governed_outcome_promote(
+    state: tauri::State<'_, DesktopShellState>,
+    request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+) -> Result<crate::runtime::GovernedPromotionResponse, String> {
+    governed_outcome_promote_runtime(std::sync::Arc::clone(&state.inner().runtime), request).await
+}
+
+#[cfg(not(feature = "legacy-tauri-runtime"))]
+pub async fn governed_outcome_promote(
+    state: &DesktopShellState,
+    request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+) -> Result<crate::runtime::GovernedPromotionResponse, String> {
+    governed_outcome_promote_runtime(std::sync::Arc::clone(&state.runtime), request).await
+}
+
+async fn governed_outcome_promote_runtime(
+    runtime: std::sync::Arc<DesktopRuntime>,
+    request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+) -> Result<crate::runtime::GovernedPromotionResponse, String> {
+    tokio::task::spawn_blocking(move || {
+        runtime
+            .promote_governed_outcome(request)
+            .map_err(err_to_string)
+    })
+    .await
+    .map_err(|error| format!("governed promotion command worker failed: {error}"))?
+}
+
+/// Reclaim a finished staged worktree (ADR-0019, protocol v9).
+#[cfg(feature = "legacy-tauri-runtime")]
+#[tauri::command]
+pub async fn governed_staged_worktree_discard(
+    state: tauri::State<'_, DesktopShellState>,
+    request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck, String> {
+    governed_staged_worktree_discard_runtime(std::sync::Arc::clone(&state.inner().runtime), request)
+        .await
+}
+
+#[cfg(not(feature = "legacy-tauri-runtime"))]
+pub async fn governed_staged_worktree_discard(
+    state: &DesktopShellState,
+    request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck, String> {
+    governed_staged_worktree_discard_runtime(std::sync::Arc::clone(&state.runtime), request).await
+}
+
+async fn governed_staged_worktree_discard_runtime(
+    runtime: std::sync::Arc<DesktopRuntime>,
+    request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck, String> {
+    tokio::task::spawn_blocking(move || {
+        runtime
+            .discard_governed_staged_worktree(request)
+            .map_err(err_to_string)
+    })
+    .await
+    .map_err(|error| format!("governed discard command worker failed: {error}"))?
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -174,7 +297,10 @@ pub async fn agent_close(
     runtime: tauri::State<'_, DesktopRuntime>,
     request: TerminalCloseRequest,
 ) -> Result<(), String> {
-    agent_close_inner(&runtime, request)
+    run_runtime_blocking("agent close", runtime.inner().clone(), move |runtime| {
+        agent_close_inner(runtime, request)
+    })
+    .await
 }
 
 #[cfg(not(feature = "legacy-tauri-runtime"))]
@@ -182,7 +308,10 @@ pub async fn agent_close(
     runtime: &DesktopRuntime,
     request: TerminalCloseRequest,
 ) -> Result<(), String> {
-    agent_close_inner(runtime, request)
+    run_runtime_blocking("agent close", runtime.clone(), move |runtime| {
+        agent_close_inner(runtime, request)
+    })
+    .await
 }
 
 fn agent_close_inner(
@@ -335,7 +464,10 @@ pub async fn terminal_close(
     runtime: tauri::State<'_, DesktopRuntime>,
     request: TerminalCloseRequest,
 ) -> Result<(), String> {
-    terminal_close_inner(&runtime, request)
+    run_runtime_blocking("terminal close", runtime.inner().clone(), move |runtime| {
+        terminal_close_inner(runtime, request)
+    })
+    .await
 }
 
 #[cfg(not(feature = "legacy-tauri-runtime"))]
@@ -343,7 +475,10 @@ pub async fn terminal_close(
     runtime: &DesktopRuntime,
     request: TerminalCloseRequest,
 ) -> Result<(), String> {
-    terminal_close_inner(runtime, request)
+    run_runtime_blocking("terminal close", runtime.clone(), move |runtime| {
+        terminal_close_inner(runtime, request)
+    })
+    .await
 }
 
 fn terminal_close_inner(
@@ -482,8 +617,7 @@ pub async fn mcp_invoke(
     request: McpInvokeRequest,
 ) -> Result<McpInvocation, String> {
     let state = state.inner().clone();
-    let context = state.context();
-    invoke_blocking(&state, request, context)
+    invoke_on_blocking_pool(state, request).await
 }
 
 #[cfg(not(feature = "legacy-tauri-runtime"))]
@@ -491,8 +625,19 @@ pub async fn mcp_invoke(
     state: &DesktopShellState,
     request: McpInvokeRequest,
 ) -> Result<McpInvocation, String> {
-    let context = state.context();
-    invoke_blocking(state, request, context)
+    invoke_on_blocking_pool(state.clone(), request).await
+}
+
+async fn invoke_on_blocking_pool(
+    state: DesktopShellState,
+    request: McpInvokeRequest,
+) -> Result<McpInvocation, String> {
+    tokio::task::spawn_blocking(move || {
+        let context = state.context();
+        invoke_blocking(&state, request, context)
+    })
+    .await
+    .map_err(|error| format!("MCP invocation worker failed: {error}"))?
 }
 
 fn invoke_blocking(
@@ -663,6 +808,7 @@ mod tests {
             AGENT_RESIZE_COMMAND,
             AGENT_SNAPSHOT_COMMAND,
             AGENT_WRITE_COMMAND,
+            GOVERNED_TASK_MUTATE_COMMAND,
             LIST_WORKSPACES_COMMAND,
             MCP_DESCRIPTORS_COMMAND,
             MCP_INVOKE_COMMAND,

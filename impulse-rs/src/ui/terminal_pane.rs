@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -68,6 +69,28 @@ pub struct TerminalSpawnRequest<'a> {
     pub scrollback_lines: Option<usize>,
 }
 
+/// Remove every inherited `IMPULSE_*` environment key from a pending PTY
+/// command before explicit launch metadata is overlaid. A `CommandBuilder`
+/// starts from the parent process environment, so an ordinary pane spawned from
+/// a governed Desktop/daemon context would otherwise inherit a daemon socket,
+/// producer CLI, governed task id, or role identity that belongs to a different
+/// agent instance. Matching, case-insensitive prefix logic to
+/// `impulse-term::backend::remove_inherited_impulse_env`.
+fn remove_inherited_impulse_env<I>(command: &mut CommandBuilder, inherited_keys: I)
+where
+    I: IntoIterator<Item = OsString>,
+{
+    for key in inherited_keys {
+        let rendered = key.to_string_lossy();
+        if rendered
+            .get(.."IMPULSE_".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("IMPULSE_"))
+        {
+            command.env_remove(&key);
+        }
+    }
+}
+
 impl TerminalPane {
     pub fn spawn(request: TerminalSpawnRequest<'_>) -> anyhow::Result<Self> {
         let TerminalSpawnRequest {
@@ -91,6 +114,14 @@ impl TerminalPane {
         let pair = pty_system.openpty(size)?;
 
         let mut cmd = CommandBuilder::new(command);
+        // Scrub any IMPULSE_* vars inherited from this process's environment
+        // before overlaying explicit launch metadata below. `CommandBuilder`
+        // seeds the child from the parent environment, so omitting a key does
+        // not isolate it: a pane spawned from a governed context could otherwise
+        // inherit the Desktop/daemon socket, producer CLI, governed task id, or
+        // role identity that belongs to another agent instance. Mirrors
+        // impulse-term::backend's remove_inherited_impulse_env.
+        remove_inherited_impulse_env(&mut cmd, std::env::vars_os().map(|(key, _value)| key));
         for arg in args {
             cmd.arg(arg);
         }
@@ -472,5 +503,46 @@ fn pty_reader_loop(
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inherited_impulse_environment_is_scrubbed_before_explicit_overlay() {
+        let mut command = CommandBuilder::new("true");
+        // Governed identity vars a TUI could carry from a Desktop/daemon parent.
+        command.env("IMPULSE_SOCKET_PATH", "/tmp/parent.sock");
+        command.env("IMPULSE_GOVERNED_TASK_ID", "task-parent");
+        command.env("IMPULSE_PROJECT_ID", "project-parent");
+        command.env("PATH", "/usr/bin");
+
+        remove_inherited_impulse_env(
+            &mut command,
+            [
+                OsString::from("IMPULSE_SOCKET_PATH"),
+                OsString::from("IMPULSE_GOVERNED_TASK_ID"),
+                OsString::from("IMPULSE_PROJECT_ID"),
+                OsString::from("PATH"),
+            ],
+        );
+
+        // Every governed identity var is removed; unrelated vars survive.
+        assert!(command.get_env("IMPULSE_SOCKET_PATH").is_none());
+        assert!(command.get_env("IMPULSE_GOVERNED_TASK_ID").is_none());
+        assert!(command.get_env("IMPULSE_PROJECT_ID").is_none());
+        assert_eq!(
+            command.get_env("PATH"),
+            Some(std::ffi::OsStr::new("/usr/bin"))
+        );
+
+        // Explicit launch metadata overlaid after the scrub still applies.
+        command.env("IMPULSE_PANE_ID", "7");
+        assert_eq!(
+            command.get_env("IMPULSE_PANE_ID"),
+            Some(std::ffi::OsStr::new("7"))
+        );
     }
 }

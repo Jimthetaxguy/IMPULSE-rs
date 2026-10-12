@@ -18,6 +18,9 @@
 //! contract holds. Only the Terminal view is kept alive across switches.
 
 use dioxus::prelude::*;
+use impulse_ops::memory_candidate::{
+    AcceptedRunMemoryCandidate, AcceptedRunSourceAssurance, MemoryCandidateStatus,
+};
 use impulse_ops::{
     ArtifactEnvelope, ArtifactStatus, ArtifactViewHint, ContextHealthSummary, InsightRecord,
     MemorySummary, RetrievalSummary,
@@ -177,6 +180,7 @@ pub fn MemoryView(
     context: ContextHealthSummary,
     memory: MemorySummary,
     retrieval: RetrievalSummary,
+    memory_candidates: Vec<AcceptedRunMemoryCandidate>,
 ) -> Element {
     let pct = usage_meter_pct(context.usage_fraction);
     let tier = if context.tier.is_empty() {
@@ -245,6 +249,72 @@ pub fn MemoryView(
                     value: context.injection_count.to_string(),
                     sub: format!("{} compactions", context.compaction_count),
                 }
+                StatCard {
+                    label: "Candidates".to_string(),
+                    value: memory_candidates.len().to_string(),
+                    sub: "review-only accepted outcomes".to_string(),
+                }
+            }
+            section { class: "view-section memory-candidates", "data-source": "memory_candidates",
+                h3 { "Accepted-run candidates" }
+                if memory_candidates.is_empty() {
+                    p { class: "section-empty", "No accepted outcome is awaiting semantic-memory review." }
+                } else {
+                    div { class: "memory-candidate-list",
+                        for candidate in memory_candidates {
+                            {
+                                let assurance = match candidate.source_assurance {
+                                    AcceptedRunSourceAssurance::DaemonProfiledEvidenceDeclaredOperator =>
+                                        "daemon-profiled evidence · declared operator",
+                                    // ADR-0018: the approving connection presented this
+                                    // daemon run's operator capability.
+                                    AcceptedRunSourceAssurance::DaemonProfiledEvidenceAuthenticatedOperator =>
+                                        "daemon-profiled evidence · authenticated operator",
+                                    AcceptedRunSourceAssurance::CallerComposedEvidenceDeclaredOperator =>
+                                        "caller-composed evidence · declared operator",
+                                };
+                                // ADR-0020 added the two decided variants. This
+                                // read-only view renders them; the operator
+                                // Promote/Dismiss controls are a separate lane.
+                                let status = match candidate.status {
+                                    MemoryCandidateStatus::PendingReview => "Pending review — not stored in GENOME",
+                                    MemoryCandidateStatus::Promoted { .. } => "Promoted — in the GENOME projection",
+                                    MemoryCandidateStatus::Dismissed { .. } => "Dismissed — not stored in GENOME",
+                                };
+                                rsx! {
+                                    article {
+                                        class: "memory-candidate-card",
+                                        "data-candidate-id": "{candidate.id}",
+                                        div { class: "view-card-k", "{status}" }
+                                        h4 { "{candidate.task}" }
+                                        p { class: "memory-candidate-summary", "{candidate.proposed_summary}" }
+                                        dl { class: "memory-candidate-evidence",
+                                            dt { "Verified subject" }
+                                            dd { code { "{candidate.subject_revision}" } }
+                                            dt { "Verification" }
+                                            dd { "{candidate.verification_policy}" }
+                                            dt { "Assurance" }
+                                            dd { "{assurance}" }
+                                            dt { "Task / evidence" }
+                                            dd {
+                                                code { "{candidate.governed_task_id}" }
+                                                " · "
+                                                code { "{candidate.verification_id}" }
+                                                " · "
+                                                code { "{candidate.operator_decision_id}" }
+                                            }
+                                        }
+                                        ul { class: "memory-candidate-criteria",
+                                            for criterion in candidate.acceptance_criteria {
+                                                li { "{criterion}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             section { class: "view-section retrieval-status", "data-source": "retrieval",
                 h3 { "Retrieval" }
@@ -299,6 +369,7 @@ fn ArtifactCard(artifact: ArtifactEnvelope, on_intent: EventHandler<ShellIntent>
                         {
                             let artifact_id = artifact.id.clone();
                             let action_id = action.id.clone();
+                            let action_key = action_id.clone();
                             let action_label = action.label.clone();
                             let class_name = if action.requires_confirmation {
                                 "action-ghost mutating"
@@ -307,7 +378,7 @@ fn ArtifactCard(artifact: ArtifactEnvelope, on_intent: EventHandler<ShellIntent>
                             };
                             rsx! {
                                 button {
-                                    key: "{action_id}",
+                                    key: "{action_key}",
                                     class: "{class_name}",
                                     onclick: move |_| on_intent.call(ShellIntent::ArtifactAction {
                                         artifact_id: artifact_id.clone(),

@@ -3,6 +3,12 @@
 
 use dioxus::prelude::*;
 use impulse_desktop::{ArtifactsView, MemoryView, MemoryViewProps};
+use impulse_ops::governed_task::{GovernedRecordId, GovernedTaskId, GovernedVerificationProfile};
+use impulse_ops::memory_candidate::{
+    AcceptedRunCommandEvidence, AcceptedRunMemoryCandidate, AcceptedRunSourceAssurance,
+    MemoryCandidateId, MemoryCandidateStatus, ACCEPTED_RUN_MEMORY_CANDIDATE_SCHEMA_VERSION,
+    ACCEPTED_RUN_MEMORY_DERIVATION_VERSION,
+};
 use impulse_ops::{
     ArtifactAction, ArtifactEnvelope, ArtifactStatus, ArtifactViewHint, ContextHealthSummary,
     InsightRecord, MemorySummary, RetrievalSummary,
@@ -19,6 +25,54 @@ fn seed_insight(content: &str) -> InsightRecord {
         agent_label: "codex".to_string(),
         kind: "decision".to_string(),
         content: content.to_string(),
+    }
+}
+
+fn digest(prefix: &str, character: char) -> String {
+    format!("{prefix}{}", character.to_string().repeat(64))
+}
+
+fn accepted_run_candidate() -> AcceptedRunMemoryCandidate {
+    AcceptedRunMemoryCandidate {
+        id: MemoryCandidateId::try_new(format!(
+            "memory-candidate-{}",
+            "a".repeat(64)
+        ))
+        .unwrap(),
+        schema_version: ACCEPTED_RUN_MEMORY_CANDIDATE_SCHEMA_VERSION,
+        derivation_version: ACCEPTED_RUN_MEMORY_DERIVATION_VERSION,
+        status: MemoryCandidateStatus::PendingReview,
+        project_id: "impulse-rs".to_string(),
+        workspace_root: "/tmp/impulse-rs".to_string(),
+        governed_task_id: GovernedTaskId::try_new("task-memory-candidate").unwrap(),
+        accepted_task_revision: 7,
+        task: "Stage an accepted-run memory candidate".to_string(),
+        acceptance_criteria: vec!["Keep the candidate review-only".to_string()],
+        proposed_summary: "Accepted governed outcome backed by daemon-profiled verification; pending semantic-memory review.".to_string(),
+        runtime_id: "codex".to_string(),
+        agent_id: "builder-01".to_string(),
+        session_id: Some("session-01".to_string()),
+        verification_profile: Some(GovernedVerificationProfile::RustWorkspaceV1),
+        verification_policy: "rust_workspace_v1".to_string(),
+        subject_revision: "a".repeat(40),
+        claim_id: GovernedRecordId::try_new("claim-01").unwrap(),
+        verification_id: GovernedRecordId::try_new("verification-01").unwrap(),
+        supervisor_verdict_id: GovernedRecordId::try_new("verdict-01").unwrap(),
+        operator_decision_id: GovernedRecordId::try_new("decision-01").unwrap(),
+        claimed_artifact_ids: vec!["artifact-claim-01".to_string()],
+        verification_artifact_ids: vec!["artifact-verification-01".to_string()],
+        commands: vec![AcceptedRunCommandEvidence {
+            name: "cargo-test".to_string(),
+            command_digest: digest("sha256:", 'b'),
+            output_digest: digest("sha256:", 'c'),
+            exit_code: Some(0),
+            success: true,
+            output_bytes: 42,
+            output_truncated: false,
+        }],
+        source_assurance: AcceptedRunSourceAssurance::DaemonProfiledEvidenceDeclaredOperator,
+        source_digest: digest("sha256-v1:", 'd'),
+        staged_at: "2026-07-15T22:00:00Z".to_string(),
     }
 }
 
@@ -53,6 +107,7 @@ fn test_memory_view_binds_context_memory_and_retrieval() {
             context,
             memory,
             retrieval,
+            memory_candidates: Vec::new(),
         },
     ));
 
@@ -92,6 +147,7 @@ fn test_memory_view_fallbacks_for_empty_and_none_fields() {
             context,
             memory,
             retrieval,
+            memory_candidates: Vec::new(),
         },
     ));
 
@@ -100,6 +156,38 @@ fn test_memory_view_fallbacks_for_empty_and_none_fields() {
     assert!(html.contains("—"));
     assert!(html.contains("note"));
     assert!(html.contains("untyped note"));
+}
+
+#[test]
+fn test_memory_view_renders_review_only_candidate_provenance_without_actions() {
+    let candidate = accepted_run_candidate();
+    let candidate_id = candidate.id.to_string();
+    let html = render_dom(VirtualDom::new_with_props(
+        MemoryView,
+        MemoryViewProps {
+            context: ContextHealthSummary::default(),
+            memory: MemorySummary::default(),
+            retrieval: RetrievalSummary::default(),
+            memory_candidates: vec![candidate],
+        },
+    ));
+
+    assert!(html.contains("Accepted-run candidates"));
+    assert!(html.contains(&format!("data-candidate-id=\"{candidate_id}\"")));
+    assert!(html.contains("Pending review — not stored in GENOME"));
+    assert!(html.contains("Stage an accepted-run memory candidate"));
+    assert!(html.contains("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    assert!(html.contains("rust_workspace_v1"));
+    assert!(html.contains("daemon-profiled evidence · declared operator"));
+    assert!(html.contains("task-memory-candidate"));
+    assert!(html.contains("verification-01"));
+    assert!(html.contains("decision-01"));
+    assert!(html.contains("Keep the candidate review-only"));
+
+    assert!(!html.contains("<button"));
+    assert!(!html.contains("Promote"));
+    assert!(!html.contains(">Apply<"));
+    assert!(!html.contains("artifact-actions"));
 }
 
 #[component]

@@ -3,6 +3,8 @@ title: User Story Map
 description: Rust-first user stories and documentation baseline for the current Impulse product surface
 version: '1.3'
 updated: 2026-07-13
+version: '1.4'
+updated: 2026-07-15
 type: specification
 category: core
 phase: all
@@ -209,7 +211,7 @@ Status: Implemented
 
 Acceptance criteria:
 
-- the Unix socket protocol serves session, tool, guard, steward, and workbench requests
+- the Unix socket protocol serves session, tool, guard, steward, workbench, and governed-task requests
 - daemon lifecycle operations avoid unsafe crashes on malformed input
 - direct CLI and daemon workflows can coexist against the same project state
 
@@ -217,6 +219,9 @@ Primary interfaces:
 
 - `daemon`
 - JSON-line IPC protocol v3
+- JSON-line IPC protocol v6
+- `RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, `MutateGovernedTask`
+- `SubmitGovernedClaim`, `RunGovernedVerification`, `RunGovernedSupervisorReview`
 
 #### ST-09 Observe work through the Dioxus desktop host
 
@@ -229,6 +234,8 @@ Acceptance criteria:
 - `impulse-desktop` renders the current workbench surfaces
 - daemon snapshots provide the durable read model for the active workbench surfaces
 - live terminal telemetry can be overlaid without replacing durable daemon truth
+- the Supervisor route renders `ProjectOpsSnapshot.governed_tasks` and submits acknowledged
+  revision-bound decisions without optimistic task state
 
 Primary interfaces:
 
@@ -239,6 +246,7 @@ Primary interfaces:
 - `ListArtifacts`
 - `GetArtifact`
 - `RunArtifactAction`
+- `governed_task_mutate`
 
 ### E. Stewardship and Safety
 
@@ -304,6 +312,7 @@ As an operator, I want one supervisor and one builder to complete a scoped task 
 backend policy so Impulse proves that its existing controls compose into a governed workflow.
 
 Status: In progress
+Status: In progress — daemon-owned profiled producers live; full launched-runtime workflow pending
 
 Acceptance criteria:
 
@@ -311,6 +320,14 @@ Acceptance criteria:
 - the supervisor observes daemon-owned workbench truth and can focus the builder or send confirmed input under `SupervisorPermissionPolicy`
 - the builder receives a bounded assignment and produces reviewable implementation and verification evidence
 - completion distinguishes worker claims, observed evidence, supervisor judgment, and operator approval
+- the builder receives a bounded assignment plus exact acceptance criteria, and the profiled path
+  binds its claim to a daemon-attested clean committed Git subject
+- the daemon, rather than the Builder, expands and executes the closed verification profile and
+  derives bounded evidence
+- Supervisor review is a strict criteria-digest-bound API turn with no tools or shared history;
+  unsupported generic harness configuration fails closed
+- completion distinguishes worker claims, observed evidence, supervisor judgment, and operator approval
+- runtime exit and task acceptance remain independent, with final acceptance reserved for an explicit operator decision against current passing evidence
 - terminal launch, write, focus, close, and lifecycle telemetry remain projections of daemon/control-plane truth rather than a competing state store
 - role-specific permissions are enforced by the backend for this slice, with unsupported enforcement reported honestly
 
@@ -320,6 +337,13 @@ Primary interfaces:
 - `AgentRoleId` / `AgentRoleAssignment` / `RoleCompatibility`
 - `DesktopRuntime::{spawn_agent, write_agent, focus_agent, close_agent}`
 - daemon `PublishTerminalOps`, `SubscribeOps`, and `RunSupervisorAction`
+- `GovernedTaskRun` / `GovernedTaskMutationRequest` and the typed claim, verification, supervisor verdict, and operator decision records
+- `DesktopRuntime::{spawn_agent, write_agent, focus_agent, close_agent}`
+- daemon `RegisterGovernedTask`, `GetGovernedTask`, `ListGovernedTasks`, `MutateGovernedTask`,
+  `SubmitGovernedClaim`, `RunGovernedVerification`, `RunGovernedSupervisorReview`,
+  `PublishTerminalOps`, `SubscribeOps`, and `RunSupervisorAction`
+- CLI `impulse-rs --daemon governed-claim|governed-verify|governed-review` (or the injected
+  `"$IMPULSE_CONTROL_CLI" --daemon ...` path); Ion `governed_submit_claim`
 - `SupervisorPermissionPolicy` / `SupervisorPermissionState`
 
 Live boundary:
@@ -327,6 +351,34 @@ Live boundary:
 - the Dioxus Builder launcher now requires an explicit bounded task and product-role assignment, previews trusted static compatibility, and fails closed when its platform catalog is unavailable
 - the backend canonicalizes the workspace, repeats compatibility evaluation, blocks unsatisfied mandatory requirements before agent-id reservation or PTY creation, and preserves task/assignment/result telemetry
 - one end-to-end supervisor/builder governed-run lifecycle carrying evidence through verification, supervisor judgment, and operator approval is not yet complete
+- the Dioxus Builder launcher requires an explicit bounded task, exact acceptance criteria,
+  `rust_workspace_v1`, and product-role assignment; desktop and daemon both attest the clean
+  canonical Git `HEAD` before PTY launch
+- the backend canonicalizes the workspace, while the daemon independently recomputes exact runtime
+  compatibility from its registry and rejects caller-forged results; unsatisfied mandatory
+  requirements block before agent-id reservation or PTY creation
+- governed Builder launch now registers a distinct durable task before PTY creation; registration failure blocks launch without reserving the agent id
+- daemon state now separates execution from review, persists revisioned/idempotent task mutations and lifecycle events, rejects stale/cross-project transitions, and never infers acceptance from process exit
+- profiled claims arrive through env-routed CLI or Ion's typed tool, while the daemon derives Worker
+  identity and subject; generic automatic producer mutations are rejected
+- verification runs fixed Rust commands in a detached worktree with a scrubbed environment,
+  a committed regular root lockfile, no source-tree symlinks, timeouts, streamed digests,
+  process-group cleanup, and bounded post-kill reaping. It executes host-trusted project code and
+  is not an OS sandbox
+- the daemon runs strict API-only, tool-free, history-free Supervisor review bound to the current
+  evidence and acceptance-criteria digest; generic external harness review fails closed
+- the Dioxus Supervisor surface renders evidence and terminal producer-command guidance, then
+  submits acknowledged operator decisions without optimistic state; it does not expose producer
+  buttons, and only the operator can create `accepted`
+- accepted tasks deterministically stage one pending candidate in owner-only
+  `MEMORY_CANDIDATES.json`; replay/startup repairs absence, contradictions fail closed, and Dioxus
+  renders the candidate read-only without changing `GENOME.md` or `HISTORY.jsonl`
+- desktop launch/exit intent is written ahead of daemon I/O to a bounded, owner-only, cross-process-locked project outbox and reconciles after daemon recovery; abrupt process death before exit intent exists still requires runtime leases/orphan reconciliation
+- a real daemon/CLI/child-process test proves claim, detached verification, persistence, and restart;
+  daemon handler tests prove strict Supervisor binding and operator-only acceptance. One complete
+  launched Builder/Supervisor workflow remains downstream; explicit candidate promotion/dismissal
+  is a later memory-writing contract
+- typed actor kinds are provenance rather than same-user cryptographic authentication; project identity, task reassignment, pagination/archive, and structured CAS errors remain explicit follow-ups
 - generalized role composition, a common dynamic runtime-adapter trait, and capability negotiation across arbitrary runtimes remain target architecture; this narrow preflight must not imply that every runtime has equal or continuous enforcement
 
 ## Story Priority

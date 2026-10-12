@@ -41,6 +41,23 @@ pub struct HistoryEntry {
 
 pub struct State {
     storage: Storage,
+    pub(super) governed_tasks: std::sync::Mutex<super::governed_task::GovernedTaskLedger>,
+    pub(super) memory_candidates: std::sync::Mutex<super::memory_candidate::MemoryCandidateLedger>,
+    /// Whether `MEMORY_CANDIDATES.json` existed when this `State` opened.
+    ///
+    /// Captured before any reconciliation writes it, because candidate
+    /// reconciliation re-creates the file — so a later probe would report
+    /// `Local` on every machine and a fresh clone's tracked memory log would be
+    /// misread as a pile of interrupted decisions (ADR-0020 rule 3b).
+    pub(super) memory_ledger_origin: super::memory_record::LedgerOrigin,
+    /// Verified view of the append-only promoted-memory log (ADR-0020).
+    /// Always locked *after* `memory_candidates`, never before.
+    pub(super) memory_log: std::sync::Mutex<super::memory_record::MemoryLog>,
+    pub(super) producer_reservations:
+        std::sync::Mutex<super::producer_reservation::ProducerReservationLedger>,
+    governed_producer_locks: tokio::sync::Mutex<
+        HashMap<impulse_ops::governed_task::GovernedTaskId, Arc<tokio::sync::Mutex<()>>>,
+    >,
     live_state: RwLock<LiveState>,
     /// Set on every mutation, cleared after a sync. A lock-free `AtomicBool`
     /// so `mark_dirty` (sync, called from async mutators) and the `Drop` flush
@@ -84,17 +101,52 @@ impl State {
         let config = storage
             .read_json::<Config>(CONFIG_FILE)
             .context("Failed to read config from disk")?;
+        let governed_tasks = Self::load_governed_task_ledger(&storage)?;
+        let (memory_candidates, memory_ledger_origin) =
+            Self::load_memory_candidate_ledger(&storage)?;
+        let producer_reservations = Self::load_producer_reservation_ledger(&storage)?;
 
-        Ok(Self {
+        let state = Self {
             storage,
+            governed_tasks,
+            memory_candidates,
+            memory_ledger_origin,
+            memory_log: std::sync::Mutex::new(Default::default()),
+            producer_reservations,
+            governed_producer_locks: tokio::sync::Mutex::new(HashMap::new()),
             live_state: RwLock::new(live_state),
             dirty: AtomicBool::new(false),
             config: RwLock::new(config),
-        })
+        };
+        state.reconcile_accepted_run_memory_candidates()?;
+        // Must follow candidate reconciliation: the log is cross-checked against
+        // the reconciled review statuses, not the pre-migration ones.
+        state.reconcile_promoted_memory_log()?;
+        state.reconcile_producer_reservations()?;
+        Ok(state)
     }
 
     pub fn storage(&self) -> &Storage {
         &self.storage
+    }
+
+    /// Serialize daemon-owned producer side effects per governed task.
+    ///
+    /// The guard spans the authoritative re-read, any Git/command/model work,
+    /// and persistence. This keeps duplicate and competing requests from
+    /// executing the same expensive producer before CAS can reject one.
+    pub(crate) async fn acquire_governed_producer_lock(
+        &self,
+        task_id: &impulse_ops::governed_task::GovernedTaskId,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.governed_producer_locks.lock().await;
+            locks
+                .entry(task_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
     }
 
     fn mark_dirty(&self) {

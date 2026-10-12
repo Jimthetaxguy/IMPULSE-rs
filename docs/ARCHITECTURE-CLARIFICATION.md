@@ -1,6 +1,7 @@
 # Control-Plane Architecture Boundaries
 
 - **Updated:** 2026-07-13
+- **Updated:** 2026-10-03
 - **Status:** Active boundary map
 - **North star:** [`../VISION.md`](../VISION.md)
 - **Canonical product contract:** [`spec/RUST-CANONICAL-CONTRACT.md`](spec/RUST-CANONICAL-CONTRACT.md)
@@ -43,6 +44,7 @@ workbench authority.
 | Agent instance | One running identity and its status | `AgentRuntime`, `AgentRuntimeSnapshot`, desktop runtime record | Not a session |
 | Session | Bounded persisted work history | daemon create/end session + `.impulse/LIVE_STATE.json`/history | Not necessarily process lifetime |
 | Task | Assignment plus acceptance evidence | delegations, `current_task`, Ion harness `Task` | May span sessions |
+| Task | Assignment plus acceptance evidence | daemon-owned `GovernedTaskRun`; delegations, `current_task`, and Ion harness `Task` remain separate carriers | Governed task id is distinct from agent/session ids; current assignment is immutable and resume/reassignment is future work |
 | Pane | View/input attachment | TUI pane manager and desktop terminal ids | Not an authorization boundary |
 | Workspace target | Filesystem root assigned at launch | desktop `WorkspaceTarget`/`WorkspaceRegistry` | Not the same as global cockpit scope |
 | Project | Memory/policy/artifact governance boundary | `ProjectOpsSnapshot`, project-scoped `.impulse/` data | Often maps 1:1 to a workspace today, but conceptually distinct |
@@ -59,6 +61,10 @@ generalized role composition, a common runtime-adapter contract, or dynamic capa
 | Daemon coordination | `impulse-rs/src/daemon/{mod,protocol,handlers}.rs` | Workbench authority, session operations, managed agent turns, telemetry overlays, supervisor enforcement | Live |
 | PTY/process lifecycle | `impulse-rs/impulse-term/src/backend.rs`, `impulse-rs/impulse-desktop/src/runtime.rs` | Spawn, input, resize, focus, output, exit, and cleanup | Live |
 | Dioxus cockpit | `impulse-rs/impulse-desktop/src/{desktop_host,host_bridge,host_commands,views}.rs` | Renders backend state and dispatches typed host actions; does not own durable truth | Live host/bridge foundation |
+| Shared control-plane wire/read models | `impulse-rs/impulse-ops/src/{lib,governed_task,memory_candidate}.rs` | Versioned daemon requests/responses, workbench snapshots, governed task/evidence/decision types, accepted-run candidate types, telemetry, supervisor policy/actions, artifacts | Live |
+| Daemon coordination | `impulse-rs/src/daemon/{mod,protocol,handlers}.rs`, `src/state/{governed_task,memory_candidate}.rs`, `src/governed_producers.rs` | Workbench authority, persistent governed-task lifecycle, deterministic accepted-run review projection, profiled claim/verification/Supervisor producers, managed agent turns, telemetry overlays | Live |
+| PTY/process lifecycle | `impulse-rs/impulse-term/src/backend.rs`, `impulse-rs/impulse-desktop/src/{runtime,daemon_ops}.rs` | Spawn, input, resize, focus, output, exit, cleanup, pre-PTY governed registration, and durable launch/exit reconciliation | Live |
+| Dioxus cockpit | `impulse-rs/impulse-desktop/src/{desktop_host,host_bridge,host_commands,ui}.rs` | Renders backend state/evidence and dispatches acknowledged revisioned decisions; does not own or optimistically mutate durable task truth | Live host/bridge foundation |
 | Workspace registration | `impulse-rs/impulse-desktop/src/workspace.rs` | Registered filesystem targets and operator-authored project notes | Live |
 | Platform identity/launch metadata | `impulse-rs/impulse-ops/src/agent_registry.rs`, desktop runtime/MCP/host | Registry-backed open ids, fail-closed resolution, Ion builtin launch | Live; legacy closed types remain where compatibility requires them |
 | External agent harness calls | `impulse-rs/src/agent/{mod,harness,coordinator}.rs` | Bounded CLI request/response integration and shared cached agent state | Live; not a general adapter trait |
@@ -69,6 +75,9 @@ generalized role composition, a common runtime-adapter contract, or dynamic capa
 | Memory/context | `impulse-rs/src/{state,memory,retrieval,injection,stewardship}/` | Project-scoped persistence, FTS5/semantic retrieval, review-first injection, context health | Live |
 | Credentials | `impulse-rs/src/credentials/` | Provider abstraction for Keychain, socket, CLI proxy, env, and session memory | Live; per-role credential grants are not generalized |
 | Artifacts/evidence | `ArtifactEnvelope` in `impulse-ops`, daemon artifact handlers, `impulse-rs/src/verify/` | Provenance-bearing outputs and verification gates | Live foundation |
+| Memory/context | `impulse-rs/src/{state,memory,retrieval,injection,stewardship}/` | Project-scoped persistence, deterministic pending accepted-run candidates, FTS5/semantic retrieval, review-first injection, context health | Live; candidate promotion/dismissal is not implemented |
+| Credentials | `impulse-rs/src/credentials/` | Provider abstraction for Keychain, socket, CLI proxy, env, and session memory | Live; per-role credential grants are not generalized |
+| Artifacts/evidence | governed/candidate types and `ArtifactEnvelope` in `impulse-ops`, daemon governed/artifact handlers, `impulse-rs/src/governed_producers.rs` | Separate claims, daemon-observed profiled evidence, strict Supervisor verdicts, operator decisions, deterministic pending memory candidates, and provenance-bearing outputs | Live first producer profile + review-only candidate foundation |
 | Agent messaging/handoffs | `impulse-rs/src/{delegation,orchestration}/`, daemon delegation contracts | Delegations, handoff artifacts, and routing logs | Live partial; no unified typed message bus |
 | Legacy desktop | `impulse-rs/impulse-gui/`, optional egui modules in `impulse-term` | Compile-maintenance only | Frozen |
 
@@ -101,6 +110,143 @@ The next architecture ADR must settle these together:
    discovery, attestation freshness, emulation, and post-launch re-evaluation.
 4. Typed message routing and cross-project isolation.
 5. Role-specific credential, context, tool, and verification grants.
+
+Do **not** create separate `ROLES`, `RUNTIMES`, `SUPERVISOR`, or replacement architecture schema
+documents before those decisions land. `VISION.md` and the canonical contract remain the source of
+product intent; the later ADR will authorize schema-level splits.
+
+The current profiled governed desktop launch boundary requires a nonblank task, exact non-empty
+acceptance criteria, `rust_workspace_v1`, and both `workspace.root` and `cwd` naming the same
+absolute canonical Git worktree root. The desktop requires a clean committed `HEAD`; the daemon
+independently re-observes that OID before registering the task and creating the PTY. The canonical
+root drives process state and telemetry. Working-directory binding is not filesystem sandboxing.
+
+After that preflight, a governed Builder launch must register a distinct task with the bound daemon
+before the PTY is created. Env-routed `"$IMPULSE_CONTROL_CLI" --daemon governed-claim` and Ion claim surfaces submit only summary/artifact intent;
+the daemon derives the Worker and clean Git subject. It verifies a detached checkout with fixed locked Rust
+argv and derives evidence. Supervisor review is a strict criteria-digest-bound, tool-free,
+history-free API turn; generic external harness mode fails closed before spawn. A model may
+recommend acceptance, but only the operator can accept. Dioxus renders daemon-owned records and
+terminal command guidance rather than producer buttons. Launch/exit intent is written ahead of
+daemon I/O to a bounded, owner-only,
+cross-process-locked project outbox and reconciled after daemon recovery. This does not detect an
+abrupt desktop death that occurs before exit intent exists; runtime leases/orphan reconciliation
+remain a separate contract.
+
+Profiled command evidence stores fixed argv, SHA-256 digests, byte counts, and truncation flags,
+never raw output. Verification executes host-trusted Rust build scripts/proc macros/tests in a
+detached worktree with a scrubbed environment, bounds, and process cleanup; it is not an OS sandbox.
+Typed actors are provenance and transition claims, not cryptographic
+identity among processes running as the same user. The socket directory, socket, and PID file use
+`0700`, `0600`, and `0600`, respectively; that is an OS-user boundary, not a same-user role boundary.
+
+After operator approval, `GOVERNED_TASKS.json` remains the acceptance authority and the daemon
+derives one pending projection in owner-only `MEMORY_CANDIDATES.json`. The two writes are not one
+filesystem transaction: acceptance replay and daemon-start reconciliation repair a missing
+projection, while orphaned or source-mismatched candidates fail closed. Protocol v6 exposes the
+serde-defaulted candidates through `ProjectOpsSnapshot`; Dioxus renders them read-only. This path
+never mutates `GENOME.md` or `HISTORY.jsonl` and grants no semantic promotion capability.
+Accepted/rejected decisions are terminal. Each ledger uses its own synced-temp-file rename (without
+parent-directory fsync), not a cross-file transaction. Candidate digests cover exact JSON bytes from
+a fixed ordered/versioned source struct, not Unicode semantic normalization.
+
+It cannot promise control over a vendor's hidden system prompt, proprietary reasoning loop,
+internal context compression, or unsupported tool mechanics. The live static preflight therefore
+uses explicit enforcement strengths rather than a boolean "supported" flag; future generalized
+runtime adapters must preserve that honesty while adding discovery and lifecycle semantics.
+
+## Bounded tool specialists
+
+**Conceptual direction approved by James on 2026-10-03 and documented here; implementation
+is deferred.** The candidate below and first-candidate prioritization remain proposals, not
+accepted implementation plans. Broader coding cleanup remains paused over resource and workspace
+ownership concerns.
+
+Give the main agent compact conceptual capability descriptions explaining when and why to
+delegate, plus a minimal typed delegation contract. Do not automatically load underlying MCP
+catalogs or full tool schemas into its context. Detailed tool descriptions remain inspectable on
+request; the main agent need not receive the full intermediate event chain by default.
+
+A bounded specialist owns the relevant schemas, tool selection, and intermediate tool chains in
+its own context. Deterministic code handles predictable loops, paging, and fixed checks; a small
+model handles domain choices only when needed. This direction does not prescribe a new agent
+runtime dependency.
+
+MCP, direct APIs, progressive discovery, specialist isolation, and code execution are
+complementary layers; transport does not determine main-agent visibility. A specialist is a
+domain/workflow boundary, not necessarily one MCP server. A CLI is optional; a typed in-process
+or sandboxed SDK is also possible. Five core tools is a heuristic, not a universal limit. Server
+instructions/descriptions are untrusted data, not permissions or policy. Schemas cannot establish
+semantic correctness; compiled validation and runtime authorization remain required. Secrets
+should stay in a scoped broker rather than broad sandbox environment variables. These constraints
+do not add a runtime dependency or change current integration behavior.
+
+Illustrative contract shapes, not frozen Rust types or a new live wire protocol:
+
+```text
+Request {
+  request_id: string, capability_id: string, objective: string,
+  inputs: capability-specific typed value, success_checks: Check[],
+  scope_ref: existing runtime scope reference,
+  budget_ref: existing runtime budget reference
+}
+Result {
+  request_id: string, status: succeeded | partial | failed | cancelled,
+  outcome: string, evidence_refs: EvidenceRef[],
+  unresolved_questions: string[], failures: Failure[], uncertainty: string[]
+}
+```
+
+`Check`, `EvidenceRef`, and `Failure` denote capability-specific validated values, evidence
+locators, and typed failure categories; their concrete forms require later design review. Scope
+and budget references express existing constraints and confer no new authority.
+
+The main agent owns the goal and interpretation of success; the specialist owns bounded local
+working context. The runtime/control plane retains permission, budget, cancellation, and execution
+authority. Delegation can only stay within existing grants; it cannot expand authority, reset
+limits, or bypass cancellation. Daemon task truth, runtime process state, specialist working
+state, and evidence retain their separate owners. A specialist's success report never creates a
+governed-task acceptance decision.
+
+Return compact outcomes, evidence references, unresolved questions, failures, and uncertainty.
+Keep original evidence and event traces under their existing owners; summaries are projections,
+not replacements. The inspection path must expose detailed tool descriptions/schemas and original
+evidence/event traces on demand under the same permissions, with missing or truncated evidence
+reported explicitly.
+
+**IMPULSE candidate (proposed): build/test diagnostics.** An explicit workspace/subject, allowed
+command or existing receipt inputs, and success checks could scope a specialist that returns the
+failing stage, permitted short diagnostic evidence, exact command/subject and evidence references,
+and unresolved causes. Code handles predictable command sequencing; a small model may interpret
+ambiguous failures. The current `rust_workspace_v1` producer persists fixed argv, digests, byte
+counts, and truncation flags, not raw output; a digest must not be represented as an inspectable
+original log. Diagnostic excerpts and trace retention need a separately approved evidence path
+that preserves original sources and current receipts. This example does not authorize builds,
+tests, or retry loops during the documentation task.
+
+Evaluate end-to-end success, latency, and total model cost across the main agent and specialists,
+including extra inference, duplicated context, and on-demand inspection. Smaller main-agent
+context alone is insufficient if cost or failure merely moves to a specialist. Implementation,
+runtime integration, concrete schemas, and candidate prioritization require a later scoped decision.
+
+## Direction that is not implemented yet
+
+The next architecture ADR must settle these together:
+
+1. The remaining hierarchy and identifiers for project, workspace, role, runtime, instance,
+   session, and pane, plus stable project identity and governed-task reassignment/resume.
+2. The minimum runtime-adapter operations, optional operations, and emulation rules.
+3. Generalized and dynamic capability negotiation beyond the static desktop preflight, including
+   discovery, attestation freshness, emulation, and post-launch re-evaluation.
+4. Typed message routing and cross-project isolation.
+5. Role-specific credential, context, tool, and verification grants.
+6. Durable producer reservations for crash-safe replay, structured CAS error codes, task/receipt
+   pagination and archival, and stronger same-user actor authorization where deployment profiles
+   require it.
+7. A complete launched Builder/Supervisor proof that reaches acceptance and observes exactly one
+   staged candidate.
+8. Explicit candidate promotion/dismissal with semantic validation, authorization, audit, and the
+   curated-memory write boundary.
 
 Do **not** create separate `ROLES`, `RUNTIMES`, `SUPERVISOR`, or replacement architecture schema
 documents before those decisions land. `VISION.md` and the canonical contract remain the source of

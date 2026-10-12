@@ -47,12 +47,17 @@ CONTRACT_KEY_FILES = [
     DOCS_DIR / "INDEX.md",
     DOCS_DIR / "SUMMARY.yaml",
     DOCS_DIR / "SUMMARY.md",
+    DOCS_DIR / "IPC-PROTOCOL.md",
 ]
 
 DURABLE_ROADMAP_MARKER = (
     "Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + "
     "hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; "
     "Legacy=egui compile-maintenance only"
+    "Now=control-plane foundations + governed runtime producers + accepted-run review candidates; "
+    "Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; "
+    "Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + "
+    "multi-project routing; Legacy=egui compile-maintenance only"
 )
 
 CONTRACT_REQUIRED_MARKERS = {
@@ -85,6 +90,8 @@ CONTRACT_REQUIRED_MARKERS = {
         "COLLABORATIVE-AGENTIC-CODING.md",
         "Canonical stack: Rust (impulse-rs)",
         DURABLE_ROADMAP_MARKER,
+        "Current governed slice:",
+        "Next governed slice:",
     ],
     DOCS_DIR / "SUMMARY.md": [
         "VISION.md",
@@ -96,6 +103,16 @@ CONTRACT_REQUIRED_MARKERS = {
         "VISION.md",
         "RUST-CANONICAL-CONTRACT.md",
         DURABLE_ROADMAP_MARKER,
+    ],
+    DOCS_DIR / "IPC-PROTOCOL.md": [
+        "**Protocol version: 9**",
+        '"protocol_version": 9',
+        "### v9 — Daemon governed wiring",
+        "### v8 — Builder staged-worktree world scope",
+        "### v7 — Socket actor provenance",
+        "### v6 — Deterministic accepted-run memory candidates",
+        "### v5 — Daemon-owned governed producers",
+        "### v4 — Daemon-owned governed tasks",
     ],
 }
 
@@ -109,6 +126,14 @@ FORBIDDEN_ACTIVE_PHRASES = [
     "The active roadmap is now Rust core plus the EGUI operator workbench.",
     "EGUI/operator workbench is marked as active work",
     "active Rust-native EGUI surface",
+    "**Next governed slice:** daemon-owned task evidence",
+    "Protocol v3 does not define daemon request variants for retrieval.",
+    '"protocol_version": 3',
+    '"protocol_version": 4',
+    "**Protocol version: 4**",
+    "Now=control-plane foundations + daemon-owned governed task lifecycle; Next=real claim/verification producers + supervisor/builder process proof + accepted-run memory promotion; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only",
+    "Now=control-plane foundations + daemon-owned governed runtime producers; Next=accepted-run memory promotion + stronger same-user actor authorization + full launched-runtime proof; Later=general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only",
+    "verified-memory promotion",
 ]
 
 NON_AUTHORITATIVE_STATUSES = {"superseded", "deprecated", "archive", "historical"}

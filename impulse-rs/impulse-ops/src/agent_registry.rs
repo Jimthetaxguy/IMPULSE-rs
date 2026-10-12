@@ -1477,9 +1477,79 @@ command = "ratchet"
         let old_partial = std::path::Path::new(&manifest).join(
             "../../archive/reconciled-from-clean-2026-06-25/crates/impulse-contracts/Cargo.toml",
         );
+    }
+
+    #[test]
+    fn test_resolve_launch_command_never_falls_back_for_unknown_platform() {
+        let reg = AgentRegistry::builtin();
+        let missing = AgentPlatformId::try_new("missing-agent").unwrap();
+        let resolved = resolve_launch_command(&reg, &missing, None);
+
         assert!(
-            has_archived || old_partial.exists(),
-            "reconciled archive must contain contracts crate reference from .clean"
+            matches!(resolved, Err(RegistryError::UnknownPlatform(id)) if id == "missing-agent")
+        );
+    }
+
+    #[test]
+    fn test_resolve_launch_command_rejects_blank_explicit_override() {
+        let reg = AgentRegistry::builtin();
+        let codex = AgentPlatformId::try_new("codex").unwrap();
+
+        assert!(
+            resolve_launch_command(&reg, &codex, Some("   ")).is_err(),
+            "an explicit blank override is invalid input, not an implicit default"
+        );
+    }
+
+    #[test]
+    fn test_resolve_launch_command_rejects_blank_registered_command() {
+        let platform = AgentPlatformId::try_new("blank-command").unwrap();
+        let registry = AgentRegistry::from_descriptors(vec![AgentDescriptor {
+            id: platform.clone(),
+            label: "Blank command".to_string(),
+            command: "   ".to_string(),
+            invocation_args: Vec::new(),
+            aliases: Vec::new(),
+            capabilities: AgentCapabilities::default(),
+            runtime_capabilities: Vec::new(),
+        }])
+        .unwrap();
+
+        assert!(
+            resolve_launch_command(&registry, &platform, None).is_err(),
+            "a registered identity without an executable command is not launchable"
+        );
+    }
+
+    #[test]
+    fn test_reconciled_backend_contract_lives_in_canonical_registry() {
+        // ADR-0009 maps the archived experiment's BackendDescriptor /
+        // BackendRegistry contract to these tracked canonical types. Prove the
+        // resulting behavior rather than depending on a maintainer-local,
+        // gitignored archive that cannot exist in a fresh clone or worktree.
+        let registry = AgentRegistry::builtin();
+        let platform = AgentPlatformId::try_new("claude-code").unwrap();
+        let descriptor = registry
+            .get(platform.as_str())
+            .expect("canonical registry contains the reconciled backend identity");
+
+        assert_eq!(descriptor.id, platform);
+        assert_eq!(descriptor.command, "claude");
+        assert_eq!(
+            registry.resolve("claude").map(|agent| &agent.id),
+            Some(&platform),
+            "the reconciled registry preserves typed alias resolution"
+        );
+        assert_eq!(
+            resolve_launch_command(&registry, &platform, None).unwrap(),
+            "claude",
+            "the reconciled descriptor remains executable through the canonical launch API"
+        );
+
+        let report = AgentPlatformsReport::from_registry(&registry);
+        assert!(
+            report.platforms.iter().any(|agent| agent.id == platform),
+            "the reconciled backend contract remains observable to control-plane clients"
         );
     }
 }

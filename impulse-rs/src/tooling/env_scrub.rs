@@ -81,6 +81,26 @@ pub(crate) fn scrub_and_allowlist_env(cmd: &mut Command, extra_allowlist: &[Stri
     }
 }
 
+/// Synchronous-command counterpart used by bounded control-plane probes such
+/// as Git subject observation. Keeping it here prevents `GIT_*`, credential,
+/// and provider variables from silently redirecting those probes.
+pub(crate) fn scrub_and_allowlist_std_env(
+    cmd: &mut std::process::Command,
+    extra_allowlist: &[String],
+) {
+    cmd.env_clear();
+    for name in ENV_ALLOWLIST {
+        if let Ok(value) = std::env::var(name) {
+            cmd.env(name, value);
+        }
+    }
+    for name in extra_allowlist {
+        if let Ok(value) = std::env::var(name) {
+            cmd.env(name, value);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

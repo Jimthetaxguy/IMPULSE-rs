@@ -3,6 +3,8 @@ title: Documentation Index
 description: Master navigation hub for Impulse documentation
 version: '1.5'
 updated: 2026-07-13
+version: '1.7'
+updated: 2026-09-26
 type: doc
 category: navigation
 phase: all
@@ -10,6 +12,7 @@ status: active
 audience: everyone
 tags: [index, navigation, discovery]
 last_updated: 2026-07-13
+last_updated: 2026-09-26
 authors:
   - name: Impulse Maintainers
     role: Maintainer
@@ -27,6 +30,12 @@ authors:
 > **Roadmap contract:** Now=control-plane foundations; Next=one governed supervisor/builder vertical slice + hierarchy/enforcement ADR; Later=general roles + negotiated runtimes; Legacy=egui compile-maintenance only.
 > **Current launch slice:** explicit product role/task preflight and typed compatibility telemetry.
 > **Next governed slice:** daemon-owned task evidence, verification results, and supervisor decisions.
+> **Roadmap contract:** Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
+> **Current governed slice:** profiled Builder preflight, exact criteria, daemon-attested clean Git
+> subjects, daemon-derived claim/verification, strict API Supervisor review, operator acceptance,
+> and deterministic pending candidates that do not mutate `GENOME`/`HISTORY`.
+> **Next governed slice:** stronger same-user actor authorization and one full launched
+> Builder/Supervisor proof; explicit candidate promotion/dismissal remains later.
 > **Collaboration playbook:** [`guides/COLLABORATIVE-AGENTIC-CODING.md`](guides/COLLABORATIVE-AGENTIC-CODING.md)
 > **Narrow validation register:** [`HONEST-ROADMAP.md`](HONEST-ROADMAP.md) preserves unresolved
 > hook, compaction, extraction, and memory-quality risks from the legacy phase-era design. It is
@@ -65,6 +74,12 @@ authors:
 ADR-0010 accepts only the explicit role/task launch-preflight boundary. Do not split separate
 role/runtime/supervisor schema documents until the remaining hierarchy, adapter, lifecycle, and
 generalized capability-negotiation decisions listed in `VISION.md` are resolved.
+ADR-0010 accepts role/task launch preflight, ADR-0011 accepts the governed-task lifecycle,
+ADR-0012 accepts the first daemon-owned producer profile, and ADR-0013 accepts deterministic
+pending accepted-run candidates. Do not split separate
+role/runtime/supervisor schema documents until the
+remaining hierarchy, adapter, reassignment, and generalized capability-negotiation decisions listed
+in `VISION.md` are resolved.
 
 ### Validation and Historical Risk
 
@@ -87,6 +102,16 @@ generalized capability-negotiation decisions listed in `VISION.md` are resolved.
 | [0008](decisions/0008-dioxus-desktop-host.md) | Dioxus Desktop host | Accepted | Current desktop host authority |
 | [0009](decisions/0009-reconcile-impulse-copies.md) | Reconcile duplicate Impulse codebases | Accepted | Current canonical-tree decision |
 | [0010](decisions/0010-product-role-launch-contract.md) | Product role launch contract | Accepted | Current explicit role/task launch-preflight boundary |
+| [0011](decisions/0011-governed-task-run-lifecycle.md) | Daemon-owned governed task lifecycle | Accepted | Durable task/evidence/review authority and operator-required acceptance |
+| [0012](decisions/0012-daemon-owned-governed-runtime-producers.md) | Daemon-owned governed runtime producers | Accepted | Profiled clean-Git claims, detached Rust verification, and strict API Supervisor review |
+| [0013](decisions/0013-deterministic-accepted-run-memory-candidates.md) | Deterministic accepted-run memory candidates | Accepted | Owner-only pending review projection, provenance/source assurance, and no `GENOME`/`HISTORY` mutation |
+| [0014](decisions/0014-work-item-and-comparative-settlement.md) | WorkItem identity and comparative settlement | Proposed | Proposed planning identity, fan-out effect bound, and four-part settlement record |
+| [0015](decisions/0015-harness-owned-step-model.md) | Harness-owned step model choice | Accepted | Pure Impulse-owned per-step policy; hosts retain inference, provider, and evidence authority |
+| [0017](decisions/0017-canonical-loop-contract.md) | Canonical loop contract | Proposed | Typed loop budgets, breaker-evaluated stop conditions, and termination evidence for Ion tool loops |
+| [0018](decisions/0018-socket-actor-provenance.md) | Socket actor provenance | Proposed | Connection classes from peer credentials plus a per-run operator capability; only an operator surface can mint `accepted` |
+| [0019](decisions/0019-builder-staged-worktree-world-scope.md) | Builder staged-worktree world scope | Proposed | Declared world scope, a disposable staged Builder worktree, fast-forward-only promotion after acceptance, and the governed Builder loop binding |
+| [0020](decisions/0020-scoped-memory-promotion-and-dismissal.md) | Scoped memory promotion and dismissal | Proposed | Operator-class promote/dismiss, an append-only hash-chained memory log, a separate regenerated GENOME projection, and promoted-only retrieval indexing |
+| [0021](decisions/0021-monty-sandbox-for-calculator-and-python-exec.md) | Monty sandbox for calculator and python_exec | Proposed | In-process Monty interpreter replaces `python3 -c` for the Python tool surfaces; no filesystem, network, or process access; typed fault classes; crash isolation via `monty-pool` deferred |
 
 See [decisions/README.md](decisions/README.md) for full decision log.
 
@@ -141,6 +166,9 @@ CLI help, or current tests.
 | [DESKTOP-SHELL-ARCHITECTURE.md](spec/DESKTOP-SHELL-ARCHITECTURE.md) | Dioxus Desktop + xterm.js layer boundaries |
 | [IMPULSE_TERM_STATUS.md](../impulse-rs/docs/IMPULSE_TERM_STATUS.md) | Terminal backend status and desktop bridge implications |
 | [ADR-0010](decisions/0010-product-role-launch-contract.md) | Current explicit product-role/task launch-preflight boundary |
+| [ADR-0011](decisions/0011-governed-task-run-lifecycle.md) | Current daemon-owned governed task evidence/decision boundary |
+| [ADR-0012](decisions/0012-daemon-owned-governed-runtime-producers.md) | Current profiled claim/verification/Supervisor producer boundary |
+| [ADR-0013](decisions/0013-deterministic-accepted-run-memory-candidates.md) | Current deterministic accepted-run review-projection boundary |
 
 > **NOTE:** `spec/RUST-CANONICAL-CONTRACT.md` is authoritative for implementation. Legacy TypeScript/Bun docs are retained as historical reference unless explicitly marked active and aligned.
 
@@ -206,6 +234,10 @@ Older Ralph loop plans and `ROADMAP-PLAN.md` are preserved for provenance only. 
 [`VISION.md`](../VISION.md),
 `spec/RUST-CANONICAL-CONTRACT.md`, `decisions/0008-dioxus-desktop-host.md`, and
 `decisions/0010-product-role-launch-contract.md` for current guidance.
+`spec/RUST-CANONICAL-CONTRACT.md`, `decisions/0008-dioxus-desktop-host.md`,
+`decisions/0010-product-role-launch-contract.md`,
+`decisions/0011-governed-task-run-lifecycle.md`, and
+`decisions/0012-daemon-owned-governed-runtime-producers.md` for current guidance.
 
 ---
 
@@ -232,6 +264,15 @@ Start here:
 4. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Enforcement and authority boundary map
 5. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Acceptance criteria for current surfaces
 6. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Evidence map and known gaps
+### Next: Complete Launched-Runtime Governed Workflow
+
+1. [0013-deterministic-accepted-run-memory-candidates.md](decisions/0013-deterministic-accepted-run-memory-candidates.md) — Live pending review projection and explicit no-promotion boundary
+2. [0012-daemon-owned-governed-runtime-producers.md](decisions/0012-daemon-owned-governed-runtime-producers.md) — Live first producer profile and explicit security limits
+3. [VISION.md](../VISION.md) — Ten-step workflow, accepted-run review boundary, and launched-runtime proof
+4. [RUST-CANONICAL-CONTRACT.md](spec/RUST-CANONICAL-CONTRACT.md) — Live foundations and contract boundary
+5. [ARCHITECTURE-CLARIFICATION.md](ARCHITECTURE-CLARIFICATION.md) — Enforcement and authority boundary map
+6. [USER-STORY-MAP.md](spec/USER-STORY-MAP.md) — Acceptance criteria for current surfaces
+7. [TEST-TRACEABILITY.md](spec/TEST-TRACEABILITY.md) — Evidence map and known gaps
 
 ### Validation Side Lane: Hook and Memory Evidence
 

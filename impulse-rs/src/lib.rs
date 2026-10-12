@@ -13,6 +13,7 @@ pub mod token_tracker;
 
 pub mod agent;
 pub mod agent_discovery;
+pub mod basis;
 pub mod branding;
 pub mod build_hygiene;
 pub mod client;
@@ -23,12 +24,14 @@ pub mod delegation;
 pub mod docs;
 pub mod envelope;
 pub mod error;
+pub mod governed_producers;
 pub mod guardrail;
 pub mod handlers;
 pub mod injection;
 pub mod integration_tests;
 pub mod ion_repl;
 pub mod llm_backends;
+pub mod loop_contract;
 pub mod mcp;
 pub mod memory;
 pub mod monty;
@@ -41,6 +44,7 @@ pub(crate) mod process_group;
 pub mod process_util;
 pub mod retrieval;
 pub mod semantic_diff;
+pub mod settlement;
 pub mod state;
 pub mod stewardship;
 pub mod storage;
@@ -51,6 +55,7 @@ pub mod tools;
 pub mod ui;
 pub mod validate;
 pub mod verify;
+pub mod voice;
 
 // Re-export CLI types at crate root for backward compatibility.
 // Existing code (e.g. handlers/daemon_dispatch.rs) imports `crate::Commands`.

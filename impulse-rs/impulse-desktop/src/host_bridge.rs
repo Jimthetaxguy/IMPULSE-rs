@@ -25,7 +25,9 @@ use dioxus::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{
+    channel, error::TrySendError, unbounded_channel, Receiver, UnboundedReceiver, UnboundedSender,
+};
 
 use crate::host_commands::{
     self, DesktopShellState, AGENT_CLOSE_COMMAND, AGENT_FOCUS_COMMAND, AGENT_PLATFORMS_COMMAND,
@@ -34,6 +36,12 @@ use crate::host_commands::{
     NATIVE_ISLAND_REQUEST_COMMAND, REGISTER_WORKSPACE_COMMAND, REVIEW_DECISION_COMMAND,
     REVIEW_QUEUE_COMMAND, SUPERVISOR_LOCAL_ACTION_COMMAND, TERMINAL_CLOSE_COMMAND,
     TERMINAL_FOCUS_COMMAND, TERMINAL_OPEN_COMMAND, TERMINAL_RESIZE_COMMAND, TERMINAL_WRITE_COMMAND,
+    GOVERNED_OUTCOME_PROMOTE_COMMAND, GOVERNED_STAGED_WORKTREE_DISCARD_COMMAND,
+    GOVERNED_TASK_MUTATE_COMMAND, LIST_WORKSPACES_COMMAND, MCP_DESCRIPTORS_COMMAND,
+    MCP_INVOKE_COMMAND, NATIVE_ISLAND_REQUEST_COMMAND, REGISTER_WORKSPACE_COMMAND,
+    REVIEW_DECISION_COMMAND, REVIEW_QUEUE_COMMAND, SUPERVISOR_LOCAL_ACTION_COMMAND,
+    TERMINAL_CLOSE_COMMAND, TERMINAL_FOCUS_COMMAND, TERMINAL_OPEN_COMMAND, TERMINAL_RESIZE_COMMAND,
+    TERMINAL_WRITE_COMMAND,
 };
 use crate::runtime::{DesktopEvent, DesktopEventSink};
 
@@ -41,6 +49,7 @@ use crate::runtime::{DesktopEvent, DesktopEventSink};
 /// stubs. Anything other than [`crate::host_commands::PENDING_HOST_BOOTSTRAP_STATUS`]
 /// reads as "ready" to the host-adapter resolver in `ui.rs`.
 pub const LIVE_HOST_BRIDGE_STATUS: &str = "dioxus-eval-bridge-ready";
+const HOST_INVOKE_QUEUE_CAPACITY: usize = 64;
 
 /// A single `invoke()` call crossing from JS into Rust.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -54,14 +63,25 @@ pub struct HostInvokeRequest {
 /// The reply to a [`HostInvokeRequest`]. `ok` mirrors the underlying
 /// `Result`; `result` carries the serialized success value and `error` the
 /// failure message (never both).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HostInvokeResponse {
     pub id: String,
     pub ok: bool,
-    #[serde(default)]
     pub result: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+/// The only serializable Rust → JavaScript representation of an invoke
+/// response. Keeping the internal response non-serializable prevents a send
+/// site from bypassing the discriminator required by the strict JS router.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct HostInvokeResponseEnvelope {
+    kind: &'static str,
+    id: String,
+    ok: bool,
+    result: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 impl HostInvokeResponse {
@@ -113,6 +133,15 @@ async fn dispatch_command(
         AGENT_PLATFORMS_COMMAND => json(host_commands::agent_platforms().await?),
         AGENT_SPAWN_COMMAND => json(host_commands::agent_spawn(runtime, body(payload)?).await?),
         AGENT_WRITE_COMMAND => json(host_commands::agent_write(runtime, body(payload)?).await?),
+        GOVERNED_TASK_MUTATE_COMMAND => {
+            json(host_commands::governed_task_mutate(state, body(payload)?).await?)
+        }
+        GOVERNED_OUTCOME_PROMOTE_COMMAND => {
+            json(host_commands::governed_outcome_promote(state, body(payload)?).await?)
+        }
+        GOVERNED_STAGED_WORKTREE_DISCARD_COMMAND => {
+            json(host_commands::governed_staged_worktree_discard(state, body(payload)?).await?)
+        }
         AGENT_RESIZE_COMMAND => json(host_commands::agent_resize(runtime, body(payload)?).await?),
         AGENT_FOCUS_COMMAND => json(host_commands::agent_focus(runtime, body(payload)?).await?),
         AGENT_CLOSE_COMMAND => json(host_commands::agent_close(runtime, body(payload)?).await?),
@@ -162,6 +191,19 @@ pub async fn dispatch_host_invoke(
     }
 }
 
+async fn dispatch_host_invokes_fifo(
+    state: DesktopShellState,
+    mut requests: Receiver<HostInvokeRequest>,
+    responses: UnboundedSender<HostInvokeResponse>,
+) {
+    while let Some(request) = requests.recv().await {
+        let response = dispatch_host_invoke(&state, request).await;
+        if responses.send(response).is_err() {
+            break;
+        }
+    }
+}
+
 /// Build the `host_event` envelope delivered to JS `listen` handlers. The
 /// payload is the event's `data` content so handlers receive the same shape the
 /// legacy Tauri host produced (e.g. `{ agent_id, data }` for terminal output).
@@ -175,6 +217,16 @@ pub fn host_event_envelope(event: &DesktopEvent) -> Value {
         "event": event.name(),
         "payload": payload,
     })
+}
+
+fn host_invoke_response_envelope(response: HostInvokeResponse) -> HostInvokeResponseEnvelope {
+    HostInvokeResponseEnvelope {
+        kind: "host_invoke_result",
+        id: response.id,
+        ok: response.ok,
+        result: response.result,
+        error: response.error,
+    }
 }
 
 /// A [`DesktopEventSink`] that forwards every runtime event onto an unbounded
@@ -240,18 +292,25 @@ pub const LIVE_HOST_BRIDGE_SCRIPT: &str = concat!(
   const pendingInvokes = new Map();
   const listeners = new Map();
   let nextId = 0;
+  let invokeTail = Promise.resolve();
   const host = {
     invoke(command, payload) {
-      return new Promise((resolve, reject) => {
-        const id = `host-${++nextId}`;
-        pendingInvokes.set(id, { resolve, reject });
-        try {
-          dioxus.send({ kind: "host_invoke", id, command, payload: payload ?? null });
-        } catch (error) {
-          pendingInvokes.delete(id);
-          reject(error);
-        }
-      });
+      const scheduled = invokeTail.then(() => new Promise((resolve, reject) => {
+          const id = `host-${++nextId}`;
+          pendingInvokes.set(id, { resolve, reject });
+          try {
+            dioxus.send({ kind: "host_invoke", id, command, payload: payload ?? null });
+          } catch (error) {
+            pendingInvokes.delete(id);
+            reject(error);
+          }
+        })
+      );
+      invokeTail = scheduled.then(
+        () => undefined,
+        () => undefined,
+      );
+      return scheduled;
     },
     listen(event, handler) {
       let set = listeners.get(event);
@@ -308,8 +367,11 @@ pub fn live_host_bridge_script() -> &'static str {
 
 /// Drive the bridge: install the JS transport, then concurrently service
 /// `invoke` requests (dispatched against `state`) and forward runtime events to
-/// the webview. Runs until either channel closes. This is the only function
-/// that touches the Dioxus runtime; everything it calls is plain data.
+/// the webview. A bounded FIFO worker preserves wire order while returning
+/// results through a correlation channel, so daemon retries or PTY setup never
+/// stop the loop from draining terminal/ops events. Runs until either source
+/// channel closes. This is the only function that touches the Dioxus runtime;
+/// everything it calls is plain data.
 pub fn use_live_host_bridge() {
     use_future(move || async move {
         let Some(context) = live_host_context() else {
@@ -326,6 +388,14 @@ pub fn use_live_host_bridge() {
         };
         let state = context.state.clone();
         let mut eval = document::eval(LIVE_HOST_BRIDGE_SCRIPT);
+        let (invoke_result_tx, mut invoke_result_rx) = unbounded_channel::<HostInvokeResponse>();
+        let (invoke_tx, invoke_rx) = channel::<HostInvokeRequest>(HOST_INVOKE_QUEUE_CAPACITY);
+        let invoke_state = state.clone();
+        let invoke_worker = tokio::spawn(dispatch_host_invokes_fifo(
+            invoke_state,
+            invoke_rx,
+            invoke_result_tx,
+        ));
 
         loop {
             tokio::select! {
@@ -337,12 +407,27 @@ pub fn use_live_host_bridge() {
                         None => break,
                     }
                 }
+                response = invoke_result_rx.recv() => {
+                    if let Some(response) = response {
+                        let _ = eval.send(host_invoke_response_envelope(response));
+                        }
+                }
                 request = eval.recv::<HostInvokeRequest>() => {
                     match request {
                         Ok(request) => {
-                            let response = dispatch_host_invoke(&state, request).await;
-                            if let Ok(value) = serde_json::to_value(&response) {
-                                let _ = eval.send(value);
+                            let rejected = match invoke_tx.try_send(request) {
+                                Ok(()) => None,
+                                Err(TrySendError::Full(request)) => Some(HostInvokeResponse::err(
+                                    request.id,
+                                    "host invoke queue is full".to_string(),
+                                )),
+                                Err(TrySendError::Closed(request)) => Some(HostInvokeResponse::err(
+                                    request.id,
+                                    "host invoke worker is unavailable".to_string(),
+                                )),
+                            };
+                            if let Some(response) = rejected {
+                                let _ = eval.send(host_invoke_response_envelope(response));
                             }
                         }
                         Err(_) => break,
@@ -350,6 +435,7 @@ pub fn use_live_host_bridge() {
                 }
             }
         }
+        invoke_worker.abort();
     });
 }
 
@@ -369,6 +455,9 @@ pub fn LiveDesktopApp() -> Element {
 mod tests {
     use super::*;
     use crate::runtime::{AgentPlatformId, DesktopRuntime, LocalSupervisorAction};
+    use crate::runtime::{
+        AgentPlatformId, DesktopRuntime, GovernedTaskGateway, LocalSupervisorAction,
+    };
     use crate::workspace::WorkspaceRegistry;
     use crate::McpToolRegistry;
     use serde_json::json;
@@ -380,6 +469,61 @@ mod tests {
         let mcp = Arc::new(McpToolRegistry::with_builtins());
         let memory_root = std::env::temp_dir().join(format!("impulse-host-bridge-{}", uuid_seed()));
         DesktopShellState::new(runtime, workspaces, mcp, memory_root)
+    }
+
+    struct AcknowledgingGovernedGateway {
+        task: impulse_ops::governed_task::GovernedTaskRun,
+        mutations: Mutex<Vec<impulse_ops::governed_task::GovernedTaskMutationRequest>>,
+    }
+
+    impl GovernedTaskGateway for AcknowledgingGovernedGateway {
+        fn register(
+            &self,
+            _registration: impulse_ops::governed_task::GovernedTaskRegistration,
+        ) -> Result<impulse_ops::governed_task::GovernedTaskRun, String> {
+            Err("registration is not used by this host dispatch test".to_string())
+        }
+
+        fn mutate(
+            &self,
+            request: impulse_ops::governed_task::GovernedTaskMutationRequest,
+        ) -> Result<impulse_ops::governed_task::GovernedTaskRun, String> {
+            self.mutations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request.clone());
+            let mut updated = self.task.clone();
+            updated.revision = request.expected_revision + 1;
+            Ok(updated)
+        }
+
+        fn mutate_current(
+            &self,
+            _project_id: &str,
+            _task_id: &impulse_ops::governed_task::GovernedTaskId,
+            _request_id: impulse_ops::governed_task::GovernedRequestId,
+            _mutation: impulse_ops::governed_task::GovernedTaskMutation,
+        ) -> Result<impulse_ops::governed_task::GovernedTaskRun, String> {
+            Err("current mutation is not used by this host dispatch test".to_string())
+        }
+    }
+
+    fn test_state_with_governed_gateway(
+        gateway: Arc<dyn GovernedTaskGateway>,
+    ) -> DesktopShellState {
+        let (sink, _rx) = channel_event_sink();
+        let runtime = Arc::new(
+            DesktopRuntime::builder()
+                .with_event_sink(sink)
+                .with_governed_task_gateway(gateway)
+                .build(),
+        );
+        DesktopShellState::new(
+            runtime,
+            Arc::new(WorkspaceRegistry::empty()),
+            Arc::new(McpToolRegistry::with_builtins()),
+            std::env::temp_dir().join(format!("impulse-host-bridge-{}", uuid_seed())),
+        )
     }
 
     // Deterministic-ish unique suffix without pulling Uuid into the test (the
@@ -415,14 +559,145 @@ mod tests {
     }
 
     #[test]
-    fn host_invoke_response_round_trips_both_arms() {
+    fn host_invoke_response_constructors_preserve_both_arms() {
         let ok = HostInvokeResponse::ok("a".to_string(), json!([1, 2, 3]));
         let err = HostInvokeResponse::err("b".to_string(), "boom".to_string());
-        for response in [ok, err] {
-            let text = serde_json::to_string(&response).unwrap();
-            let back: HostInvokeResponse = serde_json::from_str(&text).unwrap();
-            assert_eq!(response, back);
+        assert_eq!(ok.id, "a");
+        assert!(ok.ok);
+        assert_eq!(ok.result, json!([1, 2, 3]));
+        assert_eq!(ok.error, None);
+        assert_eq!(err.id, "b");
+        assert!(!err.ok);
+        assert_eq!(err.result, Value::Null);
+        assert_eq!(err.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn host_invoke_response_envelope_marks_both_arms_for_the_js_router() {
+        let ok = serde_json::to_value(host_invoke_response_envelope(HostInvokeResponse::ok(
+            "host-ok".to_string(),
+            json!([1, 2, 3]),
+        )))
+        .expect("serialize success response envelope");
+        assert_eq!(ok["kind"], "host_invoke_result");
+        assert_eq!(ok["id"], "host-ok");
+        assert_eq!(ok["ok"], true);
+        assert_eq!(ok["result"], json!([1, 2, 3]));
+        assert!(ok.get("error").is_none());
+
+        let error = serde_json::to_value(host_invoke_response_envelope(HostInvokeResponse::err(
+            "host-error".to_string(),
+            "boom".to_string(),
+        )))
+        .expect("serialize error response envelope");
+        assert_eq!(error["kind"], "host_invoke_result");
+        assert_eq!(error["id"], "host-error");
+        assert_eq!(error["ok"], false);
+        assert_eq!(error["result"], Value::Null);
+        assert_eq!(error["error"], "boom");
+    }
+
+    #[test]
+    fn live_host_bridge_invoke_promise_settles_from_the_rust_response_envelope() {
+        let Ok(node_version) = std::process::Command::new("node").arg("--version").output() else {
+            eprintln!("node is unavailable; skipping live host response-envelope smoke");
+            return;
+        };
+        if !node_version.status.success() {
+            eprintln!("node is unavailable; skipping live host response-envelope smoke");
+            return;
         }
+
+        let envelope = host_invoke_response_envelope(HostInvokeResponse::ok(
+            "host-1".to_string(),
+            json!(["settled"]),
+        ));
+        let error_envelope = host_invoke_response_envelope(HostInvokeResponse::err(
+            "host-2".to_string(),
+            "typed rejection".to_string(),
+        ));
+        let script = format!(
+            r#"
+global.window = {{}};
+global.document = {{ documentElement: {{ setAttribute() {{}} }} }};
+const pendingMessages = [];
+let receiveResolver = null;
+const responseEnvelopes = {{
+  "host-1": {envelope},
+  "host-2": {error_envelope},
+}};
+const deliver = (message) => {{
+  if (receiveResolver) {{
+    const resolve = receiveResolver;
+    receiveResolver = null;
+    resolve(message);
+  }} else {{
+    pendingMessages.push(message);
+  }}
+}};
+global.dioxus = {{
+  send(message) {{
+    if (message?.kind === "host_invoke") {{
+      queueMicrotask(() => deliver(responseEnvelopes[message.id]));
+    }}
+  }},
+  recv() {{
+    if (pendingMessages.length > 0) return Promise.resolve(pendingMessages.shift());
+    return new Promise((resolve) => {{ receiveResolver = resolve; }});
+  }},
+}};
+{bridge}
+setImmediate(async () => {{
+  try {{
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("host invoke promise did not settle")), 500)
+    );
+    const result = await Promise.race([
+      window.__IMPULSE_DESKTOP_HOST.invoke("agent_snapshot", {{}}),
+      timeout,
+    ]);
+    if (JSON.stringify(result) !== JSON.stringify(["settled"])) {{
+      throw new Error(`unexpected result: ${{JSON.stringify(result)}}`);
+    }}
+    let rejection = "";
+    try {{
+      await Promise.race([
+        window.__IMPULSE_DESKTOP_HOST.invoke("unknown", {{}}),
+        timeout,
+      ]);
+    }} catch (error) {{
+      rejection = String(error?.message || error);
+    }}
+    if (rejection !== "typed rejection") {{
+      throw new Error(`unexpected rejection: ${{rejection}}`);
+    }}
+    process.stdout.write("resolved-and-rejected");
+    process.exit(0);
+  }} catch (error) {{
+    console.error(error?.stack || String(error));
+    process.exit(1);
+  }}
+}});
+"#,
+            envelope = serde_json::to_string(&envelope).expect("serialize response envelope"),
+            error_envelope =
+                serde_json::to_string(&error_envelope).expect("serialize error response envelope"),
+            bridge = live_host_bridge_script(),
+        );
+        let output = std::process::Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .expect("run live host response-envelope smoke");
+        assert!(
+            output.status.success(),
+            "node smoke failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "resolved-and-rejected"
+        );
     }
 
     #[test]
@@ -511,6 +786,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_governed_task_mutation_returns_daemon_acknowledgment() {
+        let task: impulse_ops::governed_task::GovernedTaskRun = serde_json::from_value(json!({
+            "id": "task-host-dispatch",
+            "revision": 0,
+            "project_id": "impulse-rs",
+            "workspace_root": "/tmp/impulse-rs",
+            "task": "Exercise the live host governed-task route",
+            "runtime_id": "codex",
+            "agent_id": "codex-live",
+            "execution_state": "running",
+            "review_state": "awaiting_claim",
+            "claims": [],
+            "verifications": [],
+            "supervisor_verdicts": [],
+            "operator_decisions": [],
+            "events": [],
+            "created_at": "2026-07-13T20:00:00Z",
+            "updated_at": "2026-07-13T20:00:00Z"
+        }))
+        .unwrap();
+        let gateway = Arc::new(AcknowledgingGovernedGateway {
+            task,
+            mutations: Mutex::new(Vec::new()),
+        });
+        let state = test_state_with_governed_gateway(gateway.clone());
+        let response = dispatch_host_invoke(
+            &state,
+            HostInvokeRequest {
+                id: "governed-host".to_string(),
+                command: GOVERNED_TASK_MUTATE_COMMAND.to_string(),
+                payload: json!({
+                    "request": {
+                        "request_id": "req-host-dispatch",
+                        "project_id": "impulse-rs",
+                        "task_id": "task-host-dispatch",
+                        "expected_revision": 0,
+                        "mutation": {
+                            "kind": "mark_runtime_exited",
+                            "data": {
+                                "actor": { "kind": "system", "id": "desktop-runtime" },
+                                "reason": "test exit"
+                            }
+                        }
+                    }
+                }),
+            },
+        )
+        .await;
+
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result["id"], "task-host-dispatch");
+        assert_eq!(response.result["revision"], 1);
+        assert_eq!(
+            gateway
+                .mutations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_unknown_command_reports_error() {
         let state = test_state();
         let response = dispatch_host_invoke(
@@ -525,6 +863,30 @@ mod tests {
         assert!(!response.ok);
         assert!(response.error.unwrap().contains("unknown host command"));
         assert_eq!(response.id, "host-9");
+    }
+
+    #[tokio::test]
+    async fn invoke_worker_preserves_fifo_wire_order() {
+        let state = test_state();
+        let (request_tx, request_rx) = channel(2);
+        let (response_tx, mut response_rx) = unbounded_channel();
+        let worker = tokio::spawn(dispatch_host_invokes_fifo(state, request_rx, response_tx));
+
+        for id in ["host-first", "host-second"] {
+            request_tx
+                .send(HostInvokeRequest {
+                    id: id.to_string(),
+                    command: format!("unknown-{id}"),
+                    payload: Value::Null,
+                })
+                .await
+                .unwrap();
+        }
+        drop(request_tx);
+
+        assert_eq!(response_rx.recv().await.unwrap().id, "host-first");
+        assert_eq!(response_rx.recv().await.unwrap().id, "host-second");
+        worker.await.unwrap();
     }
 
     #[tokio::test]
@@ -671,6 +1033,8 @@ mod tests {
         assert!(script.contains("host_event"));
         assert!(script.contains("await dioxus.recv()"));
         assert!(script.contains("dioxus.send("));
+        assert!(script.contains("let invokeTail = Promise.resolve()"));
+        assert!(script.contains("invokeTail = scheduled.then("));
         assert!(script.contains(LIVE_HOST_BRIDGE_STATUS));
         // Must NOT advertise the pending sentinel — it is the live transport.
         assert_ne!(
