@@ -41,6 +41,9 @@ Memory is one first-class service, not the whole product. Impulse also owns proc
 
 ---
 
+## Desktop Shell Status (as of 2026-07-19)
+
+> **egui / impulse-gui is LEGACY.** It is frozen — no new features. The active retirement plan removes it as dead product code after release automation is made truthful; it is not a functional fallback.
 ## Desktop Shell Status (as of 2026-07-12)
 ## Desktop Shell Status (as of 2026-08-17)
 

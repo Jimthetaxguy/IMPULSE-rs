@@ -1,11 +1,13 @@
 ---
 title: Legacy UI Retirement Plan
 description: Gated retirement of the nonfunctional egui surface, unwired affordances, and temporary Tauri compatibility adapter while preserving Dioxus, ratatui, CLI, PTY, and daemon authority
+version: '2.1'
 version: '2.0'
 type: doc
 category: roadmap
 phase: all
 status: active
+updated: 2026-07-19
 updated: 2026-08-17
 audience: builders
 tags: [roadmap, decommission, egui, eframe, dioxus, tauri, desktop, cleanup]
@@ -37,6 +39,70 @@ Impulse will carry only functional product surfaces:
 The stable boundary is not a UI framework. PTY lifecycle, runtime identity, policy, memory,
 telemetry, review, and verification remain Rust backend responsibilities. A cockpit renders and
 invokes those contracts; it never becomes a second control plane.
+
+## Verified Baseline
+
+Verified on `origin/main` at `2504557` on 2026-07-19, after PR #21's desktop startup/folder-picker
+fixes and PR #22's voice-engine integration. This plan describes merged repository truth only.
+The unmerged `codex/dioxus-egui-retirement` branch contains later packaging, cockpit, and
+dead-affordance work, but none of that work is counted as shipped here.
+
+| Surface | Live fact | Retirement consequence |
+|---|---|---|
+| `impulse-gui` | Excluded leaf crate; 43 files and 14,998 Rust lines | Remove the entire crate after recovery proof; do not port it feature-for-feature |
+| `impulse-term` egui layer | `default = ["egui"]` still activates `eframe` in normal workspace resolution | Removing it materially reduces the active dependency graph |
+| Framework-neutral terminal core | `backend.rs`, `context.rs`, and `paste.rs`; Dioxus already uses `default-features = false` | Preserve and strengthen this boundary |
+| Dioxus host | `LiveDesktopApp` and the Rust eval bridge are implemented; PR #21 added bounded host-adapter resolution and the native folder-picker path | Keep as the graphical product surface; those fixes do not by themselves prove packaged lifecycle parity |
+| Dioxus host smoke | Browser smoke replaces the pending bootstrap with a test host API | Useful contract proof, but not packaged real-bridge acceptance |
+| Dioxus dead affordances | Disabled `Cmd-K` and `Settings` buttons say “coming soon”; artifact action buttons only record a local status string | Hide/remove until backed by a real typed operation, or wire and prove them |
+| macOS release | Release workflow calls a script that expects excluded `impulse-gui` output | Broken/stale release claim must be repaired or removed before EGUI deletion |
+| Tauri adapter | Optional Cargo feature, event sink, cfg wrappers, JS fallback, and legacy smoke remain | Retire in a distinct tranche after Dioxus acceptance |
+| Agent automation | Project skill and Ralph state still route future work toward EGUI | Neutralize before deleting code to prevent resurrection |
+
+## Relevance After Current-Main Reconciliation
+
+| Original PR concern | 2026-07-19 verdict | Consequence |
+|---|---|---|
+| Remove frozen `impulse-gui` and the `impulse-term` EGUI layer | **Still relevant** | Both remain in source; `impulse-term` still enables `egui` by default on `main` |
+| Repair the macOS release path before legacy deletion | **Still relevant** | The release job still invokes a bundler that expects the excluded `impulse-gui` binary |
+| Remove or wire dead Dioxus affordances | **Still relevant** | `Cmd-K`, `Settings`, and local-only artifact intents remain on `main` |
+| Retire Tauri together with EGUI | **Rejected coupling** | Tauri stays a separate later tranche with its own packaged-host acceptance gate |
+| Replay the governed-role/task/producer stack carried by the old PR branch | **Superseded** | PRs #14, #18, and #19 already integrated those capabilities into `main` |
+| Update `docs/ROADMAP-PLAN.md` as an active roadmap | **Superseded** | That document is explicitly historical; this active plan and the canonical contract own current truth |
+| Treat `codex/dioxus-egui-retirement` as completed work | **Not current truth** | The branch is unmerged and behind current `main`; it must be forward-ported and reverified before its results can satisfy any checkbox below |
+
+## Removal Policy
+
+Whole legacy stacks, dead affordances inside retained shells, and compatibility adapters are
+different retirement problems and must not share one all-or-nothing gate.
+
+### Track A — EGUI/eframe
+
+EGUI is not a functional fallback today: the crate is excluded from the workspace and the release
+script does not build the binary it later tries to copy. Its deletion therefore does **not** wait
+for Tauri-adapter retirement. It does wait for an honest release state:
+
+1. **Preferred:** replace the stale bundle path with a tested Dioxus `.app`/DMG pipeline.
+2. **Allowed fallback:** if desktop packaging is deliberately deferred, remove the broken DMG job
+   and publish CLI artifacts only, with desktop distribution explicitly marked unavailable.
+
+The preferred route is the product-aligned route. The fallback is honest but does not satisfy the
+first-class desktop distribution goal.
+
+### Track B — Dead affordances in retained surfaces
+
+An active cockpit must not advertise controls that cannot perform their named operation. Every
+visible action must satisfy one of these states:
+
+1. **Functional:** it invokes a typed backend command and renders success/failure evidence.
+2. **Truthfully unavailable:** it is omitted from the product surface; capability/help text may
+   explain what is not installed without presenting a fake action.
+3. **Read-only:** it is visibly non-actionable and never styled or announced as an executable
+   control.
+
+“Coming soon,” permanently disabled buttons, local-only intent handlers, and fixture-backed actions
+do not qualify. In the current Dioxus shell, remove the disabled command-palette/settings buttons
+until implemented, and hide artifact action buttons until they dispatch a real typed operation.
 
 EGUI deletion does **not** wait on Tauri retirement and does **not** wait on a vague “Dioxus
 parity” gate. It waits on an honest release state (Track A / R1).
@@ -109,6 +175,7 @@ daemon-backed state. Removing Tauri must be a later, independently reversible co
 - `impulse-term/src/backend.rs`, `context.rs`, and `paste.rs`.
 - `impulse-term/tests/backend_tests.rs`.
 - `impulse-term/tests/boundary_tests.rs`, reworded to prove the post-EGUI public API.
+- Daemon/control-plane, role, runtime, memory, telemetry, review, artifact, and verification code.
 - Daemon/control-plane, role, runtime, memory, telemetry, review, artifact, verification, voice,
   basis, and settlement code.
 - Dioxus MemoryView / accepted-run candidate cards and governed-task evidence cards that render
@@ -163,6 +230,10 @@ requirements instead of preserving dead presentation code inside the PTY crate.
 
 - [ ] Refresh `git status`, `git fetch`, upstream divergence, worktrees, and open PR dependencies.
 - [ ] Prove no active crate or external package consumes `TerminalPanel`, `TerminalRenderer`, the
+  EGUI theme types, or `impulse-gui` as a binary artifact.
+- [ ] Push a backup ref for the exact pre-removal commit.
+- [ ] Create a deterministic `git archive` of the EGUI crate, EGUI-only terminal files, current
+  packaging files, and active automation into a user-approved non-repository archive directory.
       EGUI theme types, or `impulse-gui` as a binary artifact.
 - [ ] Push a backup ref for the exact pre-removal commit.
 - [ ] Create a deterministic `git archive` of the EGUI crate, EGUI-only terminal files, current
@@ -181,6 +252,17 @@ Preferred Dioxus packaging path:
 - [ ] Move bundle metadata/icon ownership out of `impulse-gui`.
 - [ ] Package the Dioxus binary and required `impulse-rs` companion binary explicitly.
 - [ ] Add an artifact inspection and macOS launch smoke that fails if the app exits immediately,
+  cannot load local xterm assets, or never reports the live Dioxus bridge status.
+- [ ] Make the tag release consume only the proven Dioxus package recipe.
+
+Fallback CLI-only path, only if explicitly chosen:
+
+- [ ] Remove the broken DMG job and stale GUI bundler from active release automation.
+- [ ] State clearly that tagged releases contain CLI artifacts only until Dioxus packaging lands.
+- [ ] Keep Track C blocked; CLI-only release truth is not Dioxus operational acceptance.
+
+**Gate:** no active release script or workflow may reference `impulse-gui`.
+
       cannot load local xterm assets, or never reports the live Dioxus bridge status.
 - [ ] Make the tag release consume only the proven Dioxus package recipe.
 
@@ -204,6 +286,17 @@ limits are recorded in [the release lane work card](worktrees/2026-09-14-cli-rel
 
 - [ ] Rewrite the project development skill to route graphical view work to Dioxus.
 - [ ] Replace the EGUI view guide with a Dioxus view/host-contract guide; preserve old guidance only
+  under an explicitly historical/archive path.
+- [ ] Retire the stale `.opencode/ralph-loop.json` EGUI continuation state so automation cannot
+  resume its command-palette or tab-reordering queue.
+- [ ] Update live code comments that use deleted GUI modules as a current comparison point.
+- [ ] Inventory every visible Dioxus and ratatui control against a typed command/event/read-model
+  path; record KEEP, WIRE, or REMOVE for each unmatched control.
+- [ ] Remove the disabled `Cmd-K` and `Settings` “coming soon” buttons until they are functional.
+- [ ] Remove/hide artifact action buttons that only set a local status string; retain read-only
+  artifact cards until a real artifact-action command exists.
+- [ ] Add SSR/contract coverage that rejects `coming soon` controls and actionable buttons without
+  a backed handler contract.
       under an explicitly historical/archive path.
 - [ ] Retire any stale Ralph-loop EGUI continuation state so automation cannot resume an EGUI queue.
 - [ ] Update live code comments that use deleted GUI modules as a current comparison point.
@@ -243,6 +336,15 @@ all still compile and pass.
 
 ### R5 — Make the canonical contract describe removal
 
+- [ ] Add ADR `0014` recording EGUI removal, the chosen release path, preserved surfaces,
+  recovery reference, and the fact that Tauri compatibility remains separate.
+- [ ] In the same implementation PR that physically removes EGUI, flip the exact roadmap marker
+  from `Legacy=egui compile-maintenance only` to `Legacy=egui removed` everywhere enforced by the
+  docs validator.
+- [ ] Update current README, handbook, architecture, desktop spec, metadata, quickstart, skill, and
+  collaboration guidance. Do not rewrite historical ADRs/design research as if EGUI never existed.
+- [ ] Mark this plan's Track A complete only after source, manifests, release automation, agent
+  instructions, docs, and dependency resolution agree.
 - [ ] In the **implementation** PR that physically removes EGUI, add the next free ADR (0016 as of
       2026-08-17; 0013–0015 are already taken) recording EGUI removal, the chosen release path,
       preserved surfaces, recovery reference, and the fact that Tauri compatibility remains separate.
@@ -258,6 +360,7 @@ all still compile and pass.
 ### R6 — Retire Tauri compatibility independently (Track C)
 
 Entry gate: a packaged Dioxus app must exercise the real `LiveDesktopApp` eval transport without
+`__IMPULSE_TEST_HOST_API` or `window.__TAURI__` and prove:
 an injected test host API or `window.__TAURI__` and prove:
 
 - [ ] app launch and live bridge readiness;
@@ -278,6 +381,16 @@ Then, in a separate commit/PR:
 ### R7 — Final sweep and closure
 
 - [ ] Confirm zero EGUI references in shipping Rust, Cargo manifests/locks, shell scripts, release
+  workflows, or active agent configuration.
+- [ ] Allowlist historical/archive references instead of rewriting provenance.
+- [ ] Confirm zero Tauri runtime references after Track C; framework-neutral mentions in ADR history
+  may remain.
+- [ ] Mark this plan complete and record removed files/LOC, dependency change, release proof,
+  verification evidence, recovery ref, and PRs.
+
+## Verification Contract
+
+Run from `impulse-rs/` unless noted:
       workflows, or active agent configuration.
 - [ ] Allowlist historical/archive references instead of rewriting provenance.
 - [ ] Confirm zero Tauri runtime references after Track C; framework-neutral mentions in ADR history
@@ -302,6 +415,18 @@ cargo check -p impulse-desktop --features desktop-app --bin impulse-desktop
 cargo check -p impulse-desktop --features legacy-tauri-runtime  # Track A only
 ```
 
+Run from `impulse-rs/impulse-desktop/`:
+
+```bash
+npm run host:smoke
+```
+
+Track C additionally requires the packaged real-bridge acceptance test described in R6; the
+browser contract smoke alone is insufficient.
+
+Run from the repository root:
+
+```bash
 Run from `impulse-rs/impulse-desktop/` if the host-smoke script is still the documented contract
 check. Track C additionally requires the packaged real-bridge acceptance test described in R6;
 browser contract smoke alone is insufficient.

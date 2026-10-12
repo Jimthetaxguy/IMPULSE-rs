@@ -1,5 +1,12 @@
 ---
 title: Long-Range Enhancement Roadmap
+description: Superseded PR-organized enhancement backlog retained for historical planning context
+version: '1.1'
+updated: 2026-07-19
+type: doc
+category: roadmap
+phase: historical
+status: superseded
 description: Historical 33-candidate enhancement backlog across 8 themed lanes
 version: '1.0'
 updated: 2026-03-17
@@ -10,7 +17,7 @@ status: archive
 archived: 2026-09-14
 audience: builder
 tags: [roadmap, enhancements, planning, backlog]
-last_updated: 2026-03-17
+last_updated: 2026-07-19
 authors:
   - name: Impulse Maintainers
     role: Maintainer
@@ -18,6 +25,15 @@ authors:
 
 # Long-Range Enhancement Roadmap — Impulse
 
+> **SUPERSEDED — historical planning record.** This file preserves an earlier 33-item enhancement
+> backlog and its dependency ideas. Its Now/Next/Later labels, product framing, file paths, and
+> completion claims are not current implementation guidance. Use [`../VISION.md`](../VISION.md) for
+> the living product north star, [`spec/RUST-CANONICAL-CONTRACT.md`](./spec/RUST-CANONICAL-CONTRACT.md)
+> for current behavior and roadmap boundaries, and [`spec/TEST-TRACEABILITY.md`](./spec/TEST-TRACEABILITY.md)
+> for current evidence gaps.
+>
+> [`HONEST-ROADMAP.md`](./HONEST-ROADMAP.md) remains a narrow historical hook and memory validation
+> register, not the current whole-product roadmap.
 > **Historical backlog snapshot; archived 2026-09-14.** All 33 candidates, their
 > acceptance ideas, dependency graph, and provenance below are retained. Their March
 > Now/Next/Later labels and readiness statements are historical, not current work authorization.
@@ -39,22 +55,11 @@ authors:
 
 ---
 
-## Governance
+## Historical Use
 
-This document is the **third pillar** of Impulse planning:
-
-| Document | Role | Scope |
-|----------|------|-------|
-| [`ROADMAP-PLAN.md`](./ROADMAP-PLAN.md) | Execution sequence | What we're doing now and next |
-| [`HONEST-ROADMAP.md`](./HONEST-ROADMAP.md) | Risk register | What's unproven and risky |
-| **This document** | PR backlog | The full queue organized by theme |
-
-**Rules:**
-- Items in **Now** lanes are ready for immediate work.
-- Items in **Next** lanes are ready once their dependencies land.
-- Items in **Later** lanes are ready only after Now+Next complete and validation evidence exists.
-- If HONEST-ROADMAP.md validation fails, dependent items here must be revised.
-- RUST-CANONICAL-CONTRACT.md wins any conflicts.
+This document is retained for provenance and reusable implementation ideas only. Do not select work
+from a lane because it is labeled Now or Next. Re-evaluate any useful item against the current
+vision, canonical contract, accepted ADRs, and test traceability before creating an active plan.
 
 **Pattern provenance:** Many enhancements borrow patterns from external analysis. Sources are cited inline: `[desloppify]`, `[Hermes]`, `[OpenSquirrel]`, `[Agent Harness Analysis]`.
 
