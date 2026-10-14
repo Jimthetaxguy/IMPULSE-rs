@@ -50,8 +50,6 @@ pub mod stewardship;
 pub mod storage;
 #[cfg(test)]
 mod test_support;
-#[doc(hidden)]
-pub mod test_git_repo;
 pub mod tooling;
 pub mod tools;
 pub mod ui;
