@@ -1,24 +1,26 @@
 ---
 title: Legacy UI retirement planning lane
-description: Replace the stale EGUI decommission plan with a current, evidence-backed three-track retirement contract
-updated: 2026-07-19
+description: Historical lane card. It does not replace docs/plans/EGUI-DECOMMISSION.md, which #83 restored on main.
+updated: 2026-10-14
 type: doc
 category: planning
 phase: all
-status: active
+status: superseded
 audience: builders
 tags: [worktree, cleanup, egui, dioxus, tauri, release]
 ---
 
 # Legacy UI Retirement Planning Lane
 
+> Superseded 2026-10-14. #83 restored [`../EGUI-DECOMMISSION.md`](../EGUI-DECOMMISSION.md) to the pre-sweep plan. This card is lane provenance and does not replace that file.
+
 ## Lane Facts
 
 - Owner: Codex (`codex/legacy-ui-retirement-plan`).
 - Base: `origin/main` at `2504557`.
-- Scope: documentation and read-only inventory only. Owned paths are `AGENTS.md`,
+- Scope: documentation and read-only inventory only. Owned paths were `AGENTS.md`,
   `docs/LONG-RANGE-ENHANCEMENTS.md`, this work card, and `docs/plans/EGUI-DECOMMISSION.md`.
-- Canonical output: [`../EGUI-DECOMMISSION.md`](../EGUI-DECOMMISSION.md).
+- Current plan: [`../EGUI-DECOMMISSION.md`](../EGUI-DECOMMISSION.md), as restored by #83. This card is not that plan.
 - No UI source, Cargo dependency, release job, compatibility adapter, or generated local artifact
   was removed in this lane. The stale stacked PR history was rebuilt from current `main`; its exact
   previous head is preserved at `backup/pr17-legacy-ui-retirement-plan-2026-07-19`.

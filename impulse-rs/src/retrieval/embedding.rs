@@ -683,9 +683,7 @@ mod tests {
     fn test_allow_fake_embedding_backend_with_env() {
         let _guard = retrieval_embedding_env_lock();
         std::env::set_var("IMPULSE_EMBED_ALLOW_FAKE", "1");
-        assert!(
-            reject_or_warn_fake_embedding_backend(Some(FAKE_EMBED_BACKEND)).is_ok()
-        );
+        assert!(reject_or_warn_fake_embedding_backend(Some(FAKE_EMBED_BACKEND)).is_ok());
         std::env::remove_var("IMPULSE_EMBED_ALLOW_FAKE");
     }
 

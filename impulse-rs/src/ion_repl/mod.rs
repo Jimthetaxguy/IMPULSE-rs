@@ -620,7 +620,6 @@ mod tests {
     /// per-file lock is insufficient).
     use crate::test_support::init_git_repo;
     use crate::test_support::ion_gate_launcher_env_lock as env_lock;
-    use crate::test_git_repo::init_git_repo_with_empty_commit;
     use chat::test_support::{EchoProvider, MissingKeyProvider};
 
     /// A `ChatState` that always fails with `AgentError::MissingApiKey`,
