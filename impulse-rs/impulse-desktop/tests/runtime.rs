@@ -717,7 +717,6 @@ fn test_ungoverned_cross_workspace_spawn_does_not_receive_daemon_control_routing
     }
 }
 
-
 #[test]
 fn test_terminal_harness_spawn_request_binds_workspace_and_default_tools() {
     let request = AgentSpawnRequest::terminal_harness(
