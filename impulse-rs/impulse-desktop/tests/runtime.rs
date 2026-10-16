@@ -174,6 +174,7 @@ impl GovernedTaskGateway for TestGovernedGateway {
             task: registration.task,
             acceptance_criteria: registration.acceptance_criteria,
             approval_policy: ApprovalPolicy::OperatorRequired,
+            world_scope: Default::default(),
             verification_profile: registration.verification_profile,
             role_assignment: registration.role_assignment,
             role_compatibility: registration.role_compatibility,
@@ -181,6 +182,8 @@ impl GovernedTaskGateway for TestGovernedGateway {
             agent_id: registration.agent_id,
             session_id: registration.session_id,
             initial_subject_revision: registration.initial_subject_revision,
+            staged_worktree: None,
+            promotions: vec![],
             execution_state: GovernedExecutionState::Registered,
             review_state: GovernedReviewState::AwaitingClaim,
             claims: Vec::new(),
@@ -562,66 +565,6 @@ fn test_desktop_runtime_snapshot_carries_workspace_and_builtin_mcp_tools() {
         .expect("close workspace agent");
 }
 
-#[test]
-fn test_ungoverned_cross_workspace_spawn_does_not_receive_daemon_control_routing() {
-    const HELPER_ENV: &str = "IMPULSE_ROUTING_ISOLATION_TEST_HELPER";
-    if std::env::var_os(HELPER_ENV).is_none() {
-        let output = std::process::Command::new(
-            std::env::current_exe().expect("locate desktop runtime test binary"),
-        )
-        .args([
-            "--exact",
-            "test_ungoverned_cross_workspace_spawn_does_not_receive_daemon_control_routing",
-            "--nocapture",
-        ])
-        .env(HELPER_ENV, "1")
-        .env("IMPULSE_SOCKET_PATH", "/tmp/parent-leak.sock")
-        .env("IMPULSE_CONTROL_CLI", "/bin/echo")
-        .output()
-        .expect("run routing-isolation subprocess");
-        assert!(
-            output.status.success(),
-            "poisoned-parent routing isolation failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-
-    let workspace = tempfile::tempdir().expect("temporary ungoverned workspace");
-    let sink = Arc::new(RecordingSink::default());
-    let gateway: Arc<dyn GovernedTaskGateway> = Arc::new(TestGovernedGateway::default());
-    let runtime = DesktopRuntime::builder()
-        .with_event_sink(sink.clone())
-        .with_governed_task_gateway(gateway)
-        .build();
-    let mut request = shell_spawn(
-        "ungoverned-cross-workspace",
-        "printf '%s|%s' \"${IMPULSE_SOCKET_PATH-unset}\" \"${IMPULSE_CONTROL_CLI-unset}\"; sleep 0.1",
-    );
-    request.cwd = Some(workspace.path().display().to_string());
-    request.workspace = Some(WorkspaceTarget::from_root(
-        workspace.path().display().to_string(),
-    ));
-
-    runtime
-        .spawn_agent(request)
-        .expect("ordinary cross-workspace agent should launch");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let output = String::from_utf8_lossy(&terminal_output(&sink, "ungoverned-cross-workspace"))
-            .to_string();
-        if output.contains("unset|unset") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "ordinary agent output did not prove routing isolation: {output:?}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
 #[cfg(unix)]
 #[test]
 fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_directory() {
@@ -712,6 +655,66 @@ fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_direc
         "expected PTY cwd and trusted workspace env to use `{canonical_text}`, got `{}`",
         String::from_utf8_lossy(&terminal_output(&sink, "canonical-workspace-agent"))
     );
+}
+
+#[test]
+fn test_ungoverned_cross_workspace_spawn_does_not_receive_daemon_control_routing() {
+    const HELPER_ENV: &str = "IMPULSE_ROUTING_ISOLATION_TEST_HELPER";
+    if std::env::var_os(HELPER_ENV).is_none() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("locate desktop runtime test binary"),
+        )
+        .args([
+            "--exact",
+            "test_ungoverned_cross_workspace_spawn_does_not_receive_daemon_control_routing",
+            "--nocapture",
+        ])
+        .env(HELPER_ENV, "1")
+        .env("IMPULSE_SOCKET_PATH", "/tmp/parent-leak.sock")
+        .env("IMPULSE_CONTROL_CLI", "/bin/echo")
+        .output()
+        .expect("run routing-isolation subprocess");
+        assert!(
+            output.status.success(),
+            "poisoned-parent routing isolation failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let workspace = tempfile::tempdir().expect("temporary ungoverned workspace");
+    let sink = Arc::new(RecordingSink::default());
+    let gateway: Arc<dyn GovernedTaskGateway> = Arc::new(TestGovernedGateway::default());
+    let runtime = DesktopRuntime::builder()
+        .with_event_sink(sink.clone())
+        .with_governed_task_gateway(gateway)
+        .build();
+    let mut request = shell_spawn(
+        "ungoverned-cross-workspace",
+        "printf '%s|%s' \"${IMPULSE_SOCKET_PATH-unset}\" \"${IMPULSE_CONTROL_CLI-unset}\"; sleep 0.1",
+    );
+    request.cwd = Some(workspace.path().display().to_string());
+    request.workspace = Some(WorkspaceTarget::from_root(
+        workspace.path().display().to_string(),
+    ));
+
+    runtime
+        .spawn_agent(request)
+        .expect("ordinary cross-workspace agent should launch");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let output = String::from_utf8_lossy(&terminal_output(&sink, "ungoverned-cross-workspace"))
+            .to_string();
+        if output.contains("unset|unset") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "ordinary agent output did not prove routing isolation: {output:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

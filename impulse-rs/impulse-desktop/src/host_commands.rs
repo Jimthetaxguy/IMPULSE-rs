@@ -3,7 +3,9 @@ use crate::bridge::{
     TerminalResizeRequest, TerminalSessionResponse, TerminalWriteRequest,
 };
 use crate::mcp::{list_review_queue, McpContext, McpInvocation, McpToolRegistry, ReviewDecision};
-use crate::native::{DefaultNativeIslandHost, NativeIslandRequest, NativeIslandResult};
+use crate::native::{
+    DefaultNativeIslandHost, NativeIslandKind, NativeIslandRequest, NativeIslandResult,
+};
 use crate::runtime::{
     AgentRuntimeSnapshot, AgentSpawnRequest, AgentWriteRequest, DesktopRuntime,
     SupervisorLocalActionRequest, WorkspaceTarget,
@@ -30,6 +32,8 @@ pub const AGENT_RESIZE_COMMAND: &str = "agent_resize";
 pub const AGENT_SNAPSHOT_COMMAND: &str = "agent_snapshot";
 pub const AGENT_SPAWN_COMMAND: &str = "agent_spawn";
 pub const AGENT_WRITE_COMMAND: &str = "agent_write";
+pub const GOVERNED_OUTCOME_PROMOTE_COMMAND: &str = "governed_outcome_promote";
+pub const GOVERNED_STAGED_WORKTREE_DISCARD_COMMAND: &str = "governed_staged_worktree_discard";
 pub const GOVERNED_TASK_MUTATE_COMMAND: &str = "governed_task_mutate";
 pub const LIST_WORKSPACES_COMMAND: &str = "list_workspaces";
 pub const MCP_DESCRIPTORS_COMMAND: &str = "mcp_descriptors";
@@ -53,6 +57,8 @@ pub const HOST_INVOKE_COMMANDS: &[&str] = &[
     AGENT_SNAPSHOT_COMMAND,
     AGENT_SPAWN_COMMAND,
     AGENT_WRITE_COMMAND,
+    GOVERNED_OUTCOME_PROMOTE_COMMAND,
+    GOVERNED_STAGED_WORKTREE_DISCARD_COMMAND,
     GOVERNED_TASK_MUTATE_COMMAND,
     LIST_WORKSPACES_COMMAND,
     MCP_DESCRIPTORS_COMMAND,
@@ -170,6 +176,73 @@ async fn governed_task_mutate_runtime(
     })
     .await
     .map_err(|error| format!("governed task command worker failed: {error}"))?
+}
+
+/// Fast-forward the canonical branch onto an accepted staged outcome
+/// (ADR-0019, protocol v9).
+///
+/// A blocked promotion is a recorded `Ok`; a typed refusal is a distinct `Ok`
+/// carrying the unchanged task and remedy. Transport or invalid responses are `Err`.
+#[cfg(feature = "legacy-tauri-runtime")]
+#[tauri::command]
+pub async fn governed_outcome_promote(
+    state: tauri::State<'_, DesktopShellState>,
+    request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+) -> Result<crate::runtime::GovernedPromotionResponse, String> {
+    governed_outcome_promote_runtime(std::sync::Arc::clone(&state.inner().runtime), request).await
+}
+
+#[cfg(not(feature = "legacy-tauri-runtime"))]
+pub async fn governed_outcome_promote(
+    state: &DesktopShellState,
+    request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+) -> Result<crate::runtime::GovernedPromotionResponse, String> {
+    governed_outcome_promote_runtime(std::sync::Arc::clone(&state.runtime), request).await
+}
+
+async fn governed_outcome_promote_runtime(
+    runtime: std::sync::Arc<DesktopRuntime>,
+    request: impulse_ops::governed_wiring::GovernedPromotionRequest,
+) -> Result<crate::runtime::GovernedPromotionResponse, String> {
+    tokio::task::spawn_blocking(move || {
+        runtime
+            .promote_governed_outcome(request)
+            .map_err(err_to_string)
+    })
+    .await
+    .map_err(|error| format!("governed promotion command worker failed: {error}"))?
+}
+
+/// Reclaim a finished staged worktree (ADR-0019, protocol v9).
+#[cfg(feature = "legacy-tauri-runtime")]
+#[tauri::command]
+pub async fn governed_staged_worktree_discard(
+    state: tauri::State<'_, DesktopShellState>,
+    request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck, String> {
+    governed_staged_worktree_discard_runtime(std::sync::Arc::clone(&state.inner().runtime), request)
+        .await
+}
+
+#[cfg(not(feature = "legacy-tauri-runtime"))]
+pub async fn governed_staged_worktree_discard(
+    state: &DesktopShellState,
+    request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck, String> {
+    governed_staged_worktree_discard_runtime(std::sync::Arc::clone(&state.runtime), request).await
+}
+
+async fn governed_staged_worktree_discard_runtime(
+    runtime: std::sync::Arc<DesktopRuntime>,
+    request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest,
+) -> Result<impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardAck, String> {
+    tokio::task::spawn_blocking(move || {
+        runtime
+            .discard_governed_staged_worktree(request)
+            .map_err(err_to_string)
+    })
+    .await
+    .map_err(|error| format!("governed discard command worker failed: {error}"))?
 }
 
 #[cfg(feature = "legacy-tauri-runtime")]
@@ -445,6 +518,21 @@ fn terminal_focus_inner(
 pub async fn native_island_request(
     request: NativeIslandRequest,
 ) -> Result<NativeIslandResult, String> {
+    // `FileOpenPanel` opens a real, potentially long-lived modal OS dialog.
+    // `dispatch_host_invokes_fifo` (host_bridge.rs) drains host invokes one
+    // at a time on a single tokio task, so calling a blocking dialog inline
+    // here would stall every other host command (terminal writes, agent
+    // snapshots, ...) for as long as the picker stays open. `spawn_blocking`
+    // moves the blocking call onto tokio's dedicated blocking-thread pool
+    // instead — it only needs the already-enabled `rt` Cargo feature and
+    // works even on a current-thread runtime, and it never blocks the FIFO
+    // worker.
+    if matches!(request.kind, NativeIslandKind::FileOpenPanel) {
+        return tokio::task::spawn_blocking(move || DefaultNativeIslandHost.dispatch(request))
+            .await
+            .map_err(err_to_string)?
+            .map_err(err_to_string);
+    }
     DefaultNativeIslandHost
         .dispatch(request)
         .map_err(err_to_string)

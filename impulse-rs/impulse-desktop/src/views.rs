@@ -266,11 +266,20 @@ pub fn MemoryView(
                                 let assurance = match candidate.source_assurance {
                                     AcceptedRunSourceAssurance::DaemonProfiledEvidenceDeclaredOperator =>
                                         "daemon-profiled evidence · declared operator",
+                                    // ADR-0018: the approving connection presented this
+                                    // daemon run's operator capability.
+                                    AcceptedRunSourceAssurance::DaemonProfiledEvidenceAuthenticatedOperator =>
+                                        "daemon-profiled evidence · authenticated operator",
                                     AcceptedRunSourceAssurance::CallerComposedEvidenceDeclaredOperator =>
                                         "caller-composed evidence · declared operator",
                                 };
+                                // ADR-0020 added the two decided variants. This
+                                // read-only view renders them; the operator
+                                // Promote/Dismiss controls are a separate lane.
                                 let status = match candidate.status {
                                     MemoryCandidateStatus::PendingReview => "Pending review — not stored in GENOME",
+                                    MemoryCandidateStatus::Promoted { .. } => "Promoted — in the GENOME projection",
+                                    MemoryCandidateStatus::Dismissed { .. } => "Dismissed — not stored in GENOME",
                                 };
                                 rsx! {
                                     article {
@@ -360,6 +369,7 @@ fn ArtifactCard(artifact: ArtifactEnvelope, on_intent: EventHandler<ShellIntent>
                         {
                             let artifact_id = artifact.id.clone();
                             let action_id = action.id.clone();
+                            let action_key = action_id.clone();
                             let action_label = action.label.clone();
                             let class_name = if action.requires_confirmation {
                                 "action-ghost mutating"
@@ -368,7 +378,7 @@ fn ArtifactCard(artifact: ArtifactEnvelope, on_intent: EventHandler<ShellIntent>
                             };
                             rsx! {
                                 button {
-                                    key: "{action_id}",
+                                    key: "{action_key}",
                                     class: "{class_name}",
                                     onclick: move |_| on_intent.call(ShellIntent::ArtifactAction {
                                         artifact_id: artifact_id.clone(),

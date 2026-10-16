@@ -23,6 +23,58 @@ pub(crate) fn ion_gate_launcher_env_lock() -> std::sync::MutexGuard<'static, ()>
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Creates a throwaway git repository with one empty commit, hermetic
+/// against the invoking user's real git configuration (Stage 1 lane,
+/// `docs/superpowers/specs/2026-09-02-ion-tool-sandbox-and-untrusted-output.md`).
+///
+/// Before this helper, five call sites (`ion_repl::{mod, chat, tool_verify}`,
+/// `handlers::ion`, `tests/ion_verify_cli.rs`) each hand-rolled their own
+/// `git init` fixture with no environment isolation. Under a broad
+/// `cargo test --lib -- ion_repl` filter the fixtures occasionally failed
+/// with `insufficient permission for adding an object to repository
+/// database .git/objects` -- each fixture uses its own `tempfile::TempDir`,
+/// so the cause was never a shared path; the leading suspect is a global
+/// git config (`~/.gitconfig`, e.g. `core.sharedRepository`) or a
+/// credential helper leaking into the child process across concurrent test
+/// threads. `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` stop
+/// git from reading any global or system config at all, and pointing `HOME`
+/// at the same tempdir removes the legacy `~/.gitconfig` fallback path
+/// those two variables don't cover on older git. `user.name`/`user.email`
+/// are set locally so the commit succeeds with no ambient identity.
+///
+/// Panics with the captured stderr on any git failure -- this is test
+/// setup, not a `Result`-returning production path (CLAUDE.md Principle #1
+/// scopes `unwrap`/`expect` to tests and `main()`).
+///
+/// `tests/ion_verify_cli.rs` is a separate integration-test crate compiled
+/// against a non-`--cfg test` build of this library, so it cannot see this
+/// `#[cfg(test)]`-gated module regardless of visibility; it keeps its own
+/// copy of this exact fixture (see that file's `init_git_repo`).
+pub(crate) fn init_git_repo() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().expect("failed to create tempdir");
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", dir.path())
+            .output()
+            .expect("failed to run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&["init", "--quiet"]);
+    run(&["config", "user.email", "test@example.com"]);
+    run(&["config", "user.name", "Test"]);
+    run(&["commit", "--allow-empty", "--quiet", "-m", "init"]);
+    dir
+}
+
 /// Acquire the process-wide lock guarding test mutation of
 /// `IMPULSE_EMBED_SCRIPT` and related retrieval-embedding env configuration.
 ///
@@ -31,6 +83,31 @@ pub(crate) fn ion_gate_launcher_env_lock() -> std::sync::MutexGuard<'static, ()>
 /// the other test's script path while both run in the same libtest process.
 /// Poison recovery keeps later tests runnable if an earlier assertion panics.
 pub(crate) fn retrieval_embedding_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Acquire the process-wide lock guarding test mutation of `IMPULSE_HOME`.
+///
+/// Shared by `ion_repl::history`, `ion_repl::mod` (`sandbox_tool_context`,
+/// review round 5, P1 Codex on PR #54, item 2), and
+/// `tooling::builtin::{memory_search,genome_read}` (item 3's tool-scoped
+/// `IMPULSE_HOME` acceptance test) -- before this shared lock existed, each
+/// of those modules defined its OWN private `static ENV_LOCK`, which only
+/// serializes tests within that one file: two tests in DIFFERENT files
+/// mutating the same process-global `IMPULSE_HOME` could still race under
+/// `cargo test`'s default multi-threaded-single-process execution, exactly
+/// the failure mode this module's own doc comment warns about for
+/// `ION_GATE_LAUNCHER`. Poison-safe, matching the sibling locks above.
+pub(crate) fn impulse_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Acquire the process-wide lock guarding test mutation of governed-launch
+/// env (`IMPULSE_PROJECT_ID`, `IMPULSE_GOVERNED_TASK_ID`). Claim-confirmation
+/// prelude tests read those vars; they must not race other lib tests.
+pub(crate) fn governed_launch_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -109,5 +186,36 @@ pub(crate) async fn wait_for_pids_to_exit(
             return Err(survivors);
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+#[cfg(test)]
+mod init_git_repo_tests {
+    use super::init_git_repo;
+
+    #[test]
+    fn test_init_git_repo_creates_a_repo_with_one_commit_on_head() {
+        let repo = init_git_repo();
+        assert!(repo.path().join(".git").exists());
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["rev-parse", "HEAD"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", repo.path())
+            .output()
+            .expect("git rev-parse should run");
+        assert!(output.status.success(), "HEAD should resolve to a commit");
+        assert!(!String::from_utf8_lossy(&output.stdout).trim().is_empty());
+    }
+
+    #[test]
+    fn test_init_git_repo_two_calls_yield_independent_directories() {
+        // Regression guard for the flake this fixture replaces: two
+        // fixtures created back to back must never share a path or state.
+        let a = init_git_repo();
+        let b = init_git_repo();
+        assert_ne!(a.path(), b.path());
     }
 }

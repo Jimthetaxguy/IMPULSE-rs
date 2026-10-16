@@ -81,6 +81,28 @@ impl ReplTool for IonVerifyTool {
                     Some(ctx.repo_root.display().to_string())
                 }
             });
+
+        // Review round 1, P1: this gate ships the resolved repo's diff to an
+        // external API (the Ion Pi gate on MiniMax) -- a model-supplied
+        // `repo` argument pointing outside the session's read sandbox must
+        // be refused before ever reaching run_ion_verify, the same as any
+        // other path a bridged tool would check. The default (no `repo`
+        // argument -- falls back to ctx.repo_root itself) always resolves
+        // inside the sandbox trivially, so this check is universal rather
+        // than conditioned on whether the model supplied the argument.
+        if let Some(repo_str) = &repo {
+            let tool_ctx = ctx.sandbox_tool_context();
+            let resolved = tool_ctx.resolve_path(repo_str);
+            if !tool_ctx.is_path_allowed(&resolved, false) {
+                anyhow::bail!(
+                    "ion_verify: repo '{repo_str}' resolves outside the session's read \
+                     sandbox (repo root plus any /allow grants); this gate ships the \
+                     repo's diff to an external API, so it refuses to run against an \
+                     unsandboxed path"
+                );
+            }
+        }
+
         let diff_ref = args
             .get("diff_ref")
             .and_then(|v| v.as_str())
@@ -135,25 +157,8 @@ mod tests {
     /// env var, shared with `handlers::ion` and `ion_repl` via
     /// `crate::test_support` (see that module's doc comment for why a
     /// per-file lock is insufficient).
+    use crate::test_support::init_git_repo;
     use crate::test_support::ion_gate_launcher_env_lock as env_lock;
-
-    fn init_git_repo() -> tempfile::TempDir {
-        let dir = tempfile::TempDir::new().expect("failed to create tempdir");
-        let run = |args: &[&str]| {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir.path())
-                .args(args)
-                .status()
-                .expect("failed to run git");
-            assert!(status.success(), "git {args:?} failed");
-        };
-        run(&["init", "--quiet"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "Test"]);
-        run(&["commit", "--allow-empty", "--quiet", "-m", "init"]);
-        dir
-    }
 
     #[test]
     fn test_name_and_usage() {
@@ -181,6 +186,7 @@ mod tests {
 
         let ctx = ReplContext {
             repo_root: repo.path().to_path_buf(),
+            ..ReplContext::default()
         };
         let outcome = IonVerifyTool
             .run(serde_json::json!({"diff_ref": "HEAD"}), &ctx)
@@ -204,6 +210,7 @@ mod tests {
 
         let ctx = ReplContext {
             repo_root: repo.path().to_path_buf(),
+            ..ReplContext::default()
         };
         let outcome = IonVerifyTool
             .run(serde_json::json!({"diff_ref": "HEAD"}), &ctx)
@@ -248,6 +255,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_refuses_a_model_supplied_repo_outside_the_sandbox() {
+        // Review round 1, P1: ion_verify ships the repo's diff to an
+        // external API -- a repo argument outside the session's read
+        // sandbox must be refused before run_ion_verify is ever called
+        // (proven here by the absence of any git-repo-not-found style
+        // message: the sandbox message must be the one that surfaces).
+        let repo = init_git_repo();
+        let outside = init_git_repo();
+        let ctx = ReplContext {
+            repo_root: repo.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+
+        let outcome = IonVerifyTool
+            .run(
+                serde_json::json!({
+                    "repo": outside.path().display().to_string(),
+                    "diff_ref": "HEAD",
+                }),
+                &ctx,
+            )
+            .await;
+
+        let err = outcome.expect_err("a repo outside the sandbox must be refused");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("outside the session's read sandbox"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_accepts_a_model_supplied_repo_granted_via_allow() {
+        let repo = init_git_repo();
+        let granted = init_git_repo();
+        let stub_gate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fakes/ion-verify-stub-gate.sh");
+        let _guard = env_lock();
+        std::env::set_var(impulse_ion::pi_adapter::ION_GATE_LAUNCHER_ENV, &stub_gate);
+
+        let ctx = ReplContext {
+            repo_root: repo.path().to_path_buf(),
+            allowed_read_roots: vec![granted.path().to_path_buf()],
+        };
+        let outcome = IonVerifyTool
+            .run(
+                serde_json::json!({
+                    "repo": granted.path().display().to_string(),
+                    "diff_ref": "HEAD",
+                }),
+                &ctx,
+            )
+            .await;
+
+        std::env::remove_var(impulse_ion::pi_adapter::ION_GATE_LAUNCHER_ENV);
+
+        let outcome = outcome.expect("a /allow-granted repo should be accepted");
+        assert!(outcome.ok);
+    }
+
+    #[tokio::test]
     async fn run_ok_is_false_when_validate_fails_even_though_passed_is_true() {
         // Regression test: an earlier version set `ok = response.passed()`
         // only, diverging from the CLI's `!passed() || validate().is_err()`
@@ -264,6 +332,7 @@ mod tests {
 
         let ctx = ReplContext {
             repo_root: repo.path().to_path_buf(),
+            ..ReplContext::default()
         };
         let outcome = IonVerifyTool
             .run(serde_json::json!({"diff_ref": "HEAD"}), &ctx)

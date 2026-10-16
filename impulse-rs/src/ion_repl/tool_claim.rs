@@ -94,17 +94,36 @@ impl ReplTool for GovernedSubmitClaimTool {
             artifact_ids,
         };
         request.validate()?;
-        let acknowledged = client.submit_governed_claim(request).await?;
-        let payload = serde_json::to_value(&acknowledged)
-            .context("failed to serialize governed claim acknowledgment")?;
-        Ok(ToolOutcome {
-            rendered: format!(
-                "Governed completion claim acknowledged at task revision {}.",
-                acknowledged.revision
-            ),
-            payload,
-            ok: true,
-        })
+        match client.submit_governed_claim(request).await? {
+            crate::client::GovernedProducerOutcome::Recorded(acknowledged) => {
+                let payload = serde_json::to_value(&acknowledged)
+                    .context("failed to serialize governed claim acknowledgment")?;
+                Ok(ToolOutcome {
+                    rendered: format!(
+                        "Governed completion claim acknowledged at task revision {}.",
+                        acknowledged.revision
+                    ),
+                    payload,
+                    ok: true,
+                })
+            }
+            // ADR-0019 rule 13: the daemon refused to run Git in this staged
+            // worktree. Nothing was recorded and retrying changes nothing, so
+            // the Builder is told the reason and the remedy rather than a
+            // failure it might loop on.
+            crate::client::GovernedProducerOutcome::StagedConfigRefused(refusal) => {
+                let payload = serde_json::to_value(&refusal)
+                    .context("failed to serialize governed claim refusal")?;
+                Ok(ToolOutcome {
+                    rendered: format!(
+                        "Governed completion claim refused: {}. {}.",
+                        refusal.reason, refusal.remedy
+                    ),
+                    payload,
+                    ok: false,
+                })
+            }
+        }
     }
 }
 

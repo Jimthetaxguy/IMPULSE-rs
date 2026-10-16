@@ -8,9 +8,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use impulse_ops::memory_candidate::MemoryRecord;
+
 use crate::memory::{Decision, Genome};
 use crate::retrieval::embedding::embed_texts;
-use crate::retrieval::store::{GenomeUpsert, HistoryUpsert, RetrievalStore};
+use crate::retrieval::store::{GenomeUpsert, HistoryUpsert, MemoryRecordUpsert, RetrievalStore};
 use crate::retrieval::types::{IndexScope, IndexState};
 use crate::state::{Config, HistoryEntry, Platform};
 use crate::storage::Storage;
@@ -213,6 +215,67 @@ fn embed_genome_jobs(
         }
     }
     Ok(())
+}
+
+/// Index the promoted memory records that back the GENOME projection
+/// (ADR-0020).
+///
+/// This is a separate entry point from [`index_memory`] on purpose. Promoted
+/// records live in their own table and are never merged into
+/// `genome_decisions`: the hand-curated GENOME and the promoted-record log are
+/// different artifacts with different owners.
+///
+/// Only records passed in are indexed, and the caller is the state layer, which
+/// passes the *projection* — so a pending or dismissed candidate cannot reach
+/// the index at all (ADR-0013 rule 9).
+pub fn index_promoted_memory_records(base_path: &Path, records: &[MemoryRecord]) -> Result<usize> {
+    let _lock =
+        IndexLockGuard::acquire(base_path).context("Failed to acquire retrieval index lock")?;
+    let store = RetrievalStore::open(base_path).context("Failed to open retrieval store")?;
+    store
+        .init_schema()
+        .context("Failed to initialize retrieval schema")?;
+
+    let mut keep = HashSet::new();
+    for record in records {
+        let source_json = serde_json::to_string(&record.source)
+            .context("Failed to serialize memory record source for the retrieval index")?;
+        let search_text = format!("{} {}", record.title, record.body);
+        store
+            .upsert_memory_record(MemoryRecordUpsert {
+                record_id: record.id.as_str(),
+                project_id: &record.project_id,
+                scope: record.scope.label(),
+                kind: record.kind.label(),
+                valid_from: &record.valid_from,
+                title: &record.title,
+                body: &record.body,
+                source_json: &source_json,
+                search_text: &search_text,
+                // The record's own content digest is already a hash of exactly
+                // the indexed fields; there is no second hash to invent.
+                content_hash: &record.digest,
+            })
+            .context("Failed to index a promoted memory record")?;
+        keep.insert(record.id.as_str().to_string());
+    }
+    store
+        .delete_memory_records_except(&keep)
+        .context("Failed to drop memory records that left the projection")?;
+    Ok(records.len())
+}
+
+/// Keyword search over promoted memory records.
+pub fn search_promoted_memory(
+    base_path: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<crate::retrieval::types::SearchResult>> {
+    let store = RetrievalStore::open(base_path).context("Failed to open retrieval store")?;
+    store
+        .init_schema()
+        .context("Failed to initialize retrieval schema")?;
+    store.search_memory_keyword(query, limit)
 }
 
 pub fn index_memory(

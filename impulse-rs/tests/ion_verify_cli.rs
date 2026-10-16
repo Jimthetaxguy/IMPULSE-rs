@@ -26,16 +26,31 @@ fn impulse_rs_dir() -> PathBuf {
 
 /// Creates a throwaway git repo with one empty commit, so `--diff-ref HEAD`
 /// resolves via `git rev-parse` inside `run_ion_verify`.
+///
+/// Hermetic against the invoking user's real git config, same as
+/// `impulse_rs::test_support::init_git_repo` (Stage 1 lane,
+/// `docs/superpowers/specs/2026-09-02-ion-tool-sandbox-and-untrusted-output.md`):
+/// this file is a *separate* integration-test crate compiled against a
+/// normal (non-`--cfg test`) build of the library, so it cannot see that
+/// `#[cfg(test)]`-gated module regardless of visibility -- this is a
+/// deliberate, minimal, kept-in-sync copy, not a missed consolidation.
 fn init_git_repo() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().expect("failed to create tempdir");
     let run = |args: &[&str]| {
-        let status = Command::new("git")
+        let output = Command::new("git")
             .arg("-C")
             .arg(dir.path())
             .args(args)
-            .status()
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", dir.path())
+            .output()
             .expect("failed to run git");
-        assert!(status.success(), "git {args:?} failed");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     };
     run(&["init", "--quiet"]);
     run(&["config", "user.email", "test@example.com"]);
