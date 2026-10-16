@@ -69,9 +69,16 @@ Adopt a governed Harness Evolution Plane with these rules:
    only: no promote, apply, or dismiss request exists in this slice, and no optimizer applies its
    own patch. Promotion authority is the operator, through the same authorization path VISION
    open decision 6 will settle for memory candidates.
-4. **Candidate evaluation happens in disposable worlds.** A candidate harness is materialized and
-   evaluated only inside detached-worktree execution (`rust_workspace_v1` machinery from
-   ADR-0012), never against the live daemon or the authoritative workspace. Evaluation produces
+4. **Candidate evaluation is gated by review or a real sandbox.** A candidate harness is
+   materialized in a detached worktree (`rust_workspace_v1` machinery from ADR-0012), but that
+   worktree only isolates checkout contents: it is not a security boundary. A candidate that
+   changes executable Rust, build scripts, or tests would run those unreviewed bytes with host
+   privileges under the fixed Cargo verification commands, with reach to the authoritative
+   workspace, the shared Git directory, the daemon socket, and other host files. Such a
+   candidate therefore must not execute until either (a) the operator has reviewed it and
+   approved execution, or (b) it runs inside an actual OS/filesystem sandbox that denies that
+   host access. Steering-only candidates that change no executable bytes may be evaluated in the
+   detached worktree directly. Evaluation produces
    an evidence bundle: pass/fail deltas, fixed and regressed task lists, and cost. A candidate
    without an evidence bundle cannot leave `pending_review`.
 5. **Regression budgets are class-aware.** Reflecting the 2x regression asymmetry, steering-class
@@ -110,9 +117,11 @@ Adopt a governed Harness Evolution Plane with these rules:
 - **Depends on decisions 2 and 4** (runtime-adapter interface; role contract composition) for the
   role-contract portion of the harness manifest; the manifest can ship earlier covering tools,
   guardrails, verification, and step-model surfaces.
-- **Composes with** `sandbox-agent-analysis.md` (2026-08-22): Builder snapshot-at-mutation /
-  `staged_authoritative` world scope is a sibling decision (candidate ADR-0017) and would give
-  candidate evaluation stronger isolation than detached worktrees alone.
+- **Composes with** [ADR-0019](0019-builder-staged-worktree-world-scope.md) (Proposed): its
+  declared `WorldScope` and staged Builder worktree are the closest tracked contract for
+  candidate worlds. A real OS/filesystem sandbox for executing candidate code is an open future
+  decision (a future ADR, number to be assigned; the unmerged `claude/*` branches already use
+  0022-0024).
 - **Lane placement:** net-new Lane 9 (Harness Evolution) in `docs/LONG-RANGE-ENHANCEMENTS.md`,
   composing with Lane 1 (its evaluation suites are this plane's promotion gates) and Lane 3
   (lessons feed memory quality). Registration of Lane 9 is deferred to the implementation lane.

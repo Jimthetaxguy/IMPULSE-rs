@@ -20,9 +20,9 @@ governance chain instead of adding a second promotion system.
 - [x] ADR-0016 drafted in house style (frontmatter, numbered decision rules, consequences,
       relation to open decisions)
 - [x] Grounded against ADR-0013 candidate discipline, `rust_workspace_v1` detached-worktree
-      producer, VISION open decisions 2/4/6, `sandbox-agent-analysis.md`
-- [x] ADR number 0016 claimed (0001-0015 taken on main; the snapshot-at-mutation idea from
-      `sandbox-agent-analysis.md` shifts to candidate ADR-0017 — noted in ADR text)
+      producer, VISION open decisions 2/4/6, ADR-0019 staged-worktree world scope
+- [x] ADR number 0016 claimed (slot reserved on main; a real execution sandbox is left to a
+      future ADR, number to be assigned)
 - [ ] James review: accept/amend ADR-0016 (draft status until then)
 - [ ] On acceptance: register Lane 9 in LONG-RANGE-ENHANCEMENTS.md; open implementation lane
 
@@ -38,8 +38,8 @@ bundles.
 Phase D after B (parallel with C): Dioxus read-only candidate review surface beside the memory
 candidate view.
 Cross-cutting: promotion authorization lands with VISION decision 6, shared with memory
-candidates; Builder `staged_authoritative` world scope (candidate ADR-0017) strengthens Phase C
-isolation.
+candidates; ADR-0019's staged-worktree world scope informs Phase C, and executing capability candidates
+needs operator review or a real OS/filesystem sandbox (future ADR, number to be assigned).
 
 ## Log
 
