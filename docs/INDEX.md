@@ -98,6 +98,7 @@ in `VISION.md` are resolved.
 | [0013](decisions/0013-deterministic-accepted-run-memory-candidates.md) | Deterministic accepted-run memory candidates | Accepted | Owner-only pending review projection, provenance/source assurance, and no `GENOME`/`HISTORY` mutation |
 | [0014](decisions/0014-work-item-and-comparative-settlement.md) | WorkItem identity and comparative settlement | Proposed | Proposed planning identity, fan-out effect bound, and four-part settlement record |
 | [0015](decisions/0015-harness-owned-step-model.md) | Harness-owned step model choice | Accepted | Pure Impulse-owned per-step policy; hosts retain inference, provider, and evidence authority |
+| [0016](decisions/0016-governed-harness-evolution-plane.md) | Governed harness evolution plane | Proposed | Typed harness-patch candidates, review- or sandbox-gated evaluation, and no automatic promotion |
 | [0017](decisions/0017-canonical-loop-contract.md) | Canonical loop contract | Proposed | Typed loop budgets, breaker-evaluated stop conditions, and termination evidence for Ion tool loops |
 | [0018](decisions/0018-socket-actor-provenance.md) | Socket actor provenance | Proposed | Connection classes from peer credentials plus a per-run operator capability; only an operator surface can mint `accepted` |
 | [0019](decisions/0019-builder-staged-worktree-world-scope.md) | Builder staged-worktree world scope | Proposed | Declared world scope, a disposable staged Builder worktree, fast-forward-only promotion after acceptance, and the governed Builder loop binding |
