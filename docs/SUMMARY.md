@@ -139,7 +139,6 @@ roadmap or whole-product risk authority.
 - [decisions/0013-deterministic-accepted-run-memory-candidates.md](decisions/0013-deterministic-accepted-run-memory-candidates.md)
 - [decisions/0014-work-item-and-comparative-settlement.md](decisions/0014-work-item-and-comparative-settlement.md)
 - [decisions/0015-harness-owned-step-model.md](decisions/0015-harness-owned-step-model.md)
-- [decisions/0016-governed-harness-evolution-plane.md](decisions/0016-governed-harness-evolution-plane.md)
 - [decisions/0017-canonical-loop-contract.md](decisions/0017-canonical-loop-contract.md)
 - [decisions/0018-socket-actor-provenance.md](decisions/0018-socket-actor-provenance.md)
 - [decisions/0019-builder-staged-worktree-world-scope.md](decisions/0019-builder-staged-worktree-world-scope.md)
