@@ -35,6 +35,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use types::normalize_workspace;
 pub use types::{
     CheckKind, Claim, ClaimSource, GateFailure, HandoffError, NextStep, SubjectKey, WorkflowResult,
     WorkflowState, COMMIT_SUBJECT_TRAILER, FILE_SUBJECT_PREFIX, HANDOFF_GATE_FILE,
@@ -65,6 +66,20 @@ pub fn dispatch(
     impulse_dir: &std::path::Path,
     now: DateTime<Utc>,
 ) -> Result<WorkflowResult, HandoffError> {
+    dispatch_at(action, payload, impulse_dir, now, None)
+}
+
+/// Same as [`dispatch`], with a workspace root that was already normalized.
+///
+/// The tool sandbox checks this exact `PathBuf` and then passes it here so
+/// `submit` does not trim or canonicalize the raw JSON string a second time.
+pub(crate) fn dispatch_at(
+    action: &str,
+    payload: &Value,
+    impulse_dir: &std::path::Path,
+    now: DateTime<Utc>,
+    workspace: Option<&std::path::Path>,
+) -> Result<WorkflowResult, HandoffError> {
     if !payload.is_object() {
         return Err(HandoffError::Invalid(
             "payload must be a JSON object".into(),
@@ -72,7 +87,7 @@ pub fn dispatch(
     }
     match action {
         "record_fetch" => record_fetch(payload, impulse_dir, now),
-        "submit" => submit(payload, impulse_dir, now),
+        "submit" => submit(payload, impulse_dir, now, workspace),
         "status" => load_handoff(payload, impulse_dir, HandoffView::Status),
         "read" => load_handoff(payload, impulse_dir, HandoffView::Read),
         "read_shared" => read_shared(payload, impulse_dir, now),
@@ -151,16 +166,17 @@ fn submit(
     payload: &Value,
     impulse_dir: &std::path::Path,
     now: DateTime<Utc>,
+    workspace: Option<&std::path::Path>,
 ) -> Result<WorkflowResult, HandoffError> {
     let id = validate_id("handoff id", require_str(payload, "id")?)?;
     let from_agent = validate_id("from_agent", require_str(payload, "from_agent")?)?;
     let to_agent = validate_id("to_agent", require_str(payload, "to_agent")?)?;
-    let workspace = require_str(payload, "workspace")?.trim().to_string();
-    if workspace.is_empty() {
-        return Err(HandoffError::Invalid("workspace must not be empty".into()));
-    }
+    let workspace_path = match workspace {
+        Some(path) => path.to_path_buf(),
+        None => normalize_workspace(require_str(payload, "workspace")?)?,
+    };
+    let workspace = workspace_path.to_string_lossy().into_owned();
     let (claims, mut failures) = parse_claims(payload.get("claims"), &id)?;
-    let workspace_path = std::path::PathBuf::from(&workspace);
 
     with_store(impulse_dir, |store| {
         if let Some(existing) = store.handoff(&id) {

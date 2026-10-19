@@ -5,7 +5,7 @@
 //! so an unsourced claim cannot be stored or accepted.
 
 use std::fmt;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::de::{self, Deserializer};
@@ -356,6 +356,46 @@ fn validate_statement(raw: &str) -> Result<String, HandoffError> {
     Ok(value.to_string())
 }
 
+/// One workspace root for both the tool sandbox and claim resolution.
+///
+/// Trims surrounding whitespace, rejects an empty value, a NUL byte, and any
+/// `..` segment, then canonicalizes. Callers must use this `PathBuf` for the
+/// read-root check and for every later file read and `git -C`. A second trim
+/// of the original string is what let `" /etc"` pass the sandbox and then
+/// escape.
+pub(crate) fn normalize_workspace(raw: &str) -> Result<PathBuf, HandoffError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(HandoffError::Invalid("workspace must not be empty".into()));
+    }
+    if trimmed.contains('\0') {
+        return Err(HandoffError::Invalid(
+            "workspace must not contain a NUL byte".into(),
+        ));
+    }
+    let path = Path::new(trimmed);
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(HandoffError::Invalid(
+            "workspace must not contain `..`".into(),
+        ));
+    }
+    let canonical = path.canonicalize().map_err(|_| {
+        HandoffError::Invalid(format!(
+            "workspace `{trimmed}` does not exist or could not be resolved"
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(HandoffError::Invalid(format!(
+            "workspace `{}` must be a directory",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
 pub(crate) fn validate_relative_path(field: &str, raw: &str) -> Result<String, HandoffError> {
     let path = raw.trim();
     if path.is_empty() {
@@ -622,6 +662,28 @@ mod tests {
         let error = normalize_url("https://user:secret@billing.example.com/docs").unwrap_err();
         assert!(format!("{error}").contains("userinfo"));
         assert!(!format!("{error}").contains("secret"));
+    }
+
+    #[test]
+    fn test_normalize_workspace_rejects_empty_nul_parent_and_missing() {
+        let empty = normalize_workspace("   ").unwrap_err();
+        assert!(format!("{empty}").contains("must not be empty"));
+        let nul = normalize_workspace("/tmp/ws\0").unwrap_err();
+        assert!(format!("{nul}").contains("NUL"));
+        let parent = normalize_workspace("/tmp/project/../etc").unwrap_err();
+        assert!(format!("{parent}").contains(".."));
+        let temp = tempfile::tempdir().unwrap();
+        let missing_path = temp.path().join("missing-workspace");
+        let missing = normalize_workspace(&missing_path.to_string_lossy()).unwrap_err();
+        assert!(format!("{missing}").contains("does not exist"));
+    }
+
+    #[test]
+    fn test_normalize_workspace_trims_and_canonicalizes_an_existing_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().canonicalize().unwrap();
+        let padded = format!("  {}  ", temp.path().display());
+        assert_eq!(normalize_workspace(&padded).unwrap(), canonical);
     }
 
     #[test]

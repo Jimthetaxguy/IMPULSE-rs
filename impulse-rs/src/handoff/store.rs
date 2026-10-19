@@ -3,11 +3,18 @@
 //!
 //! Writes go through a temp file and rename. A lock file serializes
 //! read-modify-write so two agents cannot both observe the same generation
-//! and both commit.
+//! and both commit. The lock records the owner's pid and a token. It is
+//! reclaimed only when that pid is no longer alive, never because the file
+//! is old. `git` calls that run while the lock is held are killed after a
+//! fixed timeout so a slow subprocess cannot sit on the lock forever.
+//!
+//! Schema 2 keys each recorded fetch by sender and URL. A schema 1 ledger,
+//! which kept one row per URL, is rewritten to that shape on load.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
-use std::path::Path;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -20,8 +27,12 @@ use crate::storage::Storage;
 use super::types::{GateFailure, NextStep, WorkflowResult, HANDOFF_GATE_FILE, MAX_ARTIFACT_BYTES};
 use super::CheckKind;
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const LOCK_WAIT_ATTEMPTS: usize = 50;
+/// How long a contending caller waits before asking the agent to retry.
+/// This is not a staleness threshold: a live owner's lock is never taken,
+/// including when the file is older than the previous 10s age check.
+const LOCK_RETRY_PAUSE: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct FetchRecord {
@@ -70,8 +81,10 @@ pub(crate) struct ReadMark {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct GateStore {
     schema_version: u32,
+    /// Sender, then normalized URL. One record per sender, so a second
+    /// agent recording the same URL does not erase the first agent's fetch.
     #[serde(default)]
-    fetches: BTreeMap<String, FetchRecord>,
+    fetches: BTreeMap<String, BTreeMap<String, FetchRecord>>,
     #[serde(default)]
     handoffs: BTreeMap<String, StoredHandoff>,
     #[serde(default)]
@@ -114,20 +127,40 @@ impl GateStore {
             action: "read",
             source,
         })?;
-        let mut store: Self = serde_json::from_str(&text).map_err(|error| {
+        let mut value: Value = serde_json::from_str(&text).map_err(|error| {
+            super::HandoffError::Corrupt(format!(
+                "{} is not a handoff ledger ({error})",
+                path.display()
+            ))
+        })?;
+        match value.get("schema_version").and_then(Value::as_u64) {
+            Some(2) => {}
+            Some(1) => migrate_v1_fetches(&mut value).map_err(|error| {
+                super::HandoffError::Corrupt(format!(
+                    "{} is a schema 1 handoff ledger and could not be read as schema 2 ({error}). Delete it, or rewrite fetches so each record is kept for its sender and URL, then set schema_version to 2.",
+                    path.display()
+                ))
+            })?,
+            Some(other) => {
+                return Err(super::HandoffError::Corrupt(format!(
+                    "handoff ledger schema is {other}; this Impulse reads schema 2. Delete {} or rewrite it as schema 2 with one fetch record per sender and URL.",
+                    path.display()
+                )));
+            }
+            None => {
+                return Err(super::HandoffError::Corrupt(format!(
+                    "{} has no schema_version. This Impulse reads schema 2. Delete the file, or set schema_version to 2 after keying fetches by sender and URL.",
+                    path.display()
+                )));
+            }
+        }
+        let store: Self = serde_json::from_value(value).map_err(|error| {
             super::HandoffError::Corrupt(format!(
                 "{} is not a handoff ledger ({error})",
                 path.display()
             ))
         })?;
         store.validate()?;
-        // Schema 1 originally keyed by URL alone. Re-key existing rows without
-        // discarding evidence when upgrading an existing project ledger.
-        store.fetches = store
-            .fetches
-            .into_values()
-            .map(|record| (fetch_key(&record.sender, &record.url), record))
-            .collect();
         Ok(store)
     }
 
@@ -161,29 +194,91 @@ impl GateStore {
     }
 }
 
-// Keep one stable inode: unlinking a lock file can split callers across
-// different locks. The OS releases this advisory lock when the file closes,
-// including after a process crash; elapsed wall time never revokes ownership.
+struct LockOwner {
+    pid: u32,
+    token: String,
+}
+
+impl LockOwner {
+    fn encode(&self) -> String {
+        format!("pid={}\ntoken={}\n", self.pid, self.token)
+    }
+}
+
+fn parse_lock(text: &str) -> Option<LockOwner> {
+    let mut pid = None;
+    let mut token = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("pid=") {
+            pid = value.parse::<u32>().ok();
+        } else if let Some(value) = line.strip_prefix("token=") {
+            if !value.is_empty() {
+                token = Some(value.to_string());
+            }
+        }
+    }
+    Some(LockOwner {
+        pid: pid?,
+        token: token?,
+    })
+}
+
+/// `true` when `pid` names a process this caller can see.
+///
+/// `kill` with signal 0 does not deliver a signal. A live owner, including
+/// one whose lock file is older than the old 10s age threshold, stays the
+/// owner. `EPERM` still means the process exists.
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 performs an existence check and does not queue a
+    // signal. `pid` is a positive process id, not a process-group id.
+    let rc = unsafe { libc::kill(pid, 0) };
+    if rc == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 struct LedgerLock {
-    _file: File,
+    path: PathBuf,
+    token: String,
 }
 
 impl LedgerLock {
     fn acquire(dir: &Path) -> Result<Self, super::HandoffError> {
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join("HANDOFF_GATE.lock"))
-            .map_err(|source| super::HandoffError::Store {
-                action: "open lock for",
-                source,
-            })?;
+        let path = dir.join("HANDOFF_GATE.lock");
         for _ in 0..LOCK_WAIT_ATTEMPTS {
-            match file.try_lock() {
-                Ok(()) => return Ok(Self { _file: file }),
-                Err(std::fs::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(20)),
-                Err(std::fs::TryLockError::Error(source)) => {
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    let owner = LockOwner {
+                        pid: std::process::id(),
+                        token: uuid::Uuid::new_v4().simple().to_string(),
+                    };
+                    let body = owner.encode();
+                    if let Err(source) = file.write_all(body.as_bytes()) {
+                        let _ = fs::remove_file(&path);
+                        return Err(super::HandoffError::Store {
+                            action: "lock",
+                            source,
+                        });
+                    }
+                    return Ok(Self {
+                        path,
+                        token: owner.token,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if reclaim_dead_owner(&path) {
+                        continue;
+                    }
+                    thread::sleep(LOCK_RETRY_PAUSE);
+                }
+                Err(source) => {
                     return Err(super::HandoffError::Store {
                         action: "lock",
                         source,
@@ -197,8 +292,81 @@ impl LedgerLock {
     }
 }
 
-fn fetch_key(sender: &str, url: &str) -> String {
-    format!("{sender}\0{url}")
+impl Drop for LedgerLock {
+    fn drop(&mut self) {
+        let Ok(text) = fs::read_to_string(&self.path) else {
+            return;
+        };
+        if parse_lock(&text).is_some_and(|owner| owner.token == self.token) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Remove `path` only when its recorded owner is not a live process and the
+/// bytes are still the ones that were checked. A live pid is left in place
+/// even when the file's age exceeds the old 10 second threshold.
+fn reclaim_dead_owner(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    if let Some(owner) = parse_lock(&text) {
+        if process_is_alive(owner.pid) {
+            return false;
+        }
+    }
+    remove_if_unchanged(path, &text)
+}
+
+fn remove_if_unchanged(path: &Path, expected: &str) -> bool {
+    match fs::read_to_string(path) {
+        Ok(current) if current == expected => fs::remove_file(path).is_ok(),
+        _ => false,
+    }
+}
+
+/// Schema 1 stored fetches as `{ url: record }`. Schema 2 stores
+/// `{ sender: { url: record } }` so two senders can record one URL.
+fn migrate_v1_fetches(value: &mut Value) -> Result<(), String> {
+    let fetches = value
+        .get("fetches")
+        .cloned()
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let Some(map) = fetches.as_object() else {
+        return Err("schema 1 fetches must be an object".into());
+    };
+    let mut nested = serde_json::Map::new();
+    for (key, record) in map {
+        let Some(sender) = record
+            .get("sender")
+            .and_then(Value::as_str)
+            .filter(|sender| !sender.is_empty())
+        else {
+            return Err(format!("schema 1 fetch `{key}` has no sender"));
+        };
+        // Prefer the record's own URL. A schema 1 file may key the object by
+        // the URL, or by a sender/URL composite; both still carry `url`.
+        let url = record
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .unwrap_or(key.as_str());
+        let by_sender = nested
+            .entry(sender.to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let Some(by_url) = by_sender.as_object_mut() else {
+            return Err(format!(
+                "schema 1 fetch for `{sender}` could not be grouped by URL"
+            ));
+        };
+        by_url.insert(url.to_string(), record.clone());
+    }
+    let Some(object) = value.as_object_mut() else {
+        return Err("schema 1 ledger must be a JSON object".into());
+    };
+    object.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    object.insert("fetches".into(), Value::Object(nested));
+    Ok(())
 }
 
 pub(crate) fn handoff_snapshot(handoff: &StoredHandoff) -> Value {
@@ -216,18 +384,30 @@ pub(crate) fn handoff_snapshot(handoff: &StoredHandoff) -> Value {
 
 impl GateStore {
     pub(crate) fn fetch(&self, sender: &str, url: &str) -> Option<&FetchRecord> {
-        self.fetches.get(&fetch_key(sender, url))
+        self.fetches.get(sender)?.get(url)
     }
 
     pub(crate) fn insert_fetch(&mut self, record: FetchRecord) -> Result<(), super::HandoffError> {
-        let key = fetch_key(&record.sender, &record.url);
-        if self.fetches.len() >= 256 && !self.fetches.contains_key(&key) {
+        let total = self
+            .fetches
+            .values()
+            .map(|by_url| by_url.len())
+            .sum::<usize>();
+        let exists = self
+            .fetches
+            .get(&record.sender)
+            .and_then(|by_url| by_url.get(&record.url))
+            .is_some();
+        if total >= 256 && !exists {
             return Err(super::HandoffError::Invalid(
-                "the fetch ledger already holds 256 sender/URL records. Submit or drop a recorded fetch before adding another."
+                "the fetch ledger already holds 256 recorded fetches. Submit or drop a recorded fetch before adding another."
                     .into(),
             ));
         }
-        self.fetches.insert(key, record);
+        self.fetches
+            .entry(record.sender.clone())
+            .or_default()
+            .insert(record.url.clone(), record);
         Ok(())
     }
 
@@ -365,62 +545,69 @@ pub(crate) fn refuse_missing_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     #[test]
-    fn test_aged_live_lock_is_not_reclaimed_and_releases_on_drop() {
-        let temp = tempfile::tempdir().unwrap();
-        let holder = LedgerLock::acquire(temp.path()).unwrap();
-        let path = temp.path().join("HANDOFF_GATE.lock");
-        let aged = std::time::SystemTime::now() - Duration::from_secs(60);
-        holder
-            ._file
-            .set_times(std::fs::FileTimes::new().set_modified(aged))
+    fn test_live_owner_lock_older_than_ten_seconds_is_not_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("HANDOFF_GATE.lock");
+        let token = "live-owner-token";
+        fs::write(
+            &path,
+            format!("pid={}\ntoken={token}\n", std::process::id()),
+        )
+        .unwrap();
+        let old = SystemTime::now() - Duration::from_secs(11);
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(old)).unwrap();
+        let age = fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
             .unwrap();
-        assert!(LedgerLock::acquire(temp.path()).is_err());
-        assert!(path.is_file());
-        drop(holder);
-        let _next = LedgerLock::acquire(temp.path()).unwrap();
-        assert!(LedgerLock::acquire(temp.path()).is_err());
+        assert!(
+            age > Duration::from_secs(10),
+            "the fixture must be older than the previous 10s stale threshold, age {age:?}"
+        );
+
+        let acquired = LedgerLock::acquire(dir.path());
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains(token),
+            "a live owner's lock was replaced: {body}"
+        );
+        assert!(
+            body.contains(&format!("pid={}", std::process::id())),
+            "the live pid was not kept: {body}"
+        );
+        let Err(error) = acquired else {
+            panic!("a live owner keeps the lock past 10s");
+        };
+        assert!(
+            format!("{error}").contains("locked"),
+            "the contender should be told to retry, got {error}"
+        );
     }
 
     #[test]
-    fn test_legacy_url_keyed_fetch_is_rekeyed_without_losing_evidence() {
-        let temp = tempfile::tempdir().unwrap();
-        let url = "https://billing.example.com/refunds";
-        let record = FetchRecord {
-            url: url.into(),
-            host: "billing.example.com".into(),
-            status: 200,
-            body_digest: "a".repeat(64),
-            fetched_at: Utc::now(),
-            sender: "agent-a".into(),
-        };
-        let mut legacy = GateStore::default();
-        legacy.fetches.insert(url.into(), record.clone());
-        legacy.save(temp.path()).unwrap();
-        let mut loaded = GateStore::load(temp.path()).unwrap();
-        assert_eq!(loaded.fetch("agent-a", url), Some(&record));
-        let mut other = record.clone();
-        other.sender = "agent-b".into();
-        loaded.insert_fetch(other.clone()).unwrap();
-        loaded.save(temp.path()).unwrap();
-        let loaded = GateStore::load(temp.path()).unwrap();
-        assert_eq!(loaded.fetch("agent-a", url), Some(&record));
-        assert_eq!(loaded.fetch("agent-b", url), Some(&other));
-        assert!(loaded.fetch("agent-c", url).is_none());
-    }
-    #[test]
-    fn test_lock_releases_after_process_exit_without_running_destructors() {
-        const CHILD_DIR: &str = "IMPULSE_HANDOFF_LOCK_TEST_DIR";
-        if let Some(dir) = std::env::var_os(CHILD_DIR) {
-            let _held = LedgerLock::acquire(Path::new(&dir)).unwrap();
-            std::process::exit(0);
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "handoff::store::tests::test_lock_releases_after_process_exit_without_running_destructors"])
-            .env(CHILD_DIR, temp.path()).status().unwrap();
-        assert!(status.success());
-        let _next = LedgerLock::acquire(temp.path()).unwrap();
+    fn test_dead_owner_lock_is_reclaimed_and_records_the_new_pid_and_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("HANDOFF_GATE.lock");
+        fs::write(&path, "pid=4294967295\ntoken=dead-owner\n").unwrap();
+        assert!(
+            !process_is_alive(u32::MAX),
+            "the fixture pid must not be a live process"
+        );
+
+        let lock = LedgerLock::acquire(dir.path()).expect("a dead owner is reclaimed");
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(body.contains(&format!("pid={}", std::process::id())));
+        assert!(body.contains("token="));
+        assert!(!body.contains("dead-owner"));
+        drop(lock);
+        assert!(
+            !path.exists(),
+            "dropping the holder removes only the lock whose token it wrote"
+        );
     }
 }

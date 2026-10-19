@@ -37,14 +37,13 @@ tags: [worktree, lane, handoff]
 - `orchestration::write_handoff` is unchanged except a doc pointer. It still writes a task-routing note.
 
 ## Tests
-Local, 2026-10-17, stable toolchain (rustc 1.99 via `impulse-rs/rust-toolchain.toml`):
+Local, 2026-10-19, stable toolchain (rustc 1.99 via `impulse-rs/rust-toolchain.toml`):
 
-- `cargo test --lib handoff -- --test-threads=8` — 41 passed, 0 failed, 0 ignored. The filter also matches older handoff-named tests in delegation, injection, and orchestration; those passed too.
-- `cargo test --lib ion_repl::registry::tests::test_with_defaults_registers_ion_verify` — 1 passed.
+- `cargo test --lib handoff -- --test-threads=8` — 58 passed, 0 failed, 0 ignored. The filter also matches older handoff-named tests in delegation, injection, orchestration, and integration; those passed too. The gate module and `handoff` tool account for 44 of them.
 - `cargo clippy -p impulse-rs --lib --tests -- -D warnings` — exit 0.
-- Touched Rust files checked with `rustfmt +1.83.0 --edition 2021 --check` (the stable 1.99 rustfmt rewrites unrelated files; those were left alone).
-- `cargo test --workspace -- --test-threads=8` ran until `impulse-rs` lib. Packages that finished: impulse-desktop lib 176 passed; desktop_contract 90; host_surface 9; runtime 22 passed / 1 ignored; views_ssr 7; impulse-ion 23 passed / 1 ignored; impulse-ops lib 167; governed_producer_contract 8; governed_task_contract 5; memory_candidate_contract 5. `impulse-rs` lib: 2410 passed, 5 failed, 4 ignored. Cargo then stopped (fail-fast), so later packages did not run.
-- Those 5 failures are pre-existing on this machine and are not in the handoff gate. They are governed-verification tests whose first command is `cargo fmt`. The verifier scrubs the child environment down to PATH/HOME/TERM/locale/temp. This VM keeps the toolchain in `RUSTUP_HOME=/usr/local/rustup`, which is not on that allowlist, so the child rustup exits with "no default is configured" before any crate command. A scrubbed `cargo fmt` from `/tmp` reproduces that error. The handoff tests are among the 2410 that passed.
+- `cargo clippy -- -D warnings` (the Lint job command, from `impulse-rs`) — exit 0.
+- `cargo fmt --check` (the Lint job command, from `impulse-rs`) — exit 0. Touched handoff files are clean. The earlier Lint failure was `cargo fmt --check` rewriting `impulse-step-model/examples/selector_baselines.rs` under rustfmt 1.10.0-stable; that file was already formatted on this branch and was not edited again.
+- The full workspace suite was not re-run for this repair. Governed-verification tests can still fail in a scrubbed environment because `RUSTUP_HOME` is not on the verifier's allowlist. Those tests were not changed.
 
 What the new tests prove:
 
@@ -60,16 +59,10 @@ What the new tests prove:
 - The gate does not fetch URLs. The sender records status and body digest first.
 - No daemon IPC endpoint, no change to `GOVERNED_TASKS.json` / `MEMORY.jsonl` / `GENOME.md`, no new crate dependency, no secrets, no `.env`.
 
-## 2026-10-19 review repair lane
-- Owner: Codex; role: repair the current PR findings in an isolated checkout.
-- Branch: `agent/codex-handoff-review-fixes`, based on PR #96 at `dbf4df0`.
-- Owned paths: handoff module, handoff tool, `impulse-step-model/examples/selector_baselines.rs` (format and Clippy single-pattern fix), this card; shared registration and manifests remain untouched.
-- Acceptance: validate the exact normalized workspace used by dispatch; require read and write permission for project-local ledger state; retain each sender's URL evidence; serialize slow/live operations without age-based lock theft.
-- Verification: focused regressions, workspace build/test/Clippy/format; record actual outcomes before commit.
-
-- Repair decisions: the tool normalizes and validates one workspace path, preserving blank-input refusal; project-local state must be readable and writable before I/O. Fetch lookup uses sender plus normalized URL, re-keying existing schema-1 rows on load. The ledger lock uses the standard library OS lock on a stable file and releases on process exit; age does not revoke live ownership.
-- Added regression coverage: denied ledger reads, external configured home, padded absolute workspace escapes, normalized allowed workspace, blank workspace, two senders sharing a URL, legacy fetch-row migration, aged live lock exclusion, and process-exit lock release.
-- Existing CI lint drift in `selector_baselines.rs` was formatted; all-target Clippy additionally required replacing a single-pattern match with `if let`. Its four existing example tests passed.
-
-- Final verification on the repair checkout: `cargo build --offline --workspace`, `cargo test --offline --workspace` (3,169 passed / 0 failed / 9 ignored including doc tests), `cargo clippy --offline --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed. `cargo test --offline --lib handoff -- --test-threads=8`: 50 passed / 0 failed / 0 ignored. `cargo test --offline -p impulse-step-model --example selector_baselines`: 4 passed / 0 failed.
-- Ignored tests remain ignored; no live Keychain or provider-wire checks were enabled. Ready for a fast-forward push to existing PR #96 after verifying its remote head is unchanged. No merge or deployment.
+## 2026-10-19 review repair
+- Branch: `cursor/handoff-gate-4741` (PR #96). No new PR.
+- The workspace string is trimmed once, then rejected when it is empty, contains `..` or NUL, or does not canonicalize to a directory. That `PathBuf` is the read-root check and the claim root for `git -C` and file reads. A file claim is refused when its canonical path leaves the workspace, and the resolved file is opened with `O_NOFOLLOW`.
+- The ledger directory is `project_impulse_dir` (the repo `.impulse/`, including when Ion's `IMPULSE_HOME` points elsewhere). It must pass both the read-root and write-root checks.
+- The lock file stores `pid` and a token. A contender reclaims it only when that pid is not alive. Drop deletes the file only when the token still matches. `git` subprocesses are killed after 30 seconds.
+- Schema 2 stores fetches as sender, then URL. A schema 1 ledger is migrated on load, including a sender/URL composite key. Any other schema is a corrupt-ledger error that names schema 2 and how to fix the file.
+- Regression tests cover a padded absolute workspace, a `..` workspace, a symlink that leaves the workspace, a ledger outside the read roots, an external `IMPULSE_HOME`, a live lock older than 10 seconds, two senders recording one URL, and schema 1 migration.

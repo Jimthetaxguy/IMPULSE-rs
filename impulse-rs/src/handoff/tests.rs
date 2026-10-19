@@ -675,6 +675,173 @@ fn test_claim_source_round_trip_for_each_kind() {
     }
 }
 
+#[test]
+fn test_two_senders_record_the_same_url_and_both_submissions_are_accepted() {
+    let (temp, impulse) = ledger_dir();
+    let url = "https://billing.example.com/docs/refunds";
+    record_fetch(&impulse, "agent-a", url, at(0));
+    record_fetch(&impulse, "agent-b", url, at(1));
+
+    for (sender, id) in [("agent-a", "report-a"), ("agent-b", "report-b")] {
+        let result = dispatch(
+            "submit",
+            &json!({
+                "id": id,
+                "from_agent": sender,
+                "to_agent": "reviewer",
+                "workspace": temp.path(),
+                "claims": [{
+                    "id": "refund-cap",
+                    "statement": "Refunds over $50 need a second approver.",
+                    "subject": "billing.example.com",
+                    "source": {"kind": "url", "url": url}
+                }]
+            }),
+            &impulse,
+            at(2),
+        )
+        .unwrap_or_else(|error| panic!("{sender} should still have a recorded fetch: {error}"));
+        assert!(
+            result.accepted,
+            "{sender}'s fetch of the shared URL must still authorize the submit: {result:?}"
+        );
+        assert!(result.failures.is_empty());
+    }
+
+    let stored = fs::read_to_string(impulse.join(HANDOFF_GATE_FILE)).unwrap();
+    assert!(stored.contains("\"agent-a\""));
+    assert!(stored.contains("\"agent-b\""));
+    assert!(
+        stored.contains("\"schema_version\": 2"),
+        "fetches are keyed by sender and URL in schema 2, got {stored}"
+    );
+}
+
+#[test]
+fn test_version_1_ledger_migrates_a_fetch_and_still_accepts_that_sender() {
+    let (temp, impulse) = ledger_dir();
+    fs::create_dir_all(&impulse).unwrap();
+    let v1 = json!({
+        "schema_version": 1,
+        "fetches": {
+            "https://billing.example.com/docs/refunds": {
+                "url": "https://billing.example.com/docs/refunds",
+                "host": "billing.example.com",
+                "status": 200,
+                "body_digest": format!("sha256:{DIGEST}"),
+                "fetched_at": "2026-06-01T12:00:00Z",
+                "sender": "agent-a"
+            }
+        },
+        "handoffs": {},
+        "artifacts": {}
+    });
+    fs::write(
+        impulse.join(HANDOFF_GATE_FILE),
+        serde_json::to_vec_pretty(&v1).unwrap(),
+    )
+    .unwrap();
+
+    let result = dispatch(
+        "submit",
+        &json!({
+            "id": "refund-report",
+            "from_agent": "agent-a",
+            "to_agent": "agent-b",
+            "workspace": temp.path(),
+            "claims": [{
+                "id": "refund-cap",
+                "statement": "Refunds over $50 need a second approver.",
+                "subject": "billing.example.com",
+                "source": {
+                    "kind": "url",
+                    "url": "https://billing.example.com/docs/refunds"
+                }
+            }]
+        }),
+        &impulse,
+        at(0),
+    )
+    .expect("schema 1 fetch migrates and still authorizes its sender");
+    assert!(result.accepted, "{result:?}");
+
+    let stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(impulse.join(HANDOFF_GATE_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(stored["schema_version"], 2);
+    assert_eq!(
+        stored["fetches"]["agent-a"]["https://billing.example.com/docs/refunds"]["sender"],
+        "agent-a"
+    );
+}
+
+#[test]
+fn test_schema_1_composite_fetch_key_migrates_by_the_record_url() {
+    let (temp, impulse) = ledger_dir();
+    fs::create_dir_all(&impulse).unwrap();
+    let url = "https://billing.example.com/docs/refunds";
+    let mut fetches = serde_json::Map::new();
+    fetches.insert(
+        format!("agent-a\u{0}{url}"),
+        json!({
+            "url": url,
+            "host": "billing.example.com",
+            "status": 200,
+            "body_digest": format!("sha256:{DIGEST}"),
+            "fetched_at": "2026-06-01T12:00:00Z",
+            "sender": "agent-a"
+        }),
+    );
+    let v1 = json!({
+        "schema_version": 1,
+        "fetches": fetches,
+        "handoffs": {},
+        "artifacts": {}
+    });
+    fs::write(
+        impulse.join(HANDOFF_GATE_FILE),
+        serde_json::to_vec_pretty(&v1).unwrap(),
+    )
+    .unwrap();
+    let result = dispatch(
+        "submit",
+        &json!({
+            "id": "refund-report",
+            "from_agent": "agent-a",
+            "to_agent": "agent-b",
+            "workspace": temp.path(),
+            "claims": [{
+                "id": "refund-cap",
+                "statement": "Refunds over $50 need a second approver.",
+                "subject": "billing.example.com",
+                "source": {"kind": "url", "url": url}
+            }]
+        }),
+        &impulse,
+        at(0),
+    )
+    .expect("a composite schema 1 key still authorizes the recorded sender");
+    assert!(result.accepted, "{result:?}");
+}
+
+#[test]
+fn test_unknown_ledger_schema_names_the_schema_2_fix() {
+    let (_temp, impulse) = ledger_dir();
+    fs::create_dir_all(&impulse).unwrap();
+    fs::write(
+        impulse.join(HANDOFF_GATE_FILE),
+        r#"{"schema_version":9,"fetches":{},"handoffs":{},"artifacts":{}}"#,
+    )
+    .unwrap();
+    let error = dispatch("status", &json!({"id": "refund-report"}), &impulse, at(0)).unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("schema 2"), "got {text}");
+    assert!(
+        text.contains("sender and URL") || text.contains("Delete"),
+        "the error must say how to fix a ledger this Impulse cannot read, got {text}"
+    );
+}
+
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
