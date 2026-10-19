@@ -695,3 +695,27 @@ fn git(repo: &Path, args: &[&str]) -> String {
         .trim()
         .to_string()
 }
+
+#[test]
+fn test_two_senders_can_submit_the_same_url_after_reopening_the_ledger() {
+    let (temp, impulse) = ledger_dir();
+    let url = "https://billing.example.com/refunds";
+    record_fetch(&impulse, "agent-a", url, at(0));
+    record_fetch(&impulse, "agent-b", url, at(1));
+    for sender in ["agent-a", "agent-b"] {
+        let result = dispatch(
+            "submit",
+            &json!({
+                "id": format!("report-{sender}"), "from_agent": sender, "to_agent": "reader",
+                "workspace": temp.path(), "claims": [{
+                    "id": "refunds", "statement": "Refunds need approval.",
+                    "subject": "billing.example.com", "source": {"kind": "url", "url": url}
+                }]
+            }),
+            &impulse,
+            at(2),
+        )
+        .unwrap();
+        assert!(result.accepted, "{sender}: {:?}", result.failures);
+    }
+}

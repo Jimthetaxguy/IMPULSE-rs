@@ -170,7 +170,7 @@ fn submit(
         }
         let sender = from_agent.clone();
         let resolved = evaluate_claims(&claims, &workspace_path, &sender, &|url| {
-            store.fetch(url).map(|record| RecordedFetch {
+            store.fetch(&sender, url).map(|record| RecordedFetch {
                 sender: record.sender.clone(),
                 host: record.host.clone(),
             })

@@ -6,11 +6,10 @@
 //! and both commit.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::fs::{self, File, OpenOptions};
+use std::path::Path;
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -23,7 +22,6 @@ use super::CheckKind;
 
 const SCHEMA_VERSION: u32 = 1;
 const LOCK_WAIT_ATTEMPTS: usize = 50;
-const STALE_LOCK: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct FetchRecord {
@@ -116,13 +114,20 @@ impl GateStore {
             action: "read",
             source,
         })?;
-        let store: Self = serde_json::from_str(&text).map_err(|error| {
+        let mut store: Self = serde_json::from_str(&text).map_err(|error| {
             super::HandoffError::Corrupt(format!(
                 "{} is not a handoff ledger ({error})",
                 path.display()
             ))
         })?;
         store.validate()?;
+        // Schema 1 originally keyed by URL alone. Re-key existing rows without
+        // discarding evidence when upgrading an existing project ledger.
+        store.fetches = store
+            .fetches
+            .into_values()
+            .map(|record| (fetch_key(&record.sender, &record.url), record))
+            .collect();
         Ok(store)
     }
 
@@ -156,27 +161,29 @@ impl GateStore {
     }
 }
 
+// Keep one stable inode: unlinking a lock file can split callers across
+// different locks. The OS releases this advisory lock when the file closes,
+// including after a process crash; elapsed wall time never revokes ownership.
 struct LedgerLock {
-    path: PathBuf,
+    _file: File,
 }
 
 impl LedgerLock {
     fn acquire(dir: &Path) -> Result<Self, super::HandoffError> {
-        let path = dir.join("HANDOFF_GATE.lock");
+        let file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("HANDOFF_GATE.lock"))
+            .map_err(|source| super::HandoffError::Store {
+                action: "open lock for",
+                source,
+            })?;
         for _ in 0..LOCK_WAIT_ATTEMPTS {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    let _ = writeln!(file, "{}", std::process::id());
-                    return Ok(Self { path });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(&path) {
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    thread::sleep(Duration::from_millis(20));
-                }
-                Err(source) => {
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(20)),
+                Err(std::fs::TryLockError::Error(source)) => {
                     return Err(super::HandoffError::Store {
                         action: "lock",
                         source,
@@ -190,24 +197,8 @@ impl LedgerLock {
     }
 }
 
-impl Drop for LedgerLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn lock_is_stale(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    let Ok(modified) = metadata.modified() else {
-        return false;
-    };
-    modified
-        .elapsed()
-        .unwrap_or(Duration::from_secs(0))
-        .gt(&STALE_LOCK)
-        || modified > SystemTime::now()
+fn fetch_key(sender: &str, url: &str) -> String {
+    format!("{sender}\0{url}")
 }
 
 pub(crate) fn handoff_snapshot(handoff: &StoredHandoff) -> Value {
@@ -224,18 +215,19 @@ pub(crate) fn handoff_snapshot(handoff: &StoredHandoff) -> Value {
 }
 
 impl GateStore {
-    pub(crate) fn fetch(&self, url: &str) -> Option<&FetchRecord> {
-        self.fetches.get(url)
+    pub(crate) fn fetch(&self, sender: &str, url: &str) -> Option<&FetchRecord> {
+        self.fetches.get(&fetch_key(sender, url))
     }
 
     pub(crate) fn insert_fetch(&mut self, record: FetchRecord) -> Result<(), super::HandoffError> {
-        if self.fetches.len() >= 256 && !self.fetches.contains_key(&record.url) {
+        let key = fetch_key(&record.sender, &record.url);
+        if self.fetches.len() >= 256 && !self.fetches.contains_key(&key) {
             return Err(super::HandoffError::Invalid(
-                "the fetch ledger already holds 256 URLs. Submit or drop a recorded fetch before adding another."
+                "the fetch ledger already holds 256 sender/URL records. Submit or drop a recorded fetch before adding another."
                     .into(),
             ));
         }
-        self.fetches.insert(record.url.clone(), record);
+        self.fetches.insert(key, record);
         Ok(())
     }
 
@@ -368,4 +360,67 @@ pub(crate) fn refuse_missing_artifact(
             ),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_aged_live_lock_is_not_reclaimed_and_releases_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let holder = LedgerLock::acquire(temp.path()).unwrap();
+        let path = temp.path().join("HANDOFF_GATE.lock");
+        let aged = std::time::SystemTime::now() - Duration::from_secs(60);
+        holder
+            ._file
+            .set_times(std::fs::FileTimes::new().set_modified(aged))
+            .unwrap();
+        assert!(LedgerLock::acquire(temp.path()).is_err());
+        assert!(path.is_file());
+        drop(holder);
+        let _next = LedgerLock::acquire(temp.path()).unwrap();
+        assert!(LedgerLock::acquire(temp.path()).is_err());
+    }
+
+    #[test]
+    fn test_legacy_url_keyed_fetch_is_rekeyed_without_losing_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let url = "https://billing.example.com/refunds";
+        let record = FetchRecord {
+            url: url.into(),
+            host: "billing.example.com".into(),
+            status: 200,
+            body_digest: "a".repeat(64),
+            fetched_at: Utc::now(),
+            sender: "agent-a".into(),
+        };
+        let mut legacy = GateStore::default();
+        legacy.fetches.insert(url.into(), record.clone());
+        legacy.save(temp.path()).unwrap();
+        let mut loaded = GateStore::load(temp.path()).unwrap();
+        assert_eq!(loaded.fetch("agent-a", url), Some(&record));
+        let mut other = record.clone();
+        other.sender = "agent-b".into();
+        loaded.insert_fetch(other.clone()).unwrap();
+        loaded.save(temp.path()).unwrap();
+        let loaded = GateStore::load(temp.path()).unwrap();
+        assert_eq!(loaded.fetch("agent-a", url), Some(&record));
+        assert_eq!(loaded.fetch("agent-b", url), Some(&other));
+        assert!(loaded.fetch("agent-c", url).is_none());
+    }
+    #[test]
+    fn test_lock_releases_after_process_exit_without_running_destructors() {
+        const CHILD_DIR: &str = "IMPULSE_HANDOFF_LOCK_TEST_DIR";
+        if let Some(dir) = std::env::var_os(CHILD_DIR) {
+            let _held = LedgerLock::acquire(Path::new(&dir)).unwrap();
+            std::process::exit(0);
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "handoff::store::tests::test_lock_releases_after_process_exit_without_running_destructors"])
+            .env(CHILD_DIR, temp.path()).status().unwrap();
+        assert!(status.success());
+        let _next = LedgerLock::acquire(temp.path()).unwrap();
+    }
 }

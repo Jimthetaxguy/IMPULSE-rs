@@ -1,7 +1,7 @@
 ---
 title: Handoff gate
 description: Work card for the findings handoff gate and stale shared-artifact writes
-updated: 2026-10-17
+updated: 2026-10-19
 type: doc
 category: planning
 phase: all
@@ -59,3 +59,17 @@ What the new tests prove:
 - The desktop MCP tool list was not extended. Agents reach the gate through the daemon tool registry and the Ion REPL, which already wrap `ToolRegistry`.
 - The gate does not fetch URLs. The sender records status and body digest first.
 - No daemon IPC endpoint, no change to `GOVERNED_TASKS.json` / `MEMORY.jsonl` / `GENOME.md`, no new crate dependency, no secrets, no `.env`.
+
+## 2026-10-19 review repair lane
+- Owner: Codex; role: repair the current PR findings in an isolated checkout.
+- Branch: `agent/codex-handoff-review-fixes`, based on PR #96 at `dbf4df0`.
+- Owned paths: handoff module, handoff tool, `impulse-step-model/examples/selector_baselines.rs` (format and Clippy single-pattern fix), this card; shared registration and manifests remain untouched.
+- Acceptance: validate the exact normalized workspace used by dispatch; require read and write permission for project-local ledger state; retain each sender's URL evidence; serialize slow/live operations without age-based lock theft.
+- Verification: focused regressions, workspace build/test/Clippy/format; record actual outcomes before commit.
+
+- Repair decisions: the tool normalizes and validates one workspace path, preserving blank-input refusal; project-local state must be readable and writable before I/O. Fetch lookup uses sender plus normalized URL, re-keying existing schema-1 rows on load. The ledger lock uses the standard library OS lock on a stable file and releases on process exit; age does not revoke live ownership.
+- Added regression coverage: denied ledger reads, external configured home, padded absolute workspace escapes, normalized allowed workspace, blank workspace, two senders sharing a URL, legacy fetch-row migration, aged live lock exclusion, and process-exit lock release.
+- Existing CI lint drift in `selector_baselines.rs` was formatted; all-target Clippy additionally required replacing a single-pattern match with `if let`. Its four existing example tests passed.
+
+- Final verification on the repair checkout: `cargo build --offline --workspace`, `cargo test --offline --workspace` (3,169 passed / 0 failed / 9 ignored including doc tests), `cargo clippy --offline --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check` passed. `cargo test --offline --lib handoff -- --test-threads=8`: 50 passed / 0 failed / 0 ignored. `cargo test --offline -p impulse-step-model --example selector_baselines`: 4 passed / 0 failed.
+- Ignored tests remain ignored; no live Keychain or provider-wire checks were enabled. Ready for a fast-forward push to existing PR #96 after verifying its remote head is unchanged. No merge or deployment.

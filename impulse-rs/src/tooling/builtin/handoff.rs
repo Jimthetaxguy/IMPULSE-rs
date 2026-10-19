@@ -67,26 +67,31 @@ impl DynamicTool for HandoffTool {
         }
     }
 
-    async fn execute(&self, params: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
+    async fn execute(&self, mut params: Value, ctx: &ToolContext) -> Result<ToolResult, ToolError> {
         if let Some(workspace) = params
             .get("payload")
             .and_then(|payload| payload.get("workspace"))
             .and_then(Value::as_str)
         {
+            let workspace = workspace.trim();
+            if workspace.is_empty() {
+                return tool_result(refusal("workspace must not be empty".into())?);
+            }
             let path = ctx.resolve_path(workspace);
             if !ctx.is_path_allowed(&path, false) {
                 return Err(ToolError::PathNotAllowed(path.display().to_string()));
             }
+            // Dispatch must use precisely the path that passed the read check.
+            params["payload"]["workspace"] = Value::String(path.to_string_lossy().into_owned());
         }
-        if !ctx.is_path_allowed(&ctx.impulse_dir, true) {
-            return Err(ToolError::PathNotAllowed(
-                ctx.impulse_dir.display().to_string(),
-            ));
+        let ledger_dir = &ctx.project_impulse_dir;
+        if !ctx.is_path_allowed(ledger_dir, false) || !ctx.is_path_allowed(ledger_dir, true) {
+            return Err(ToolError::PathNotAllowed(ledger_dir.display().to_string()));
         }
 
         let action = params.get("action").and_then(Value::as_str).unwrap_or("");
         let payload = params.get("payload").cloned().unwrap_or(Value::Null);
-        match handoff::dispatch(action, &payload, &ctx.impulse_dir, Utc::now()) {
+        match handoff::dispatch(action, &payload, ledger_dir, Utc::now()) {
             Ok(result) => tool_result(result),
             Err(HandoffError::Invalid(message)) => tool_result(refusal(message)?),
             Err(error) => Err(ToolError::ExecutionFailed(error.to_string())),
@@ -132,6 +137,7 @@ mod tests {
 
     fn context(impulse_dir: std::path::PathBuf) -> ToolContext {
         ToolContext {
+            project_impulse_dir: impulse_dir.clone(),
             impulse_dir,
             ..ToolContext::with_all_capabilities()
         }
@@ -202,5 +208,114 @@ mod tests {
         let caps = HandoffTool.required_capabilities();
         assert!(caps.contains(&Capability::FileSystemRead));
         assert!(caps.contains(&Capability::FileSystemWrite));
+    }
+    #[tokio::test]
+    async fn test_handoff_tool_rejects_ledger_outside_read_roots() {
+        let project = tempfile::tempdir().unwrap();
+        let readable = tempfile::tempdir().unwrap();
+        let ledger = project.path().join(".impulse");
+        let mut ctx = context(ledger.clone());
+        ctx.allowed_write_roots = vec![project.path().to_path_buf()];
+        ctx.allowed_read_roots = vec![readable.path().to_path_buf()];
+        let result = HandoffTool.execute(serde_json::json!({
+            "action": "read_shared", "payload": {"artifact_id": "notes", "reader": "agent-a"}
+        }), &ctx).await;
+        assert!(matches!(result, Err(ToolError::PathNotAllowed(_))));
+        assert!(!ledger.exists(), "denial must precede all ledger I/O");
+    }
+
+    #[tokio::test]
+    async fn test_handoff_tool_uses_project_state_with_external_home() {
+        let project = tempfile::tempdir().unwrap();
+        let external = tempfile::tempdir().unwrap();
+        let ledger = project.path().join(".impulse");
+        let mut ctx = context(external.path().join(".impulse"));
+        ctx.project_impulse_dir = ledger.clone();
+        ctx.allowed_write_roots = vec![project.path().to_path_buf()];
+        ctx.allowed_read_roots = ctx.allowed_write_roots.clone();
+        let result = HandoffTool.execute(serde_json::json!({
+            "action": "write_shared", "payload": {
+                "artifact_id": "notes", "writer": "agent-a", "based_on_generation": 0, "content": "first"
+            }
+        }), &ctx).await.unwrap();
+        assert_eq!(result.output["accepted"], true);
+        assert!(ledger.join(crate::handoff::HANDOFF_GATE_FILE).is_file());
+        assert!(!ctx.impulse_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn test_handoff_tool_rejects_padded_absolute_workspace_outside_read_roots() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut ctx = context(project.path().join(".impulse"));
+        ctx.allowed_read_roots = vec![project.path().to_path_buf()];
+        ctx.allowed_write_roots = ctx.allowed_read_roots.clone();
+        for padding in [" ", "\n", "\t"] {
+            let result = HandoffTool
+                .execute(
+                    serde_json::json!({
+                        "action": "submit", "payload": {
+                            "workspace": format!("{padding}{} ", outside.path().display())
+                        }
+                    }),
+                    &ctx,
+                )
+                .await;
+            assert!(matches!(result, Err(ToolError::PathNotAllowed(_))));
+        }
+        assert!(!ctx.project_impulse_dir.exists());
+    }
+    #[tokio::test]
+    async fn test_handoff_tool_dispatches_the_normalized_allowed_workspace() {
+        let project = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project.path().join("source.txt"),
+            "impulse-subject: refunds",
+        )
+        .unwrap();
+        let mut ctx = context(project.path().join(".impulse"));
+        ctx.allowed_read_roots = vec![project.path().to_path_buf()];
+        ctx.allowed_write_roots = ctx.allowed_read_roots.clone();
+        let result = HandoffTool
+            .execute(
+                serde_json::json!({
+                    "action": "submit", "payload": {
+                        "id": "report", "from_agent": "a", "to_agent": "b",
+                        "workspace": format!(" \n{}\t", project.path().display()),
+                        "claims": [{"id": "claim", "statement": "Refunds need approval.",
+                            "subject": "refunds", "source": {"kind": "file", "path": "source.txt"}}]
+                    }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output["accepted"], true);
+        assert_eq!(
+            result.output["snapshot"]["workspace"],
+            project.path().to_string_lossy().as_ref()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handoff_tool_refuses_blank_workspace_before_ledger_io() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = context(project.path().join(".impulse"));
+        let result = HandoffTool
+            .execute(
+                serde_json::json!({
+                    "action": "submit", "payload": {"workspace": " \n\t"}
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output["accepted"], false);
+        assert_eq!(result.output["state"], "pending");
+        assert!(result.output["failures"][0]["fix"]
+            .as_str()
+            .unwrap()
+            .contains("workspace"));
+        assert!(!ctx.project_impulse_dir.exists());
     }
 }
