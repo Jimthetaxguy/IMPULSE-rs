@@ -332,11 +332,14 @@ impl PhotonTool {
     pub fn from_env() -> Self {
         let resolver: PhotonEndpointResolver = Arc::new(|ctx: &ReplContext| {
             let config = load_endpoint_config(&ctx.sandbox_tool_context().impulse_dir)?;
-            resolve_photon_endpoint(
-                &config,
-                &|key| std::env::var(key).ok(),
-                &crate::llm_backends::anthropic::anthropic_api_origin(),
-            )
+            let origin =
+                crate::llm_backends::anthropic::anthropic_api_origin().map_err(|reason| {
+                    anyhow::anyhow!(
+                        "ANTHROPIC_BASE_URL can't be used as the anthropic base URL: {reason}; \
+                     fix or unset it"
+                    )
+                })?;
+            resolve_photon_endpoint(&config, &|key| std::env::var(key).ok(), &origin)
         });
         let factory: PhotonClientFactory = Arc::new(|endpoint: &ModelEndpoint| {
             let (connection, profile) = min_agent_bridge::to_min_agent(endpoint)
@@ -352,7 +355,7 @@ impl PhotonTool {
     fn reserve_slot(&self) -> Result<()> {
         let limit = self.session_limit;
         self.used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 (n < limit).then_some(n + 1)
             })
             .map(|_| ())
