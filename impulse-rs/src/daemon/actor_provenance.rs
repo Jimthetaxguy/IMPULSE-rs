@@ -700,6 +700,7 @@ mod tests {
             GovernedTaskMutation::MarkRuntimeExited {
                 actor: system_actor(),
                 reason: None,
+                exit_kind: Default::default(),
             },
         ];
         for mark in marks {

@@ -5,7 +5,9 @@ Input (stdin JSON):
   {"texts": ["..."], "model": "all-MiniLM-L6-v2"}
 
 Output (stdout JSON):
-  {"vectors": [[...], [...]], "dim": 384}
+  {"vectors": [[...], [...]], "dim": 384, "backend": "sentence-transformers"}
+  When IMPULSE_EMBED_ALLOW_FAKE=1 and sentence-transformers is unavailable:
+  {"vectors": [...], "dim": 384, "backend": "deterministic-sha256-fallback"}
 """
 
 import hashlib
@@ -54,6 +56,7 @@ def main() -> int:
         print(json.dumps({"error": "texts must be a list of strings"}), file=sys.stderr)
         return 1
 
+    backend = "sentence-transformers"
     try:
         vectors = sentence_transformers_vectors(texts, model_name)
         dim = len(vectors[0]) if vectors else DIM
@@ -61,6 +64,7 @@ def main() -> int:
         if os.getenv("IMPULSE_EMBED_ALLOW_FAKE", "") == "1":
             vectors = [deterministic_vector(t, DIM) for t in texts]
             dim = DIM
+            backend = "deterministic-sha256-fallback"
         else:
             print(
                 json.dumps(
@@ -74,7 +78,7 @@ def main() -> int:
             )
             return 1
 
-    print(json.dumps({"vectors": vectors, "dim": dim}))
+    print(json.dumps({"vectors": vectors, "dim": dim, "backend": backend}))
     return 0
 
 

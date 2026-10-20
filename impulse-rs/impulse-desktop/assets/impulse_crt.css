@@ -166,6 +166,9 @@ body {
   display: grid;
   grid-template-columns: 232px minmax(420px, 1fr) 320px;
   min-height: 0;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .left-rail,
@@ -840,6 +843,22 @@ body {
   cursor: pointer;
 }
 
+.workspace-field-inline {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.workspace-field-inline input {
+  flex: 1;
+  min-width: 0;
+}
+
+.workspace-field-inline .invoke-button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 .workspace-primary {
   grid-column: 1 / -1;
   justify-self: start;
@@ -912,11 +931,18 @@ body {
 
 .event-strip {
   display: flex;
-  gap: 22px;
+  flex-wrap: wrap;
+  gap: 6px 22px;
   padding: 6px 22px;
   border-top: 1px solid var(--c-line);
   color: var(--c-label);
   font-size: 11px;
+}
+
+.event-strip span {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .event-strip span::before {

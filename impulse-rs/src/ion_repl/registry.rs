@@ -91,8 +91,9 @@ impl ReplToolRegistry {
     /// Builds the default ion REPL tool set: `ion_verify`,
     /// `governed_submit_claim`, the read-only `document_read` (only with the
     /// default `office-support` feature, matching `src/tooling::document`),
-    /// plus `file_read`, `file_write`, `bash_exec`, `memory_search`, and
-    /// `genome_read` bridged from `src/tooling::ToolRegistry::with_defaults()`,
+    /// plus `file_read`, `file_write`, `bash_exec`, `memory_search`,
+    /// `genome_read`, and `handoff` bridged from
+    /// `src/tooling::ToolRegistry::with_defaults()`,
     /// then ADR-0023's `blackboard_store` and `blackboard_fetch`, and last
     /// `search_tools`, whose catalog is a snapshot of everything before it.
     ///
@@ -172,12 +173,20 @@ impl ReplToolRegistry {
             .expect("default memory_search");
         registry
             .register(Box::new(DynamicToolBridge::new(
-                dynamic,
+                Arc::clone(&dynamic),
                 "genome_read",
                 "genome_read {\"section\": \"...\"} -- read permanent project decisions \
              and preferences from GENOME.md",
             )))
             .expect("default genome_read");
+        registry
+            .register(Box::new(DynamicToolBridge::new(
+                dynamic,
+                "handoff",
+                "handoff {\"action\": \"submit\", \"payload\": {...}} -- accept a sourced \
+             findings handoff, or read/write a shared artifact against its generation",
+            )))
+            .expect("default handoff");
         registry
             .register(Box::new(BlackboardStoreTool))
             .expect("default blackboard_store");
@@ -249,6 +258,7 @@ mod tests {
         assert!(registry.get("governed_submit_claim").is_some());
         assert!(registry.get("memory_search").is_some());
         assert!(registry.get("genome_read").is_some());
+        assert!(registry.get("handoff").is_some());
         assert!(registry.get("blackboard_store").is_some());
         assert!(registry.get("blackboard_fetch").is_some());
         assert!(registry.get("search_tools").is_some());
@@ -260,7 +270,7 @@ mod tests {
             registry.get("photon").is_some(),
             cfg!(feature = "photon-subagent")
         );
-        let expected = 10
+        let expected = 11
             + usize::from(cfg!(feature = "office-support"))
             + usize::from(cfg!(feature = "photon-subagent"));
         assert_eq!(registry.len(), expected);

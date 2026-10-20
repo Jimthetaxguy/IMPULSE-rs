@@ -63,6 +63,13 @@ pub fn ensure_context_dirs(impulse_dir: &Path) -> Result<PathBuf> {
     Ok(root)
 }
 
+/// Write a task-routing note (target tool, task, tracked files) under
+/// `.impulse/context/`.
+///
+/// This does not accept a findings report. A claim handed from one agent to
+/// another is accepted only by the `handoff` tool (`crate::handoff`), which
+/// refuses the handoff when a source is missing, does not resolve, or is
+/// about a different subject than the claim.
 pub fn write_handoff(
     impulse_dir: &Path,
     target_tool: &str,

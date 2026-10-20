@@ -391,6 +391,7 @@ mod tests {
             staged_worktree: None,
             promotions: Vec::new(),
             execution_state: GovernedExecutionState::Running,
+            exit_kind: Default::default(),
             review_state: GovernedReviewState::AwaitingClaim,
             claims: Vec::new(),
             verifications: Vec::new(),

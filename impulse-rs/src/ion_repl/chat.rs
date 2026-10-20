@@ -53,8 +53,9 @@
 //! confirmation step -- unlike `claude`/`codex`, which prompt before
 //! write/bash actions by default (auto-accept/yolo mode is opt-in, not the
 //! default). [`CONFIRMATION_REQUIRED_TOOLS`] gates `bash_exec`/`file_write`
-//! (mutating filesystem/shell) and `governed_submit_claim` (daemon-owned
-//! governed-task mutation) behind [`ReplToolExecutor::confirm`] -- a declined
+//! (mutating filesystem/shell), `governed_submit_claim` (daemon-owned
+//! governed-task mutation), and `handoff` (accepting a findings handoff or
+//! writing a shared artifact) behind [`ReplToolExecutor::confirm`] -- a declined
 //! confirmation short-circuits before `ReplTool::run` is ever called, so
 //! nothing executes. `ion_verify`/`file_read` are read-only and stay
 //! auto-approved, matching `/verify`'s existing ungated behavior.
@@ -514,13 +515,20 @@ fn tool_definitions(registry: &ReplToolRegistry) -> Vec<ToolDefinition> {
 }
 
 /// Tool names whose execution mutates state (filesystem writes, shell
-/// commands, daemon-owned governed-task claims) and therefore require an
-/// interactive confirmation before running when triggered by model-generated
-/// `tool_use` output. `ion_verify` (read-only, spec-a gate), `file_read`,
-/// `document_read`, `memory_search`, and `genome_read` are deliberately not
-/// gated: `ion_verify` is already ungated when hand-typed via `/verify`, and
-/// the readers cannot mutate durable workbench truth.
-const CONFIRMATION_REQUIRED_TOOLS: &[&str] = &["bash_exec", "file_write", "governed_submit_claim"];
+/// commands, daemon-owned governed-task claims, findings-handoff acceptance)
+/// and therefore require an interactive confirmation before running when
+/// triggered by model-generated `tool_use` output. `ion_verify` (read-only,
+/// spec-a gate), `file_read`, `document_read`, `memory_search`, and
+/// `genome_read` are deliberately not gated: `ion_verify` is already ungated
+/// when hand-typed via `/verify`, and the readers cannot mutate durable
+/// workbench truth. `handoff` is gated because accepting a findings report
+/// and writing a shared artifact both change durable coordination state.
+const CONFIRMATION_REQUIRED_TOOLS: &[&str] = &[
+    "bash_exec",
+    "file_write",
+    "governed_submit_claim",
+    "handoff",
+];
 
 /// An unforgeable proof that a mutating tool call was approved -- adapted
 /// from ROSA's `ApprovalGrant`/`Gate` design (see module doc comment).
@@ -1516,6 +1524,14 @@ mod tests {
             .await
             .expect("fake provider succeeds");
         assert_eq!(reply, "echo:hello");
+    }
+
+    #[test]
+    fn test_handoff_tool_requires_confirmation() {
+        assert!(
+            CONFIRMATION_REQUIRED_TOOLS.contains(&"handoff"),
+            "accepting a findings handoff must not run from model output without confirmation"
+        );
     }
 
     #[tokio::test]

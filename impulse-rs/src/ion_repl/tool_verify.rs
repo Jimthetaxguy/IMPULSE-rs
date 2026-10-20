@@ -18,6 +18,8 @@
 
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
+use impulse_ion::pi_adapter::AdapterError;
+use impulse_ion::{classify_verify_response, GateErrorKind, GateOutcome};
 use serde_json::Value;
 
 use crate::handlers::ion::{format_response_text, run_ion_verify};
@@ -114,34 +116,63 @@ impl ReplTool for IonVerifyTool {
             .unwrap_or(DEFAULT_DESCRIPTION)
             .to_string();
 
-        let response = run_ion_verify(repo, diff_ref, description)
-            .await
-            .context("ion_verify tool failed")?;
-
-        // Mirror the CLI's exit-code logic exactly (`handlers::ion::handle_ion_verify`):
-        // `passed()` alone misses `validate()`-only violations like
-        // MissingCommandsRun, which can fire even when the verdict is
-        // Approve with no CRITICAL finding.
-        let contract_violation = response
-            .validate()
-            .err()
-            .map(|violation| violation.to_string());
-        let ok = response.passed() && contract_violation.is_none();
-        let rendered = format_response_text(&response);
-        let mut payload = serde_json::to_value(&response)
-            .context("failed to serialize HarnessResponse to JSON")?;
-        if let Value::Object(ref mut map) = payload {
-            map.insert(
-                "contract_violation".to_string(),
-                serde_json::to_value(&contract_violation).unwrap_or(Value::Null),
-            );
+        match run_ion_verify(repo, diff_ref, description).await {
+            Ok(response) => outcome_from_response(&response),
+            Err(err) => match adapter_error_ref(&err).and_then(GateOutcome::from_adapter_error) {
+                Some(GateOutcome::GateError(kind)) => Ok(outcome_from_gate_error(kind, &err)),
+                _ => Err(err).context("ion_verify tool failed"),
+            },
         }
+    }
+}
 
-        Ok(ToolOutcome {
-            rendered,
-            payload,
-            ok,
-        })
+fn adapter_error_ref(err: &anyhow::Error) -> Option<&AdapterError> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<AdapterError>())
+}
+
+fn outcome_from_response(response: &impulse_ion::HarnessResponse) -> Result<ToolOutcome> {
+    // `passed()` alone misses `validate()`-only violations like
+    // MissingCommandsRun, which can fire even when the verdict is Approve
+    // with no CRITICAL finding. `classify_verify_response` is the one mapping
+    // the CLI exit code also uses.
+    let outcome = classify_verify_response(response);
+    let contract_violation = match &outcome {
+        GateOutcome::ContractViolation(violation) => Some(violation.to_string()),
+        _ => None,
+    };
+    let rendered = format_response_text(response);
+    let mut payload =
+        serde_json::to_value(response).context("failed to serialize HarnessResponse to JSON")?;
+    if let Value::Object(ref mut map) = payload {
+        map.insert(
+            "contract_violation".to_string(),
+            match &contract_violation {
+                Some(violation) => Value::String(violation.clone()),
+                None => Value::Null,
+            },
+        );
+        map.insert(
+            "outcome".to_string(),
+            Value::String(outcome.tag().to_string()),
+        );
+    }
+    Ok(ToolOutcome {
+        rendered,
+        payload,
+        ok: matches!(outcome, GateOutcome::Pass),
+    })
+}
+
+fn outcome_from_gate_error(kind: GateErrorKind, err: &anyhow::Error) -> ToolOutcome {
+    let outcome = GateOutcome::GateError(kind);
+    ToolOutcome {
+        rendered: format!("Ion gate error: {outcome}\n{err:#}"),
+        payload: serde_json::json!({
+            "outcome": outcome.tag(),
+            "gate_error": kind.tag(),
+        }),
+        ok: false,
     }
 }
 
@@ -198,6 +229,7 @@ mod tests {
         assert!(outcome.ok);
         assert!(outcome.rendered.contains("Approve"));
         assert_eq!(outcome.payload["verdict"], "APPROVE");
+        assert_eq!(outcome.payload["outcome"], "pass");
     }
 
     #[tokio::test]
@@ -221,6 +253,7 @@ mod tests {
         let outcome = outcome.expect("run should succeed even for a failing verdict");
         assert!(!outcome.ok);
         assert!(outcome.rendered.to_lowercase().contains("changesrequested"));
+        assert_eq!(outcome.payload["outcome"], "refused");
     }
 
     #[tokio::test]
@@ -347,5 +380,32 @@ mod tests {
             "validate() failure must make ok false even when passed() is true"
         );
         assert!(!outcome.payload["contract_violation"].is_null());
+        assert_eq!(outcome.payload["outcome"], "contract_violation");
+        assert_ne!(outcome.payload["outcome"], "pass");
+    }
+
+    #[tokio::test]
+    async fn test_needs_discussion_payload_is_undecided_not_refused() {
+        let _guard = env_lock();
+        let repo = init_git_repo();
+        let stub_gate = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fakes/ion-verify-stub-gate-needs-discussion.sh");
+        std::env::set_var(impulse_ion::pi_adapter::ION_GATE_LAUNCHER_ENV, &stub_gate);
+
+        let ctx = ReplContext {
+            repo_root: repo.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+        let outcome = IonVerifyTool
+            .run(serde_json::json!({"diff_ref": "HEAD"}), &ctx)
+            .await;
+
+        std::env::remove_var(impulse_ion::pi_adapter::ION_GATE_LAUNCHER_ENV);
+
+        let outcome = outcome.expect("an abstention is still a completed gate call");
+        assert!(!outcome.ok);
+        assert_eq!(outcome.payload["outcome"], "undecided");
+        assert_ne!(outcome.payload["outcome"], "refused");
+        assert_ne!(outcome.payload["outcome"], "pass");
     }
 }

@@ -53,6 +53,8 @@ pub enum AdapterError {
         "gate process timed out after {timeout_secs}s and was killed (stderr so far: {stderr})"
     )]
     TimedOut { timeout_secs: u64, stderr: String },
+    #[error("gate response request_id `{received}` does not match request `{expected}`")]
+    RequestIdMismatch { expected: String, received: String },
 }
 
 /// Locates the promoted Pi gate launcher shipped alongside the Ion harness specs.
@@ -218,7 +220,15 @@ impl PiAdapter {
             });
         }
 
-        response_result
+        let mut response = response_result?;
+        if response.request_id != request.request_id {
+            return Err(AdapterError::RequestIdMismatch {
+                expected: request.request_id.clone(),
+                received: response.request_id,
+            });
+        }
+        response.omit_oversized_output_logs();
+        Ok(response)
     }
 }
 
@@ -277,11 +287,13 @@ fn read_response_lenient(mut reader: impl BufRead) -> Result<HarnessResponse, Ad
             break; // EOF
         }
         buffer.push_str(&line);
-        if let Ok(response) = serde_json::from_str::<HarnessResponse>(&buffer) {
+        if let Ok(mut response) = serde_json::from_str::<HarnessResponse>(&buffer) {
+            response.omit_oversized_output_logs();
             return Ok(response);
         }
         let sanitized = sanitize_control_chars_in_strings(&buffer);
-        if let Ok(response) = serde_json::from_str::<HarnessResponse>(&sanitized) {
+        if let Ok(mut response) = serde_json::from_str::<HarnessResponse>(&sanitized) {
+            response.omit_oversized_output_logs();
             return Ok(response);
         }
     }
@@ -444,6 +456,81 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains('7'));
         assert!(msg.contains("boom"));
+    }
+
+    #[test]
+    fn adapter_error_request_id_mismatch_display_names_both_ids() {
+        let err = AdapterError::RequestIdMismatch {
+            expected: "req-a".to_string(),
+            received: "req-b".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("req-a"));
+        assert!(msg.contains("req-b"));
+    }
+
+    #[test]
+    fn test_response_with_foreign_request_id_is_gate_error() {
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fakes/foreign-request-id-gate.sh");
+        let adapter = PiAdapter::with_launch_script(script);
+        let request = sample_request();
+        let err = adapter
+            .verify(&request)
+            .expect_err("a response for a different request must not be this turn's verdict");
+        match &err {
+            AdapterError::RequestIdMismatch { expected, received } => {
+                assert_eq!(expected, &request.request_id);
+                assert_eq!(received, "someone-else");
+            }
+            other => panic!("expected request id mismatch, got {other}"),
+        }
+        let outcome = crate::GateOutcome::from_adapter_error(&err)
+            .expect("a crossed response is a gate error");
+        assert_eq!(
+            outcome,
+            crate::GateOutcome::GateError(crate::GateErrorKind::RequestIdMismatch)
+        );
+        assert_ne!(outcome.tag(), "pass");
+        assert_eq!(outcome.process_exit_code(), 2);
+    }
+
+    #[test]
+    fn test_oversized_output_log_is_named_with_size() {
+        let big = "y".repeat(crate::MAX_OUTPUT_LOG_BYTES + 32);
+        let omitted_bytes = big.len();
+        let small = "kept verbatim";
+        let raw = serde_json::json!({
+            "contract_version": "0",
+            "request_id": "r1",
+            "verdict": "APPROVE",
+            "findings": [],
+            "commands_run": [{
+                "command": "cargo test",
+                "exit_code": 0,
+                "output_ref": "log-big"
+            }],
+            "output_logs": {
+                "log-big": big,
+                "log-small": small,
+            },
+            "metrics": {"tokens_in": 0, "tokens_out": 0, "latency_ms": 0}
+        });
+        let response = read_response_lenient(Cursor::new(format!("{raw}\n")))
+            .expect("oversized log must still parse");
+        assert!(response.output_logs.contains_key("log-big"));
+        assert_eq!(
+            response.output_logs.get("log-small").map(String::as_str),
+            Some(small)
+        );
+        let body = response.output_logs.get("log-big").unwrap();
+        let named: serde_json::Value =
+            serde_json::from_str(body).expect("omitted log body must be JSON naming the size");
+        assert_eq!(named["omitted_bytes"], omitted_bytes);
+        assert!(
+            !body.contains(&"y".repeat(64)),
+            "the oversized body must not be silently kept"
+        );
     }
 
     fn sample_request() -> HarnessRequest {

@@ -23,7 +23,7 @@ required-features = ["desktop-app"]
 
 [features]
 default = []
-desktop-app = ["dep:dioxus-desktop", "dioxus/desktop"]
+desktop-app = ["dep:dioxus-desktop", "dioxus/desktop", "dep:rfd"]
 native-macos = [
     "dep:objc2",
     "dep:objc2-app-kit",
@@ -38,6 +38,7 @@ dioxus = { version = "0.6.3", default-features = false, features = ["minimal", "
 dioxus-desktop = { version = "0.6.3", optional = true }
 impulse-ops = { path = "../impulse-ops" }
 impulse-term = { path = "../impulse-term", default-features = false }
+rfd = { version = "0.14", optional = true, default-features = false, features = ["xdg-portal", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
