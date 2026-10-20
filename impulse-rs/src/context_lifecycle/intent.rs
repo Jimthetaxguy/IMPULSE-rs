@@ -525,6 +525,9 @@ impl Default for RuleBasedClassifier {
 // ─── Intent Store ────────────────────────────────────────────────────────
 
 /// Intent store for managing detected intents across agents.
+/// Most intents an [`IntentStore`] keeps per agent; the oldest go first.
+pub const MAX_INTENTS_PER_AGENT: usize = 100;
+
 pub struct IntentStore {
     intents: RwLock<HashMap<String, Vec<AgentIntent>>>,
     classifier: RuleBasedClassifier,
@@ -538,15 +541,18 @@ impl IntentStore {
         }
     }
 
-    /// Add an activity and get detected intent.
+    /// Add an activity and get detected intent. Each agent keeps its newest
+    /// [`MAX_INTENTS_PER_AGENT`] intents.
     pub fn detect(&self, activity: Activity) -> AgentIntent {
         let intent = self.classifier.classify(&activity);
 
         if let Ok(mut intents) = self.intents.write() {
-            intents
-                .entry(activity.agent_id.clone())
-                .or_insert_with(Vec::new)
-                .push(intent.clone());
+            let history = intents.entry(activity.agent_id.clone()).or_default();
+            history.push(intent.clone());
+            if history.len() > MAX_INTENTS_PER_AGENT {
+                let excess = history.len() - MAX_INTENTS_PER_AGENT;
+                history.drain(..excess);
+            }
         }
 
         intent
@@ -867,5 +873,27 @@ mod tests {
 
         let intent = store.detect(activity);
         assert_eq!(intent.intent_category, IntentCategory::Testing);
+    }
+
+    /// Review finding: the store grew by every insight on every tick.
+    #[test]
+    fn test_detect_keeps_a_bounded_history_per_agent() {
+        let store = IntentStore::new();
+        for i in 0..(MAX_INTENTS_PER_AGENT + 50) {
+            store.detect(
+                Activity::new(
+                    "pane-1".to_string(),
+                    AgentType::Codex,
+                    ActivityType::FileEdit,
+                )
+                .with_target(format!("src/f{i}.rs")),
+            );
+        }
+        let history = store.get_all("pane-1");
+        assert_eq!(history.len(), MAX_INTENTS_PER_AGENT);
+        assert_eq!(
+            store.get_current("pane-1").map(|i| i.timestamp),
+            history.last().map(|i| i.timestamp)
+        );
     }
 }

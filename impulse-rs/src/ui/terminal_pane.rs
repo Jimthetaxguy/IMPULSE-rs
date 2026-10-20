@@ -311,13 +311,16 @@ impl TerminalPane {
             .unwrap_or_else(|poisoned| poisoned.into_inner().screen().clone())
     }
 
-    /// Returns a screen snapshot with scrollback offset applied.
+    /// Returns a screen snapshot with scrollback offset applied, at most one
+    /// screen height: vt100 0.15 cannot show more, and reading a snapshot
+    /// taken further back underflows inside it (a panic in debug builds).
     /// After cloning, restores the parser to live view (offset 0).
     pub fn screen_snapshot_at_offset(&self, scroll_offset: usize) -> vt100::Screen {
         self.screen
             .lock()
             .map(|mut parser| {
-                parser.set_scrollback(scroll_offset);
+                let rows = usize::from(parser.screen().size().0);
+                parser.set_scrollback(scroll_offset.min(rows));
                 let snapshot = parser.screen().clone();
                 parser.set_scrollback(0); // restore live view
                 snapshot
