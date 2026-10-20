@@ -468,13 +468,22 @@ in final-gate evidence instead of copying a moving aggregate into this guide.
 | `OPENAI_BASE_URL` | Override the OpenAI API origin |
 | `MINIMAX_BASE_URL` | Override the Minimax API origin |
 
-Each `*_BASE_URL` override is the API **origin** only (scheme + host + optional port, e.g.
-`http://127.0.0.1:4010`) — the provider appends its own request path. Values that are blank or
-lack an `http://`/`https://` scheme are ignored in favor of the canonical default, so a typo
-degrades to the real API rather than to a silently broken endpoint. Precedence is
-explicit config (`BaseProvider::with_base_url`) > env var > canonical default.
+Each `*_BASE_URL` override is the base the provider appends its own request path to, e.g.
+`http://127.0.0.1:4010`, or a gateway prefix such as OpenRouter's `https://openrouter.ai/api`. A
+trailing `/v1` (the OpenAI SDK convention) is dropped, since each provider's path starts with
+`/v1/`. A blank value is unset. A value that can't be used (no `http://`/`https://` scheme, no
+host, a query or a fragment) fails every request with an error naming the variable: it never falls
+back to the canonical API, which would send the key and the prompt to the public service the user
+had pointed away from. Credentials in the URL are sent as Basic auth to Anthropic, whose key goes
+in `x-api-key`; OpenAI and MiniMax refuse them, since their key is the `Authorization` header.
+Logs and error messages show only the origin. Precedence is explicit config
+(`BaseProvider::with_base_url`) > env var > canonical default; the env var is not read when a
+base URL is configured. Providers never follow redirects: a 3xx answer is an error naming where
+it pointed, since following one would carry the API key (and, from an https origin, possibly in
+cleartext) to another host.
 
 Accepted risk: any `http(s)` origin is accepted (no host allowlist). An active override is
-logged at provider request time (origin only, never the API key). Cleartext `http://` to a
-non-loopback host is a warning; loopback HTTP (local eval harness) is not. This is a
+logged at provider request time (origin only: never the API key, credentials or path). Cleartext `http://` to a
+non-loopback host is a warning; loopback HTTP (local eval harness) is not. Only `localhost` and
+loopback IP addresses count as loopback (a host like `127.example.com` does not). This is a
 transport override, not a model picker — see ADR-0015.
