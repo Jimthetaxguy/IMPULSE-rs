@@ -466,6 +466,81 @@ mod tests {
         DesktopShellState::new(runtime, workspaces, mcp, memory_root)
     }
 
+    /// Refutation review of 6b9e3de: a paste into a pane that is not
+    /// reading blocked the bridge's one-at-a-time command queue, so the
+    /// `close` behind it never ran.
+    #[tokio::test]
+    async fn test_close_is_not_stuck_behind_a_write_the_pane_is_not_reading() {
+        let state = test_state();
+        state
+            .runtime
+            .spawn_agent(crate::runtime::AgentSpawnRequest {
+                agent_id: Some("busy-1".to_string()),
+                session_id: None,
+                platform: AgentPlatformId::try_new("shell").unwrap(),
+                command: Some("sh".to_string()),
+                args: vec!["-c".to_string(), "exec sleep 30".to_string()],
+                cwd: None,
+                env: std::collections::HashMap::new(),
+                workspace: None,
+                mcp_tools: Vec::new(),
+                rows: 24,
+                cols: 80,
+                role: None,
+                task: None,
+                role_assignment: None,
+                acceptance_criteria: Vec::new(),
+                verification_profile: None,
+                target: None,
+            })
+            .expect("spawn a pane that never reads");
+
+        let (request_tx, request_rx) = channel(64);
+        let (response_tx, mut response_rx) = unbounded_channel();
+        // The bridge worker gets its own thread and runtime, as in the live
+        // host, so a worker stuck in a write cannot stop this test's timer.
+        let worker = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(dispatch_host_invokes_fifo(state, request_rx, response_tx));
+        });
+        let paste = b"line\n".repeat(100_000);
+        for (id, command, payload) in [
+            (
+                "write",
+                AGENT_WRITE_COMMAND,
+                json!({ "request": { "agent_id": "busy-1", "data": paste } }),
+            ),
+            (
+                "close",
+                AGENT_CLOSE_COMMAND,
+                json!({ "request": { "session_id": "busy-1" } }),
+            ),
+        ] {
+            request_tx
+                .send(HostInvokeRequest {
+                    id: id.to_string(),
+                    command: command.to_string(),
+                    payload,
+                })
+                .await
+                .unwrap();
+        }
+        for expected in ["write", "close"] {
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(5), response_rx.recv())
+                    .await
+                    .expect("the bridge must answer while the pane is not reading")
+                    .expect("a response");
+            assert_eq!(response.id, expected);
+            assert!(response.ok, "{expected}: {:?}", response.error);
+        }
+        drop(request_tx);
+        let _ = worker.join();
+    }
+
     struct AcknowledgingGovernedGateway {
         task: impulse_ops::governed_task::GovernedTaskRun,
         mutations: Mutex<Vec<impulse_ops::governed_task::GovernedTaskMutationRequest>>,

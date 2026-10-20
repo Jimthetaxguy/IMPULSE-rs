@@ -92,7 +92,17 @@ impl McpServer {
         println!("MCP compatibility server listening on {}", addr);
 
         loop {
-            let (socket, _) = listener.accept().await?;
+            // A failed accept (EMFILE, a connection reset before accept)
+            // used to end the server; it now waits briefly and goes on, as
+            // the voice transports do.
+            let socket = match listener.accept().await {
+                Ok((socket, _)) => socket,
+                Err(error) => {
+                    tracing::warn!("MCP TCP accept failed: {error}");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
             let registry = self.registry.clone();
             let ctx = self.ctx.clone();
             tokio::spawn(async move {
@@ -285,13 +295,7 @@ impl McpServer {
         let path = base.join(filename);
         match std::fs::read_to_string(&path) {
             Ok(content) => {
-                let mime = if filename.ends_with(".md") {
-                    "text/markdown"
-                } else if filename.ends_with(".jsonl") {
-                    "application/jsonl"
-                } else {
-                    "application/json"
-                };
+                let (content, mime) = resource_body(filename, content);
                 serde_json::json!({
                     "contents": [{
                         "uri": uri,
@@ -305,6 +309,29 @@ impl McpServer {
             }),
         }
     }
+}
+
+/// The text and MIME type a resource file is served as. `add-decision` and
+/// `init` store GENOME.md as JSON, which was served labelled
+/// `text/markdown`; it is served as the Markdown it renders to now. A
+/// hand-written Markdown genome is served as it is, and JSON that isn't a
+/// genome is labelled as JSON.
+fn resource_body(filename: &str, content: String) -> (String, &'static str) {
+    if filename.ends_with(".md") {
+        if let Ok(genome) = serde_json::from_str::<crate::memory::Genome>(&content) {
+            return (genome.to_markdown(), "text/markdown");
+        }
+        if serde_json::from_str::<serde_json::Value>(&content).is_ok() {
+            return (content, "application/json");
+        }
+        return (content, "text/markdown");
+    }
+    let mime = if filename.ends_with(".jsonl") {
+        "application/jsonl"
+    } else {
+        "application/json"
+    };
+    (content, mime)
 }
 
 fn render_tool_result(output: serde_json::Value) -> serde_json::Value {
@@ -424,6 +451,43 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("My Decisions"));
+    }
+
+    /// Review finding: the genome resource served the stored JSON labelled
+    /// `text/markdown`.
+    #[tokio::test]
+    async fn test_mcp_resources_read_a_json_genome_as_markdown() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut genome = crate::memory::Genome::new();
+        genome.add_decision("Use Rust".into(), Some("speed".into()), Vec::new());
+        std::fs::write(
+            dir.path().join("GENOME.md"),
+            serde_json::to_string_pretty(&genome).unwrap(),
+        )
+        .unwrap();
+        let server = McpServer::new(
+            Arc::new(ToolRegistry::with_defaults()),
+            ToolContext {
+                impulse_dir: dir.path().to_path_buf(),
+                execution_origin: ExecutionOrigin::Test,
+                ..ToolContext::with_all_capabilities()
+            },
+        );
+        let response = server
+            .process_request(r#"{"method":"resources/read","params":{"uri":"impulse://genome"}}"#)
+            .await;
+        let content = &response["contents"][0];
+        assert_eq!(content["mimeType"], "text/markdown");
+        let text = content["text"].as_str().unwrap();
+        assert!(
+            text.contains("Use Rust") && text.contains("speed"),
+            "{text}"
+        );
+        assert!(!text.contains("\"decisions\""), "served raw JSON: {text}");
+        assert_eq!(
+            resource_body("GENOME.md", r#"{"patterns":[]}"#.to_string()).1,
+            "application/json"
+        );
     }
 
     #[tokio::test]

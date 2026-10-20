@@ -1,8 +1,9 @@
-//! impulse-term — custom terminal widget with context lifecycle integration.
+//! impulse-term — framework-neutral PTY and terminal-context core for Impulse.
 //!
-//! Replaces `egui_term` with a terminal backend that gives zero-copy, in-process
-//! access to both context extraction (reading agent output) and context injection
-//! (writing context blocks into agent terminals).
+//! Provides process lifecycle, VT100 parsing, serialized writes, and context
+//! extraction/injection for operator surfaces. Optional egui rendering remains
+//! behind the `egui` feature for legacy compatibility; Dioxus/xterm.js owns
+//! the active desktop cockpit.
 //!
 //! # Architecture
 //!
@@ -16,7 +17,7 @@
 //!     ├── writer handle → Box<dyn Write> (for keyboard + injection)
 //!     └── alive: AtomicBool (process status)
 //!     │
-//!     ├─── TerminalRenderer reads vt100::Screen → egui paint calls
+//!     ├─── optional legacy TerminalRenderer → egui paint calls
 //!     ├─── ContextBridge reads screen_text() for extraction
 //!     └─── ContextBridge writes inject_context() via PTY writer
 //! ```

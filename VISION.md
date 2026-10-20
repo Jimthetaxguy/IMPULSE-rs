@@ -1,416 +1,245 @@
 # IMPULSE — Feed the impulse to build.
 
 - **Status:** Living product north star
-- **Updated:** 2026-09-02
+- **Updated:** 2026-10-04
 - **Canonical implementation contract:** [`docs/spec/RUST-CANONICAL-CONTRACT.md`](docs/spec/RUST-CANONICAL-CONTRACT.md)
 - **Current code boundary map:** [`docs/ARCHITECTURE-CLARIFICATION.md`](docs/ARCHITECTURE-CLARIFICATION.md)
-- **Roadmap contract:** Now=control-plane foundations + governed runtime producers + accepted-run review candidates; Next=stronger same-user actor authorization + full launched Builder/Supervisor proof; Later=memory promotion/dismissal daemon/UI/runtime wiring + general roles + negotiated runtimes + multi-project routing; Legacy=egui compile-maintenance only.
-- **Current governed slice:** profiled pre-PTY Builder registration, exact acceptance criteria, daemon-attested clean Git subjects, daemon-derived claims and detached Rust verification, strict API-only Supervisor review, operator-required acceptance, and deterministic pending memory candidates that do not mutate `GENOME`/`HISTORY`.
-- **Next governed slice:** stronger local actor authorization and one full process proof with launched Builder and Supervisor runtimes; explicit candidate promotion/dismissal remains a later memory-writing contract.
+- **How the vision got here:** [`docs/VISION-HISTORY.md`](docs/VISION-HISTORY.md)
+- **Product requirements:** [`docs/spec/2026-10-03-impulse-ion-photon-prd.md`](docs/spec/2026-10-03-impulse-ion-photon-prd.md)
+- **Evidence base for this revision:** `claude/ion-blackboard-20261003` (stacked on the photon and
+  typed-endpoint lane): 3,225 workspace tests passed, 0 failed, 10 ignored on 2026-10-03, clippy
+  `-D warnings` clean with and without default features.
+
+Every statement below is tagged **[built]**, with the code or ADR that proves it, or
+**[not built]**, with what exists today instead. A thesis is labeled as a thesis. Code paths are
+relative to `impulse-rs/`.
 
 ## In one sentence
 
-Impulse is the local operating environment for coding agents: it launches and scopes heterogeneous
-terminal runtimes, supervises their work, and holds completion to observed evidence and human
-approval — without replacing the CLIs builders already use.
-
-## The promise
-
-An impulse is the creative urge to make something. It is also the force that changes momentum.
-Impulse exists to protect both: keep the original intent coherent, then accelerate it through a
-managed system of coding agents without forcing the builder to become the full-time dispatcher,
-historian, permission clerk, and completion auditor.
-
-The product promise is simple:
-
-> Start with the urge to build. Give it the right agents, context, tools, boundaries, and evidence.
-> Keep the human in command while the work compounds.
-
-Impulse is a terminal-native local control plane and harness manager for AI software-engineering
-agents. It is Rust-first and designed to minimize control-plane overhead while preserving the CLI
-workflows that already make Claude Code, Codex, and other coding harnesses useful. That is a design
-goal, not an unbenchmarked performance claim.
-
-## Why now, and why Impulse
-
-Modern coding agents are individually capable but operationally fragmented. Each runtime has its
-own session model, permissions, tools, context behavior, and completion language. Running several
-of them across several projects produces terminal sprawl, duplicated work, context bleed, silent
-conflicts, and unverified claims.
-
-Impulse is differentiated by treating those agents as workers inside one governed local system:
-
-- It preserves terminal-native runtimes instead of replacing them with a generic IDE imitation.
-- It makes roles and policy more important than model/vendor identity.
-- It supports both wrapped third-party harnesses and an Impulse-native runtime.
-- It treats memory as a governed platform service with provenance, not an indiscriminate transcript dump.
-- It separates worker claims, observed evidence, supervisor judgment, and user approval.
-- It keeps operator surfaces replaceable by making daemon and backend contracts authoritative.
-
-## Product hierarchy
-
-These concepts must stay separate:
-
-```text
-project (governance scope) <------> workspace target (execution root)
-        |                                      |
-        +-- task                               +-- agent process / PTY
-        |   (assignment + criteria)                 |
-        |          |                                +-- terminal/API channel
-        |          +-- agent instance <-------------+
-        |                 +-- role
-        |                 +-- runtime
-        |                 +-- session(s)
-        |
-        +-- memory, artifacts, policy, and verification
-
-pane = a cockpit view onto an agent channel, never the authority
-```
-
-- A **role** defines behavior, permissions, tools, context, communication, and verification duties.
-- A **runtime** is the execution engine or harness integration.
-- An **agent instance** is one running identity assigned a role/runtime/scope.
-- A **session** is bounded recorded work, not necessarily process lifetime.
-- A **task** is the broader assignment concept. A **governed task** is today's durable daemon-owned
-  carrier for that assignment and its acceptance evidence; it may outlive one runtime process.
-  Reassignment/resume under a different agent or runtime is not implemented yet.
-- A **pane** is presentation and input routing, not identity or authorization.
-- A **workspace target** is the filesystem root used for execution.
-- A **project** is the governance boundary for memory, artifacts, policy, and verification.
-
-ADR-0011 makes the governed task ID durable and distinct from agent/session identity. The remaining
-cardinalities, durable project identity, and task reassignment rules still require an ADR. This
-hierarchy is enough to prevent the most harmful conflations without prematurely freezing the rest
-of the schema.
-
-## Roles, especially the supervisor
-
-Roles are the stable product abstraction. Initial roles may include supervisor, builder, reviewer,
-planner, researcher, tester, documentation, security review, and release.
-
-A role contract eventually needs:
-
-- allowed and prohibited actions;
-- tool and credential grants;
-- readable/writable project and filesystem scopes;
-- context and memory visibility;
-- message routes;
-- planning/reporting/verification obligations;
-- escalation and approval conditions;
-- the minimum enforcement strength a runtime must provide.
-
-The supervisor is structurally different from a builder. Its purpose is to observe workers, detect
-conflicts or drift, request evidence, coordinate handoffs, curate durable memory, and escalate to the
-user. A supervisor role should normally receive read/inspect/message/review capabilities while
-source editing, destructive commands, and direct completion are omitted or separately approved.
-
-Prompt text is not enough. The restriction must be represented by backend policy, tool omission,
-filesystem/process boundaries, command mediation, audit, and confirmation gates wherever the
-selected runtime supports them. A left-side terminal pane can represent the supervisor; it cannot
-create the role merely by being leftmost or by running a particular model.
-
-## Two runtime paths
-
-### External harness path
-
-Claude Code, Codex, OpenCode-compatible surfaces, and future CLIs already own internal agent loops.
-Impulse wraps them with a controlled working directory, environment, PTY, process lifecycle,
-project instructions, hooks, MCP/tool bridges, credentials, and telemetry. Interruption, restart,
-and resume controls remain runtime- and adapter-capability dependent.
-
-Impulse cannot replace hidden vendor prompts, proprietary reasoning, undocumented context
-compression, or unsupported internal tool mechanics. External-runtime governance must therefore be
-described by observed enforcement strength, never by blanket parity claims.
-
-### Ion native path
-
-Ion calls model providers directly and can let Impulse own prompt construction, tool schemas, loop
-bounds, context assembly, memory retrieval, events, approvals, and structured results. It is the
-path where role contracts can become most direct and testable.
-
-Supporting Ion does not require abandoning established coding CLIs. Both paths belong in one
-control plane and should share platform services where their capabilities allow it.
-
-## Capability negotiation
-
-Different runtimes support different operations. A future generalized/dynamic adapter contract must
-report rather than hide those differences. Relevant capabilities include:
-
-ADR-0010 makes one narrow part live: Dioxus previews a static, trusted code-owned launch-capability
-comparison and the backend repeats it before PTY creation. This is conservative preflight over
-declared wrapper support, not runtime probing, model-internal governance, or the future generalized
-adapter negotiation contract.
-
-- structured tools and MCP;
-- hooks and structured events;
-- custom instructions/system prompts;
-- read-only or scoped filesystem modes;
-- process interrupt, restart, and resume;
-- typed status/events;
-- secret isolation;
-- session restoration;
-- confirmation and policy interception.
-
-Role assignment must produce a compatibility result: requirements satisfied structurally,
-satisfied through Impulse mediation, advisory only, or unsupported. Unsupported mandatory
-requirements must block launch; advisory degradation must be visible to the user.
-
-## Shared platform services
-
-Agents launched through Impulse should gain a coherent set of services even when the integration
-mechanism differs by runtime:
-
-- **Memory and retrieval:** durable decisions, session history, search, provenance, review-first injection.
-- **Tools:** typed schemas, capability checks, invocation audit, errors, versions, and runtime bridges.
-- **Telemetry:** process, task, command, test, tool, artifact, context, blocked, idle, and approval events.
-- **Messaging and handoffs:** typed, acknowledged, scoped agent-to-agent/supervisor communication.
-- **Policy:** role obligations, permissions, confirmation, guardrails, and enforcement strength.
-- **Credentials:** least-privilege provider access without secret values entering logs or memory.
-- **Artifacts:** typed outputs with project/agent/session provenance and review actions.
-- **Verification:** project-specific commands, evidence capture, supervisor review, and user approval.
-
-For Ion these can be direct typed calls. For external CLIs they may be exposed through MCP, hooks,
-local sockets, generated commands, files, or mediated PTY operations. The conceptual capability can
-be shared without pretending its enforcement is identical.
-
-## Memory and context isolation
-
-Memory is one of Impulse's strongest services and one of its largest trust risks. Durable memory
-must distinguish facts, decisions, preferences, hypotheses, and temporary state; carry source and
-scope; support correction/forgetting; and avoid treating worker prose as verified truth.
-
-Every memory, event, artifact, tool call, and message needs an explicit scope such as global user,
-project, repository, branch, task, agent, or session. Broad supervisor visibility must never imply
-broad worker visibility. Secrets must not become memory, terminal logs, model context, or
-cross-project payloads.
-
-## Events, attention, and resources
-
-The supervisor cannot consume every terminal token. Impulse should publish meaningful state
-changes, summarize noisy output, suppress repetition, prioritize blockers/conflicts/approvals, and
-retain enough raw provenance for inspection.
-
-Events are durable only when they matter for audit, replay, memory, or evidence; high-volume
-terminal details can remain ephemeral or summarized. Resource policy should bound concurrent
-agents, model/API budgets, output retention, indexing, context size, and idle activity. The guiding
-principle is useful supervision per unit of attention, not surveillance volume.
-
-## Verification and evidence
-
-"Done" is a policy result, not a phrase emitted by a worker. A completion record can include:
-
-- acceptance criteria mapped to changed behavior;
-- build, test, lint, format, security, and integration commands;
-- exact command outcomes and output references;
-- required/forbidden file checks;
-- diff and artifact review;
-- supervisor judgment;
-- explicit user approval for high-impact actions.
-
-Impulse must keep four things distinct: worker claim, observed evidence, supervisor judgment, and
-user approval. Each can disagree with the others, and the interface must show that disagreement.
-
-### Current governed-task boundary
-
-That distinction is now executable for profiled governed Builder launches. The daemon owns a
-persistent task record and append-only typed events; mutations carry an idempotency request ID and
-expected revision. A `rust_workspace_v1` launch requires exact acceptance criteria, the canonical
-Git worktree root, a clean committed `HEAD`, and an initial OID independently re-observed by the
-daemon before PTY creation.
-Execution state (`registered`, `running`, `launch_failed`, `runtime_exited`) changes independently
-from review state. Passing verification may reach `awaiting_supervisor`; only a supervisor
-`recommend_accept` verdict can reach `awaiting_operator`; only an operator approval can produce
-`accepted`.
-
-On restart, the daemon replays the stored event/record chain and requires one valid idempotency
-receipt per revision before trusting the materialized state. This catches corrupt or incoherent
-files; it is not a signature against a same-user process capable of rewriting the entire ledger.
-Receipts deduplicate already-persisted requests, and one per-task lock serializes live producer and
-lifecycle mutations. Producer execution is not crash-safe exactly-once: daemon death after a
-command/model side effect but before its durable receipt can cause a retry to repeat that side
-effect. A durable producer reservation journal is required to close that boundary.
-
-The Builder supplies only a bounded summary and artifact IDs through the env-routed
-`"$IMPULSE_CONTROL_CLI" --daemon governed-claim` command or Ion's typed
-`governed_submit_claim` tool. The packaged executable is `impulse-rs`; the environment variable
-retains the exact launched path. The daemon derives the assigned Worker actor and current clean Git
-OID. It then verifies the exact claimed commit in a detached Git
-worktree with a closed format/locked-check/locked-strict-Clippy/locked-test argv profile, a required
-committed regular non-symlink root `Cargo.lock`, a symlink-free source tree, a scrubbed environment,
-bounded timeouts, streaming output digests,
-process-group cleanup, and a bounded before/after byte manifest that includes ignored source-tree
-paths. Command evidence persists a
-display-safe executable and fixed arguments plus SHA-256 digests, byte counts, and truncation flags;
-raw output is not part of the task record.
-
-The real daemon/CLI process test proves claim submission, detached verification, durable evidence,
-and restart recovery only through `awaiting_supervisor`. Separate in-process daemon handler tests
-prove strict API-only Supervisor review and operator-only acceptance.
-
-This verifier executes host-trusted Rust build scripts, proc macros, and tests. Detached checkout,
-environment scrubbing, timeout, and cleanup are containment measures, not an OS sandbox. Projects
-that are not trusted to execute locally must not use this profile.
-
-Supervisor review is a stateless, tool-free, temperature-zero API turn. Its strict JSON envelope
-must echo the exact task revision, claim and verification IDs, subject revision, acceptance-criteria
-count, and acceptance-criteria digest. Generic coding-harness configuration fails closed before
-spawn because Impulse cannot guarantee a structurally read-only harness turn. Dioxus shows the
-result and guides the operator to the terminal producer commands; producer buttons are not live.
-
-Typed actor kinds provide provenance and transition checks, not cryptographic same-user role
-authentication. The daemon socket directory/socket/PID file are restricted to the local user, but
-another process running as that user is inside the current trust boundary. Project identity is
-currently derived from the bound project directory name, one daemon adapter is bound to one
-project, task reassignment/resume is not implemented, and the global task/receipt maps do not yet
-have pagination or archival. These limits must remain visible until stronger contracts replace them.
-
-Accepted tasks now produce a separate review projection in owner-only
-`.impulse/MEMORY_CANDIDATES.json`. The governed-task ledger remains the episodic source of truth;
-the candidate ID and source digest are deterministic over a versioned source projection. Acceptance
-persists first, while identical request replay and daemon-start reconciliation repair a missing
-candidate. Orphans and source mismatches fail closed. The candidate exposes task/criteria,
-subject, successful command evidence, artifact/record references, and an honest source-assurance
-class, but structurally excludes worker claim prose and Supervisor/operator rationales.
-The source digest hashes exact JSON bytes from a fixed ordered, versioned struct; it does not claim
-semantic normalization across alternative Unicode spellings.
-
-That candidate is durable review state, not curated semantic memory. V1 supports only
-`pending_review`; Dioxus is read-only and labels it as not stored in `GENOME`. Candidate creation,
-repair, and display do not mutate `GENOME.md`, `HISTORY.jsonl`, retrieval, or injected context.
-Accepted and rejected operator decisions are terminal, so a later opposite decision cannot orphan
-the projection. The two ledgers use separate temp-file-sync-and-rename replacements; reconciliation
-repairs absence, but no cross-file transaction or parent-directory-fsync durability is claimed.
-
-## User control and trust
-
-Users must be able to inspect which runtime and role are active, what each agent can access, why a
-context item was selected, what is remembered, which tool or credential boundary applied, what data
-crossed a scope, why the supervisor intervened, and whether an action was automatic or approved.
-
-The backend is authoritative, but authority must remain legible. Every meaningful policy decision
-needs a reason and an audit path. The user can interrupt, narrow, revoke, review, or reject.
-
-## Live foundation versus target state
-
-### Live foundation
-
-- Rust daemon and versioned workbench protocol/read models.
-- PTY spawn/write/resize/focus/exit lifecycle and process cleanup.
-- Dioxus Desktop host/bridge plus ratatui and CLI operator surfaces.
-- Registry-backed desktop platform identity and launch metadata.
-- Explicit product-role/task launch preflight, backend mandatory-capability gate, and typed
-  compatibility telemetry.
-- Daemon-owned governed task records with pre-PTY registration, revisioned/idempotent mutations,
-  independent execution/review state, durable lifecycle events, and operator-required acceptance.
-- Explicit `rust_workspace_v1` registrations with exact criteria and daemon-attested clean initial
-  Git OIDs; env-routed Builder claims through CLI and Ion's `governed_submit_claim` tool.
-- Daemon-owned detached Rust verification and strict criteria-digest-bound, API-only, tool-free,
-  history-free Supervisor review. Generic external harness review fails closed.
-- Deterministic accepted-run memory candidates in a separate owner-only ledger, startup/replay
-  repair, typed source assurance, and a read-only Dioxus pending-review view. `GENOME` and `HISTORY`
-  remain unchanged.
-- Dioxus governed-task evidence and decision cards backed by acknowledged host commands; no
-  optimistic task state. Profiled cards currently guide terminal producer commands rather than
-  exposing producer buttons.
-- Owner-only, write-ahead desktop lifecycle outbox with cross-process locking for launch/exit
-  reconciliation across ambiguous daemon transport failures. Abrupt desktop death before an exit
-  intent exists still requires a future runtime lease/orphan-reconciliation contract; missing task
-  targets are retained until a future durable registration-tombstone/expiry policy can resolve them.
-- Ion as a real desktop-launchable builtin platform.
-- Daemon-truth terminal telemetry across lifecycle and heartbeat.
-- Supervisor-specific permission/confirmation policy and daemon actions.
-- Typed capability-checked tooling, MCP surfaces, and audit paths.
-- Project memory, FTS5/semantic retrieval, context stewardship, and review-first injection.
-- Credential provider abstraction, artifacts, delegations, and verification gates.
-- Ion interactive native coding runtime with direct providers, typed tools, guardrails, and loop bounds.
-
-This contract describes the current repository implementation. Inclusion in a tagged release is
-a separate action and must not be inferred from repository state alone.
-
-### Target state
-
-- General role contracts independent of model/runtime/pane.
-- One adapter contract with required, optional, emulated, and unsupported operations.
-- Capability negotiation with explicit enforcement strength.
-- Typed cross-agent messaging, acknowledgements, routing, and project isolation.
-- Role-scoped tools, credentials, context, memory, and verification policies.
-- Event-driven supervisor attention and resource budgets.
-- Stronger same-user actor authorization and a process-level proof across launched Builder and
-  Supervisor runtimes.
-- Explicit operator promotion/dismissal for pending candidates, including semantic validation,
-  conflict/deduplication policy, audit, and the eventual curated-memory write boundary.
-
-## First complete vertical slice
-
-The first proof of the full product is one governed workflow, not a partial version of every
-subsystem:
-
-1. The user opens Impulse and selects a registered project/workspace.
-2. The user selects a supervisor role and a compatible runtime.
-3. Impulse negotiates capabilities and shows enforcement strength/degradation before launch.
-4. The user launches one builder with an explicit task, role, workspace, tools, and policy.
-5. The builder works in its normal terminal/native runtime while Impulse captures typed state changes.
-6. The supervisor receives prioritized summaries and can request context, evidence, or revision.
-7. The builder uses at least one Impulse-provided typed tool and produces a provenance-bearing artifact.
-8. Project verification runs and records exact evidence.
-9. The supervisor recommends acceptance, requests changes, or escalates based on evidence; the
-   operator explicitly approves or rejects an accept recommendation.
-10. Only accepted, verified outcomes become scoped durable memory, with an inspectable reason and source.
-
-The explicit Builder preflight and daemon-owned governed producers establish the authoritative
-parts of steps 3-5 and 8-9: registration precedes PTY creation, exact criteria and a clean Git
-subject are bound to the task, the daemon derives claim and verification truth, strict API review is
-revision-bound, runtime exit is never acceptance, and the operator owns final approval. Real-process
-and restart tests prove the CLI claim and detached verification path; handler tests prove strict
-Supervisor binding and operator-only acceptance. Accepted tasks now deterministically stage a
-review-only candidate without changing curated memory. The next forcing proof must compose launched
-Builder and Supervisor runtimes through that complete path and observe exactly one candidate.
-Turning a reviewed candidate into scoped semantic memory remains a later explicit operator action,
-so step 10 and the complete multi-runtime workflow are not yet closed.
-
-## Success criteria
-
-- A user can manage heterogeneous coding agents without losing their terminal-native strengths.
-- Role, runtime, instance, session, task, pane, workspace, and project are never conflated in state or UI.
-- Mandatory role requirements block incompatible launches; degradation is explicit.
-- The daemon remains the operational source of truth across cockpit restarts.
-- Project context, credentials, memory, and messages do not silently cross scopes.
-- Tool calls and supervisor interventions are auditable and understandable.
-- Completion status is backed by observed evidence rather than worker prose.
-- The control plane remains locally operable and its overhead is measured before performance claims.
+Impulse is a local, Rust, terminal-native application that runs coding agents (its own, Ion, and
+external ones such as Claude Code and Codex), keeps their context small, bounds what they can
+touch, and accepts their work only on observed evidence and an operator's decision.
+
+## Thesis
+
+**Computing 3.0 is objective-compiled computing.** In the first era people wrote instructions; in
+the second, models wrote them from prompts. In the third, a person states an objective with
+acceptance criteria, and a harness compiles it into bounded agent work, checks the result against
+the criteria, and records the judgment that accepted it. The objective, not the prompt, is the
+source program.
+
+**Impulse is meant to become a compiler for professional judgment.** A professional's judgment is
+the part of the work that survives tool changes: what counts as done, what is too risky to run, what
+evidence is enough, what is worth remembering. Impulse turns each of those into a typed, versioned
+artifact the harness enforces instead of prose an agent may ignore.
+
+What already compiles, and where:
+
+| Judgment | Compiled into | Status |
+|---|---|---|
+| What counts as done | Exact acceptance criteria bound to a governed task (`rust_workspace_v1`, ADR-0011, ADR-0012) | [built] |
+| What evidence is enough | Daemon-run detached verification of the claimed commit (ADR-0012, ADR-0019) | [built] |
+| Whether the work is good | Supervisor review bound to task revision, claim, verification, and criteria digest (ADR-0012) | [built] |
+| Who may accept | Operator-class connections only (ADR-0018) | [built] |
+| What is too risky to run | Guardrail rules scanned before every gated Ion tool call (`src/guardrail`, `ion_repl::chat`) | [built] |
+| How long work may run | Typed loop budgets with termination evidence (ADR-0017) | [built] |
+| What is worth remembering | Review-only memory candidates, promoted or dismissed by the operator (ADR-0013, ADR-0020) | [built, daemon endpoint and UI not built] |
+| Which model does which step | Harness-owned step model and typed endpoints (ADR-0015, ADR-0022) | [stage 1 built] |
+
+The thesis stays a thesis until one objective runs end to end through launched Builder and
+Supervisor runtimes and produces exactly one accepted memory candidate. That proof is the next
+forcing slice ([First complete slice](#first-complete-slice)).
+
+## Two modes
+
+| Mode | Purpose | Status |
+|---|---|---|
+| `impulse run` | One person and Ion, Impulse's own coding agent, in one workspace | [not built as a subcommand] Today Ion ships as the `ion` binary (`src/bin/ion.rs`, REPL in `src/ion_repl/`). `impulse-rs run` opens the ratatui workbench. |
+| `impulse harness` | An orchestrator that delegates to Ion, Claude Code, or Codex workers under governance | [not built] Today the daemon and the Dioxus cockpit launch governed Builder panes (ADR-0010, ADR-0019) and the operator orchestrates by hand. |
+
+The two modes share one daemon, one `.impulse/` directory, one governed-task store, and one
+blackboard. The orchestrator's tool surface is fixed at five names (below); the rest of the
+catalog is reached through search.
+
+## MCP on the wire, CLI in the sandbox
+
+Across a process boundary Impulse speaks a typed protocol. Inside an agent's sandbox it gives the
+agent a command line.
+
+- **On the wire [built].** The daemon serves a versioned JSON-line protocol over a Unix socket
+  (`PROTOCOL_VERSION` 9, `impulse-ops/src/lib.rs`, `docs/IPC-PROTOCOL.md`). `impulse-rs mcp` serves
+  the dynamic tool registry over MCP on stdio or loopback TCP (`src/mcp/server.rs`), with bounded
+  request reads. The Dioxus cockpit exposes its own MCP surface (`impulse-desktop/src/mcp.rs`).
+- **In the sandbox [built].** A governed Builder pane receives `IMPULSE_CONTROL_CLI` and runs
+  `"$IMPULSE_CONTROL_CLI" --daemon governed-claim`, `governed-verify`, and `governed-review`. A
+  command costs the agent no tool schema, works in any harness that can run a shell, and documents
+  itself with `--help`.
+
+The reason is the context tax. Every MCP tool a model is offered costs its schema on every turn,
+whether it is used or not. A CLI costs nothing until it is called.
+
+## Context: the blackboard and demand paging
+
+Large results do not belong in a model's context, and a model does not need every tool schema on
+every turn.
+
+- **Blackboard [built, ADR-0023].** `.impulse/blackboard.db` (SQLite through `rusqlite`) holds
+  off-context results keyed by `task_id`, with TTL purge on open, at daemon start, and on an
+  interval. Live keys are insert-only (`src/blackboard/mod.rs`).
+- **Spill [built].** Any Ion tool result over 4 KiB (configurable, 1 KiB to 1 MiB) is stored and
+  replaced by a reference with a preview and a hash; the guard scan still sees the full output
+  (`ion_repl::chat::ReplToolExecutor::finish_result`). A governed claim summary over the 4 KiB
+  claim limit is stored in the canonical project's blackboard and travels as a `blackboard:`
+  artifact id.
+- **Demand paging [built].** `blackboard_fetch` returns one window of at most 8 KiB, optionally
+  narrowed by an RFC 6901 JSON pointer (`src/blackboard/projection.rs`). Context compaction keeps
+  the key, so a spilled result stays reachable after its reference leaves history.
+- **Three meta-tools [built].** `blackboard_store`, `blackboard_fetch`, and `search_tools`
+  (`src/ion_repl/tool_blackboard.rs`, `tool_search.rs`). `search_tools` returns names and one-line
+  descriptions, and schemas only when asked.
+- **Five core tools [defined, not enforced].** `ORCHESTRATOR_TOOL_SURFACE`
+  (`src/ion_repl/registry.rs`) fixes the orchestrator at `search_tools`, `blackboard_store`,
+  `blackboard_fetch`, `delegate_task`, `approve_gate`, with a test that keeps it at five.
+  `delegate_task` and `approve_gate` are reserved names. Ion still advertises its full registry
+  every turn; adding tools to a turn only after `search_tools` finds them is not built.
+
+## The four-layer truth model
+
+Completion is never a worker's word. Four layers, each owned by a different party, each recorded:
+
+1. **Claim [built].** The worker says what it did. Builder claims go through the CLI or Ion's
+   confirmation-gated `governed_submit_claim`; the daemon derives actor and Git subject itself
+   (`src/ion_repl/tool_claim.rs`, ADR-0012).
+2. **Evidence [built].** The daemon verifies the claimed commit in a detached worktree with fixed
+   Rust commands. A staged Builder worktree is materialized, promoted, or discarded only by the
+   daemon (ADR-0019, protocol v9). Durable producer reservations reconcile interrupted runs
+   (`PRODUCER_RESERVATIONS.json`).
+3. **Supervisor [built].** Review is API-only, tool-free, history-free, and temperature-zero, bound
+   to the task revision, claim, verification, subject, and acceptance-criteria digest. A generic
+   external harness fails closed because it cannot guarantee a read-only turn (ADR-0012).
+4. **Operator [built].** Acceptance requires an operator-class connection, established by peer
+   credentials plus a per-daemon-run capability (ADR-0018). Promote and Discard for staged work are
+   operator controls in the cockpit (ADR-0019).
+
+Runtime exit is never acceptance, and an accepted run only proposes memory (ADR-0013).
+
+## Three-layer isolation
+
+| Layer | What it bounds | Status |
+|---|---|---|
+| **Capability sandbox** | What code and tools can reach | [built] `calculator` and `python_exec` run in the in-process Monty interpreter with no filesystem, network, process, or host-function access, 64 MiB and 5 s limits (ADR-0021). Ion's bridged tools run under sandbox roots: writes only in the repo root, reads in the repo root plus explicit `/allow` grants (`ReplContext::sandbox_tool_context`). Photon reads through a `cap-std` capability. `bash_exec` gets a scrubbed environment allowlist (`src/tooling/env_scrub.rs`) and a whole-process-group kill on timeout. |
+| **MicroVM** | What a shell command or verification can touch at the OS level | [not built] There is no Firecracker integration. Today: a staged Builder works in its own Git worktree (ADR-0019), and verification "executes host-trusted Rust code and is not an OS sandbox" (`CLAUDE.md`). Shell commands from Ion require confirmation, with guardrail-driven escalation to a typed `CONFIRM`. |
+| **Budget caps** | How long and how much | [partly built] Every Impulse-owned loop runs under a `LoopContract`: Ion defaults to 10 rounds and 180 s with repeated-call and same-error breakers (ADR-0017, `src/loop_contract.rs`). Photon is capped at 5 runs per session and half Ion's wall clock (`PHOTON_SESSION_LIMIT`). Daemon harness turns time out at 120 s. Token and money budgets are not built. |
+
+## Runtimes and models
+
+- **Ion [built].** Impulse's own coding agent: REPL, tool-calling loop, confirmation gate,
+  untrusted-output envelope, sandbox roots, loop contract (`src/ion_repl/`, `src/llm_backends/`).
+- **Photon [built, ADR-0022 stage 1].** A disposable read-only subagent Ion calls inside one tool
+  call: a fresh `min-agent` run with `list_files`, `read_file`, `search_text`, keeping no
+  transcript, memory, or session (`src/ion_repl/tool_photon.rs`, default feature
+  `photon-subagent`).
+- **External harnesses [built].** Claude Code, Codex, Gemini CLI, and Cursor from one agent
+  registry (`impulse-ops/src/agent_registry.rs`), launched into PTYs with a controlled environment.
+  Impulse cannot see or replace their internal loops; governance of them is stated by observed
+  enforcement, never by parity claims.
+- **Typed model endpoints [stage 1 built, ADR-0022].** An endpoint is a wire protocol
+  (`anthropic_messages`, `openai_chat`, `openai_responses`), a base URL with its path, auth by
+  environment-variable name, a model id, and an output limit, in named `config.json` profiles
+  assigned to roles (`src/model_endpoint/`). Photon resolves endpoints today. Ion's own provider
+  path, a provider trait with capability metadata, one retry/fallback policy, and local-first
+  routing are stage 2 [not built].
+- **Step model [built, ADR-0015].** The harness chooses the model for each step, including
+  escalation after a verifier failure (`impulse-step-model`).
+
+## Memory
+
+Memory is a governed service, not a transcript. `GENOME.md` is hand-curated; `HISTORY.jsonl` is an
+append-only session log; FTS5 and semantic retrieval index both (`src/retrieval/`). Accepted runs
+stage review-only candidates (ADR-0013); promotion writes `MEMORY.jsonl` and a separate
+`GENOME_PROJECTION.md` (ADR-0020) [state and types built; the daemon decision endpoint, cockpit
+controls, and Ion integration are not built]. The blackboard is working state, not memory: it
+expires.
+
+## Surfaces
+
+- **Dioxus cockpit [built, ADR-0008].** `impulse-desktop`, Dioxus 0.6.3 with an xterm.js terminal
+  bridge, governed-task evidence and decision cards, Promote and Discard controls. It projects
+  daemon truth and owns none.
+- **ratatui workbench and CLI [built].** `impulse-rs run` and the `impulse-rs` subcommands.
+- **egui [legacy].** Removed from the workspace on 2026-04-17; source frozen.
+
+## First complete slice
+
+The thesis is proven by one objective, not by a partial version of every subsystem:
+
+1. Register a project and an objective with exact acceptance criteria. [built]
+2. Launch a Builder (Ion, Claude Code, or Codex) into a staged worktree under policy. [built]
+3. The Builder works, keeping large results on the blackboard. [built for Ion]
+4. The Builder claims; the daemon verifies the claimed commit. [built]
+5. A launched Supervisor runtime reviews against the criteria digest. [API review built; launched
+   Supervisor runtime not proven end to end]
+6. The operator accepts; the daemon promotes the staged work. [built]
+7. Exactly one memory candidate appears, and the operator promotes or dismisses it. [candidate
+   built; promotion endpoint and controls not built]
+
+Steps 5 and 7 are the open work. Until they close, the vertical slice is not complete.
+
+## Built today
+
+| Area | Evidence |
+|---|---|
+| Daemon, protocol v9, governed tasks and producers | `src/daemon/`, `impulse-ops/src/governed_task.rs`, ADR-0011, ADR-0012, ADR-0019 |
+| Actor provenance | `src/daemon/actor_provenance.rs`, ADR-0018 |
+| Ion and its tool floor | `src/ion_repl/`, ADR-0017 |
+| Photon | `src/ion_repl/tool_photon.rs`, ADR-0022 |
+| Typed endpoints, stage 1 | `src/model_endpoint/`, ADR-0022 |
+| Blackboard, spill, paging, meta-tools | `src/blackboard/`, `src/ion_repl/tool_blackboard.rs`, `tool_search.rs`, ADR-0023 |
+| Monty sandbox | `src/tools/python.rs`, ADR-0021 |
+| Memory candidates and promotion state | `src/state/`, ADR-0013, ADR-0020 |
+| Step model | `impulse-step-model/`, ADR-0015 |
+| Tests | 3,225 passed, 0 failed, 10 ignored on the evidence branch above; property and fuzz harnesses over governed parsers (PR #59) |
+
+## Not built
+
+- `impulse run` and `impulse harness` as the two top-level modes.
+- The orchestrator role: `delegate_task`, `approve_gate`, and tool advertisement driven by
+  `search_tools`.
+- Firecracker (or any microVM) isolation for shell commands and verification.
+- Token and money budgets.
+- ADR-0022 stage 2: Ion on typed endpoints, a provider trait, capability metadata, one endpoint
+  policy, local-first routing.
+- The memory decision endpoint, cockpit controls, and Ion memory integration (ADR-0020).
+- A daemon IPC endpoint for the blackboard, so external harnesses and the cockpit can use it.
+- A launched Supervisor runtime proven end to end through the governed path.
+- General role contracts and capability negotiation across runtimes.
+- Cross-platform proof beyond macOS for the cockpit.
 
 ## Non-goals
 
-- Reimplementing every proprietary coding harness inside Impulse.
-- Pretending all runtimes expose equivalent control or tool semantics.
+- Reimplementing proprietary coding harnesses inside Impulse.
+- Claiming equal control over every runtime.
 - Replacing terminal workflows with a conventional IDE.
-- Making the Dioxus component tree the source of backend truth.
-- Storing every terminal token forever or promoting every agent statement to memory.
-- Giving a continuous supervisor unrestricted builder permissions.
-- Building every role, provider, or multi-project feature before one complete vertical slice works.
+- Making the cockpit's component tree the source of truth.
+- Keeping every token forever, or promoting every agent statement to memory.
+- Giving a supervisor unrestricted builder permissions.
+- Building every role, provider, or multi-project feature before the first complete slice works.
 
-## Open ADR decisions
+## Open decisions
 
-ADR-0010 accepts the product-role/task launch preflight, ADR-0011 accepts the daemon-owned
-governed-task lifecycle, ADR-0012 accepts the first daemon-owned producer profile, and ADR-0013
-accepts the deterministic pending-candidate projection. The following broader decisions remain open
-and must be resolved before schema-specific documents split out:
+1. Hierarchy and durable ids for project, workspace, role, runtime, instance, session, and pane,
+   plus governed-task reassignment and resume.
+2. The runtime-adapter contract and capability negotiation, including enforcement strength.
+3. The orchestrator role contract: what `delegate_task` and `approve_gate` may do, and how a
+   delegated worker's claim enters the four-layer model.
+4. Memory promotion authority, semantic validation, correction, and forgetting (ADR-0020 open
+   items).
+5. Credential grants, revocation, and cross-project prevention.
+6. The microVM boundary: which commands and verifications must run inside it.
+7. Token and money budgets, and measured control-plane overhead targets.
+8. Whether any low-risk verification profile may relax operator-required acceptance.
+9. ADR-0016 (governed harness evolution, drafted on `agent/claude-harness-evolution-20260826`,
+   never merged): whether the harness may propose changes to itself from execution evidence.
 
-1. Remaining hierarchy/cardinality and durable ids for project, workspace, role, runtime, instance,
-   session, pane, and supervisor scope, plus governed-task reassignment/resume.
-2. Minimum runtime-adapter interface and semantics for optional/emulated operations.
-3. Generalized and dynamic capability negotiation beyond the static desktop preflight, including
-   discovery, attestation freshness, emulation, and post-launch re-evaluation.
-4. Role contract composition, override, persistence, and migration.
-5. Cross-agent message routing, direct worker communication, acknowledgement, and isolation.
-6. Candidate promotion/dismissal authorization plus memory authorship, semantic verification,
-   conflict resolution, correction, forgetting, and inheritance.
-7. Credential grants, revocation, audit, redaction, and cross-project prevention.
-8. Supervisor scheduling, attention summaries, context budget, and intervention priority.
-9. Verification profiles and whether any future low-risk policy may relax the current
-   operator-required final approval rule.
-10. Resource budgets and measurable control-plane performance targets.
-
-Until those decisions land, do not create separate `ROLES.md`, `RUNTIMES.md`, `SUPERVISOR.md`, or a
-replacement architecture schema. This north star, the canonical contract, and one future ADR set
-are the compounding sources of truth.
+Until these land as ADRs, do not split out `ROLES.md`, `RUNTIMES.md`, or a replacement
+architecture schema. This file, the canonical contract, and the ADR set are the sources of truth.

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -262,6 +262,32 @@ struct EmbedRequest<'a> {
 struct EmbedResponse {
     vectors: Vec<Vec<f32>>,
     dim: usize,
+    #[serde(default)]
+    backend: Option<String>,
+}
+
+const FAKE_EMBED_BACKEND: &str = "deterministic-sha256-fallback";
+
+fn reject_or_warn_fake_embedding_backend(backend: Option<&str>) -> Result<(), EmbeddingError> {
+    if backend != Some(FAKE_EMBED_BACKEND) {
+        return Ok(());
+    }
+    if std::env::var("IMPULSE_EMBED_ALLOW_FAKE")
+        .ok()
+        .is_some_and(|value| value == "1")
+    {
+        tracing::warn!(
+            backend = FAKE_EMBED_BACKEND,
+            "semantic embeddings degraded to deterministic SHA-256 vectors; search quality is not semantic"
+        );
+        return Ok(());
+    }
+    Err(EmbeddingError {
+        kind: EmbeddingFailureKind::InvalidOutput,
+        message: format!(
+            "embedding script used {FAKE_EMBED_BACKEND}; install sentence-transformers or set IMPULSE_EMBED_ALLOW_FAKE=1 for development-only fallback"
+        ),
+    })
 }
 
 fn resolve_script_path() -> Option<PathBuf> {
@@ -336,21 +362,47 @@ fn embed_texts_with(
             ),
         })?;
 
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(&payload).map_err(|e| EmbeddingError {
-            kind: EmbeddingFailureKind::StdinWriteFailed,
-            message: format!(
-                "failed to write embedding request to subprocess stdin: {}",
-                e
-            ),
-        })?;
-    }
+    // Drain stdout and stderr while the child runs. The script prints one
+    // JSON line of floats per text (about 8 KB each), so a real batch is far
+    // larger than a pipe buffer; with nobody reading, the child blocked in
+    // `print`, never exited, and every batch "timed out" after the deadline.
+    let drain = |stream: Option<Box<dyn Read + Send>>| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout_reader = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let stderr_reader = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+
+    // Written on its own thread so the deadline below also covers a child
+    // that never reads its input: written inline, a request larger than a
+    // pipe buffer blocked here with no timeout. A failed write used to
+    // return at once, leaving the child unreaped and its stderr unread; its
+    // result is now checked after the child exits.
+    let stdin_writer = child
+        .stdin
+        .take()
+        .map(|mut stdin| thread::spawn(move || stdin.write_all(&payload)));
 
     let timeout = Duration::from_secs(timeout_secs);
     let deadline = Instant::now() + timeout;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -372,12 +424,19 @@ fn embed_texts_with(
                 });
             }
         }
-    }
+    };
 
-    let output = child.wait_with_output().map_err(|e| EmbeddingError {
-        kind: EmbeddingFailureKind::ProcessFailed,
-        message: format!("failed reading embedding subprocess output: {}", e),
-    })?;
+    let joined = |reader: thread::JoinHandle<Vec<u8>>| {
+        reader.join().map_err(|_| EmbeddingError {
+            kind: EmbeddingFailureKind::ProcessFailed,
+            message: "embedding subprocess output reader panicked".to_string(),
+        })
+    };
+    let output = std::process::Output {
+        status,
+        stdout: joined(stdout_reader)?,
+        stderr: joined(stderr_reader)?,
+    };
 
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
@@ -386,12 +445,23 @@ fn embed_texts_with(
             message: format!("embedding subprocess failed: {}", err.trim()),
         });
     }
+    if let Some(Ok(Err(error))) = stdin_writer.map(|writer| writer.join()) {
+        return Err(EmbeddingError {
+            kind: EmbeddingFailureKind::StdinWriteFailed,
+            message: format!(
+                "failed to write embedding request to subprocess stdin: {error}; stderr: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
 
     let response: EmbedResponse =
         serde_json::from_slice(&output.stdout).map_err(|e| EmbeddingError {
             kind: EmbeddingFailureKind::InvalidOutput,
             message: format!("failed to parse embedding subprocess JSON output: {}", e),
         })?;
+
+    reject_or_warn_fake_embedding_backend(response.backend.as_deref())?;
 
     if response.vectors.len() != texts.len() {
         return Err(EmbeddingError {
@@ -643,6 +713,23 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_fake_embedding_backend_without_allow_env() {
+        let _guard = retrieval_embedding_env_lock();
+        std::env::remove_var("IMPULSE_EMBED_ALLOW_FAKE");
+        let err = reject_or_warn_fake_embedding_backend(Some(FAKE_EMBED_BACKEND)).unwrap_err();
+        assert_eq!(err.kind, EmbeddingFailureKind::InvalidOutput);
+        assert!(err.message.contains(FAKE_EMBED_BACKEND));
+    }
+
+    #[test]
+    fn test_allow_fake_embedding_backend_with_env() {
+        let _guard = retrieval_embedding_env_lock();
+        std::env::set_var("IMPULSE_EMBED_ALLOW_FAKE", "1");
+        assert!(reject_or_warn_fake_embedding_backend(Some(FAKE_EMBED_BACKEND)).is_ok());
+        std::env::remove_var("IMPULSE_EMBED_ALLOW_FAKE");
+    }
+
+    #[test]
     fn test_embed_texts_times_out_and_kills_process() {
         let _guard = retrieval_embedding_env_lock();
         if std::process::Command::new("python3")
@@ -682,5 +769,76 @@ print(json.dumps({"vectors": [[1.0]], "dim": 1}))
             "expected timeout message, got: {}",
             err.message
         );
+    }
+
+    /// Refutation review of e1698f8: the request was written before the
+    /// deadline started, so a child that does not read its input held the
+    /// call past the timeout.
+    #[test]
+    fn test_embed_timeout_covers_a_child_that_does_not_read_its_input() {
+        let _guard = retrieval_embedding_env_lock();
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let script_path = temp.path().join("deaf_embed.py");
+        fs::write(
+            &script_path,
+            "import sys, time\ntime.sleep(5)\nsys.stdin.read()\nprint('{\"vectors\": [[1.0]], \"dim\": 1}')\n",
+        )
+        .unwrap();
+
+        std::env::set_var("IMPULSE_EMBED_SCRIPT", &script_path);
+        let cfg = Config::default();
+        let started = std::time::Instant::now();
+        // Far larger than a pipe buffer, so writing it blocks until read.
+        let result = embed_texts(&cfg, &["x".repeat(400_000)], 1);
+        std::env::remove_var("IMPULSE_EMBED_SCRIPT");
+
+        assert_eq!(result.unwrap_err().kind, EmbeddingFailureKind::Timeout);
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+    }
+
+    /// Review P2: stdout was not read until the child exited, so a reply
+    /// larger than a pipe buffer blocked the child forever and every real
+    /// batch timed out.
+    #[test]
+    fn test_embed_reads_a_reply_larger_than_a_pipe_buffer() {
+        let _guard = retrieval_embedding_env_lock();
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let script_path = temp.path().join("big_embed.py");
+        fs::write(
+            &script_path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+texts = json.loads(sys.stdin.read())["texts"]
+dim = 384
+print(json.dumps({"vectors": [[0.125] * dim for _ in texts], "dim": dim}))
+"#,
+        )
+        .unwrap();
+
+        std::env::set_var("IMPULSE_EMBED_SCRIPT", &script_path);
+        let cfg = Config::default();
+        let texts: Vec<String> = (0..64).map(|i| format!("text {i}")).collect();
+        let result = embed_texts(&cfg, &texts, 30);
+        std::env::remove_var("IMPULSE_EMBED_SCRIPT");
+
+        let vectors = result.expect("a large reply must be read, not time out");
+        assert_eq!(vectors.len(), 64);
+        assert!(vectors.iter().all(|v| v.len() == 384));
     }
 }

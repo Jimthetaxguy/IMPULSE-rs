@@ -25,6 +25,7 @@ use serde_json::Value;
 
 use crate::host_commands::{McpInvokeRequest, RegisterWorkspaceRequest};
 use crate::mcp::{McpInvocation, ReviewDecision, ReviewQueueItem, ReviewQueueStatus};
+use crate::native::{NativeIslandKind, NativeIslandRequest, NativeIslandResult};
 use crate::runtime::{
     default_builtin_mcp_tools, AgentPlatformId, AgentRuntimeSnapshot, AgentSpawnRequest,
     BuiltInMcpTool, WorkspaceTarget,
@@ -238,6 +239,22 @@ const DESKTOP_EVENT_BRIDGE_SCRIPT: &str = concat!(
     } catch (error) {
       forward("bridge_status", {
         status: "register_workspace_failed",
+        reason: String(error),
+        request,
+      });
+      throw error;
+    }
+  };
+  window.__impulseOpsBridge.pickWorkspaceFolder = async (request) => {
+    if (!invoke) {
+      forward("bridge_status", { status: "workspace_folder_pick_failed", reason: "host invoke API unavailable" });
+      return null;
+    }
+    try {
+      return await invoke("native_island_request", { request });
+    } catch (error) {
+      forward("bridge_status", {
+        status: "workspace_folder_pick_failed",
         reason: String(error),
         request,
       });
@@ -588,6 +605,71 @@ pub fn mcp_invoke_bridge_script(request: &McpInvokeRequest) -> String {
   return await bridge.invokeMcp({payload});
 }})();"#
     )
+}
+
+pub fn workspace_folder_pick_bridge_script(request: &NativeIslandRequest) -> String {
+    let payload = serde_json::to_string(request).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        r#"(async () => {{
+  const bridge = window.__impulseOpsBridge;
+  if (!bridge?.pickWorkspaceFolder) {{
+    console.warn("impulse workspace folder picker bridge unavailable");
+    return null;
+  }}
+  return await bridge.pickWorkspaceFolder({payload});
+}})();"#
+    )
+}
+
+/// Build the request for a "Browse…" click: a fresh correlation id, the
+/// `FileOpenPanel` island kind, and a small payload the native picker reads
+/// for the dialog title / starting directory. `current_root` only seeds
+/// `starting_directory` when it is non-empty, so an in-progress typed value
+/// isn't silently discarded by an empty default.
+pub fn workspace_folder_pick_request(current_root: &str) -> NativeIslandRequest {
+    let mut payload = serde_json::json!({ "title": "Select a project folder" });
+    let trimmed = current_root.trim();
+    if !trimmed.is_empty() {
+        payload["starting_directory"] = Value::String(trimmed.to_string());
+    }
+    NativeIslandRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        kind: NativeIslandKind::FileOpenPanel,
+        payload,
+    }
+}
+
+/// Parse the JS bridge's return value for a folder-pick round trip. Never
+/// panics:
+/// - `Ok(Some(path))` — the user picked a folder.
+/// - `Ok(None)` — the dialog was cancelled, or the host reported
+///   `handled: false` (bridge/feature unavailable), or the bridge itself
+///   returned `null` — all three are "nothing to apply," not failures the
+///   caller must react to differently.
+/// - `Err(reason)` — the eval bridge rejected, or the payload could not be
+///   parsed as a `NativeIslandResult`.
+///
+/// Takes `Result<Value, String>` rather than Dioxus's own `EvalError` so this
+/// function has zero Dioxus-runtime dependency and is trivially unit
+/// testable; callers convert with `.map_err(|error| error.to_string())`.
+pub fn parse_workspace_folder_pick_result(
+    eval_result: Result<Value, String>,
+) -> Result<Option<String>, String> {
+    let value = eval_result?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    let result: NativeIslandResult = serde_json::from_value(value)
+        .map_err(|error| format!("invalid native_island_request result: {error}"))?;
+    if !result.handled {
+        return Ok(None);
+    }
+    let path = result
+        .payload
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    Ok(path)
 }
 
 pub fn agent_launch_bridge_script(request: &AgentSpawnRequest) -> String {
@@ -1282,11 +1364,32 @@ fn WorkspaceLaunchPanel(
             div { class: "workspace-launch-grid",
                 label { class: "workspace-field wide",
                     span { "Folder path" }
-                    input {
-                        r#type: "text",
-                        placeholder: "Absolute project folder",
-                        value: "{register_root}",
-                        oninput: move |evt| register_root.set(evt.value()),
+                    div { class: "workspace-field-inline",
+                        input {
+                            r#type: "text",
+                            placeholder: "Absolute project folder",
+                            value: "{register_root}",
+                            oninput: move |evt| register_root.set(evt.value()),
+                        }
+                        button {
+                            class: "invoke-button secondary",
+                            "data-action": "browse-workspace-folder",
+                            "aria-label": "Browse for a folder",
+                            onclick: move |_| {
+                                let current_root = register_root();
+                                let request = workspace_folder_pick_request(&current_root);
+                                spawn(async move {
+                                    let script = workspace_folder_pick_bridge_script(&request);
+                                    let eval_result = document::eval(&script)
+                                        .await
+                                        .map_err(|error| error.to_string());
+                                    if let Ok(Some(path)) = parse_workspace_folder_pick_result(eval_result) {
+                                        register_root.set(path);
+                                    }
+                                });
+                            },
+                            "Browse…"
+                        }
                     }
                 }
                 label { class: "workspace-field",
@@ -1760,9 +1863,6 @@ fn OperatorBoard(
                                 armed_discard.read().as_deref() == Some(task_key.as_str());
                             let ack_notice = governed_acks.get(&task_key).cloned();
                             let dismiss_key = task_key.clone();
-                            // Computed before `rsx!`: in release builds Dioxus 0.6
-                            // evaluates a formatted `key:` after the props move
-                            // `task`, which fails to borrow-check (E0382).
                             let card_key = format!("{}:{}", task.id, task.revision);
                             rsx! {
                                 GovernedTaskCard {

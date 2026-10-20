@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use crate::tooling::error::ToolError;
 use crate::tooling::traits::*;
 
-/// Parses any supported Office document (XLSX, XLS, CSV, DOCX) and returns extracted content.
+/// Parses any supported Office document (XLSX, CSV, DOCX) and returns extracted content.
 ///
 /// This is the main entry point for document processing — it auto-detects format
-/// from file extension and delegates to the appropriate parser.
+/// from file extension and delegates to the appropriate parser, on the blocking
+/// pool and under the bounds in office::bounded. Legacy XLS is refused.
 pub struct DocumentParseTool;
 
 #[async_trait]
@@ -22,8 +23,7 @@ impl DynamicTool for DocumentParseTool {
         ToolDescriptor {
             id: "document_parse".into(),
             name: "Document Parse".into(),
-            description: "Parse Office documents (XLSX, XLS, CSV, DOCX) and extract text content"
-                .into(),
+            description: "Parse Office documents (XLSX, CSV, DOCX) and extract text content".into(),
             version: "0.1.0".into(),
             category: ToolCategory::Document,
             params: vec![ToolParam {
@@ -61,7 +61,14 @@ impl DynamicTool for DocumentParseTool {
             .ok_or_else(|| ToolError::InvalidParams("missing 'path' string parameter".into()))?;
         let path = PathBuf::from(path_str);
 
-        match crate::office::parse_document(&path) {
+        // Parsing is synchronous, so it runs on the blocking pool; the office
+        // bounds cap how long it can take.
+        let parsed = tokio::task::spawn_blocking(move || crate::office::parse_document(&path))
+            .await
+            .map_err(|e| {
+                ToolError::ExecutionFailed(format!("document_parse parse task failed: {e}"))
+            })?;
+        match parsed {
             Ok(result) => {
                 let mut metadata = std::collections::HashMap::new();
                 metadata.insert("document_type".to_string(), result.document_type.clone());
@@ -136,6 +143,22 @@ mod tests {
         let tool = DocumentParseTool;
         let params = serde_json::json!({"path": "/nonexistent/file.xlsx"});
         assert!(tool.validate_params(&params).is_err());
+    }
+
+    /// The parse runs on the blocking pool, so the async runtime keeps
+    /// serving other tasks while a document is read.
+    #[tokio::test]
+    async fn test_execute_parses_off_the_async_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rows.csv");
+        std::fs::write(&path, "a,b\n1,2\n").unwrap();
+        let (result, turns) = super::super::test_support::turns_while_executing(
+            &DocumentParseTool,
+            serde_json::json!({"path": path}),
+        )
+        .await;
+        assert_eq!(result.unwrap().output["content"], "a,b\n1,2\n");
+        assert!(turns > 0, "the parse ran on the async runtime thread");
     }
 
     #[tokio::test]

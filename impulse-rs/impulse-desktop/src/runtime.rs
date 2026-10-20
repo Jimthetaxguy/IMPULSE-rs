@@ -464,6 +464,113 @@ impl Drop for DispatchReset<'_> {
     }
 }
 
+/// How many writes a pane may have queued before `write_agent` reports it
+/// as not reading its input.
+const PANE_INPUT_QUEUE: usize = 256;
+/// How many bytes a pane may have queued; with only a count, a caller
+/// writing large pastes to a pane that is not reading could queue without
+/// bound. One write of any size still goes through when nothing is queued.
+const PANE_INPUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// A pane's input path: a bounded queue drained by one writer thread, so the
+/// PTY write, which blocks while the child is not reading, never runs on the
+/// caller's thread. The cockpit's host bridge runs commands one at a time,
+/// and a paste into a busy pane used to hold every later command, `close`
+/// included, until the write finished. One queue per pane keeps its writes
+/// in order.
+struct PaneInput {
+    sender: mpsc::SyncSender<Vec<u8>>,
+    /// The writer thread's write error, reported to later callers.
+    failure: Arc<Mutex<Option<String>>>,
+    /// Bytes queued and not yet written.
+    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl PaneInput {
+    fn spawn(
+        agent_id: &str,
+        write_queue: impulse_term::backend::WriteQueue,
+    ) -> std::io::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(PANE_INPUT_QUEUE);
+        let failure = Arc::new(Mutex::new(None));
+        let thread_failure = Arc::clone(&failure);
+        let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread_queued = Arc::clone(&queued_bytes);
+        thread::Builder::new()
+            .name(format!("pane-input-{agent_id}"))
+            .spawn(move || {
+                // Ends when the record, and with it the sender, is dropped,
+                // or when a write fails because the PTY closed.
+                while let Ok(data) = receiver.recv() {
+                    let written = write_queue.write_user_input(&data);
+                    thread_queued.fetch_sub(data.len(), std::sync::atomic::Ordering::SeqCst);
+                    if let Err(error) = written {
+                        *thread_failure
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(error.to_string());
+                        break;
+                    }
+                }
+            })?;
+        Ok(Self {
+            sender,
+            failure,
+            queued_bytes,
+        })
+    }
+
+    fn send(&self, data: Vec<u8>) -> Result<(), DesktopBridgeError> {
+        // Once the writer has failed, its error is the answer: writes it left
+        // in the channel stay counted and would read as a pane that is not
+        // reading.
+        if let Some(message) = self.writer_failure() {
+            return Err(DesktopBridgeError::TerminalWriteFailed { message });
+        }
+        let len = data.len();
+        let queued = self
+            .queued_bytes
+            .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+        if queued != 0 && queued.saturating_add(len) > PANE_INPUT_BYTES {
+            self.queued_bytes
+                .fetch_sub(len, std::sync::atomic::Ordering::SeqCst);
+            return Err(DesktopBridgeError::TerminalWriteFailed {
+                message: format!(
+                    "the pane is not reading its input; {queued} bytes are already queued"
+                ),
+            });
+        }
+        let sent = self.sender.try_send(data);
+        if sent.is_err() {
+            self.queued_bytes
+                .fetch_sub(len, std::sync::atomic::Ordering::SeqCst);
+        }
+        match sent {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(DesktopBridgeError::TerminalWriteFailed {
+                message: format!(
+                    "the pane is not reading its input; {PANE_INPUT_QUEUE} writes are already queued"
+                ),
+            }),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                Err(DesktopBridgeError::TerminalWriteFailed {
+                    message: self
+                        .writer_failure()
+                        .unwrap_or_else(|| "the pane's input writer has stopped".to_string()),
+                })
+            }
+        }
+    }
+
+    /// The writer thread's write error, once it has failed.
+    fn writer_failure(&self) -> Option<String> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
 struct RuntimeRecord {
     platform: AgentPlatformId,
     label: String,
@@ -482,6 +589,7 @@ struct RuntimeRecord {
     focused: bool,
     status: AgentStatus,
     backend: TerminalBackend,
+    input: PaneInput,
 }
 
 impl RuntimeRecord {
@@ -608,6 +716,7 @@ impl Drop for DesktopRuntimeInner {
                     GovernedTaskMutation::MarkRuntimeExited {
                         actor: governed_system_actor("desktop-runtime"),
                         reason: Some("desktop runtime shut down".to_string()),
+                        exit_kind: Default::default(),
                     },
                 ) {
                     eprintln!(
@@ -1055,6 +1164,7 @@ impl DesktopRuntime {
                     GovernedTaskMutation::MarkRuntimeExited {
                         actor: governed_system_actor("desktop-runtime"),
                         reason: None,
+                        exit_kind: Default::default(),
                     },
                 ) {
                     eprintln!(
@@ -1076,7 +1186,10 @@ impl DesktopRuntime {
             }
         });
 
-        let backend = match TerminalBackend::spawn_with_callbacks(
+        // The pane's input writer starts with the PTY, so a failure to start
+        // it takes the same cleanup path as a failed spawn (dropping the
+        // backend kills the child).
+        let spawned = TerminalBackend::spawn_with_callbacks(
             &command,
             &request.args,
             cwd.as_deref(),
@@ -1086,8 +1199,15 @@ impl DesktopRuntime {
             None,
             Some(output_callback),
             Some(exit_callback),
-        ) {
-            Ok(backend) => backend,
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|backend| {
+            PaneInput::spawn(&agent_id, backend.write_queue().clone())
+                .map(|input| (backend, input))
+                .map_err(|error| format!("could not start the pane's input writer: {error}"))
+        });
+        let (backend, input) = match spawned {
+            Ok(spawned) => spawned,
             Err(error) => {
                 self.lock_state().used_agent_ids.remove(&agent_id);
                 launch_callback_gate.open();
@@ -1199,6 +1319,7 @@ impl DesktopRuntime {
             focused: false,
             status: AgentStatus::Starting,
             backend,
+            input,
         };
         let lifecycle_guard = self
             .inner
@@ -1230,19 +1351,18 @@ impl DesktopRuntime {
     }
 
     pub fn write_agent(&self, request: AgentWriteRequest) -> Result<(), DesktopBridgeError> {
+        // Queue the bytes for the pane's writer thread and return. The PTY
+        // write blocks once the child's input queue is full (a large paste);
+        // done here, it held the runtime state lock, which every pane's
+        // output reader needs, and then the host bridge's command queue,
+        // which `close_agent` waits in. `try_send` never blocks.
         let state = self.lock_state();
         let record = state.agents.get(&request.agent_id).ok_or_else(|| {
             DesktopBridgeError::MissingTerminalSession {
                 session_id: request.agent_id.clone(),
             }
         })?;
-        record
-            .backend
-            .write_queue()
-            .write_user_input(&request.data)
-            .map_err(|error| DesktopBridgeError::TerminalWriteFailed {
-                message: error.to_string(),
-            })
+        record.input.send(request.data)
     }
 
     pub fn mutate_governed_task(
@@ -1527,6 +1647,7 @@ impl DesktopRuntime {
                     GovernedTaskMutation::MarkRuntimeExited {
                         actor: governed_system_actor("desktop-runtime"),
                         reason: Some("operator closed runtime".to_string()),
+                        exit_kind: impulse_ops::governed_task::GovernedExitKind::OperatorCancelled,
                     },
                 )
                 .err()
@@ -2525,6 +2646,7 @@ fn record_launch_abort_bound(
                 GovernedTaskMutation::MarkRuntimeExited {
                     actor: governed_system_actor("desktop-runtime"),
                     reason: Some(reason.to_string()),
+                    exit_kind: Default::default(),
                 },
             )
             .map_err(|exit_error| {
@@ -2976,6 +3098,7 @@ mod tests {
                 staged_worktree: None,
                 promotions: vec![],
                 execution_state: GovernedExecutionState::Registered,
+                exit_kind: Default::default(),
                 review_state: GovernedReviewState::AwaitingClaim,
                 claims: Vec::new(),
                 verifications: Vec::new(),
@@ -3024,11 +3147,12 @@ mod tests {
                     }
                     task.execution_state = GovernedExecutionState::LaunchFailed;
                 }
-                GovernedTaskMutation::MarkRuntimeExited { .. } => {
+                GovernedTaskMutation::MarkRuntimeExited { exit_kind, .. } => {
                     if task.execution_state != GovernedExecutionState::Running {
                         return Err("invalid runtime-exit transition".to_string());
                     }
                     task.execution_state = GovernedExecutionState::RuntimeExited;
+                    task.exit_kind = exit_kind;
                 }
                 _ => return Err("unsupported test mutation".to_string()),
             }
@@ -4447,6 +4571,156 @@ mod tests {
             runtime_weak.upgrade().is_none(),
             "PTY callbacks must not retain DesktopRuntimeInner"
         );
+    }
+
+    /// Review P1: `write_agent` held the runtime state lock across a blocking
+    /// PTY write, so a large paste into a pane whose child was not reading
+    /// froze every other runtime call, including the close that would end it.
+    #[cfg(unix)]
+    #[test]
+    fn test_blocked_write_does_not_hold_the_runtime_lock() {
+        let runtime = DesktopRuntime::default();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.args = vec!["-c".to_string(), "sleep 60".to_string()];
+        runtime
+            .spawn_agent(request)
+            .expect("spawn a child that never reads");
+
+        let writer = runtime.clone();
+        std::thread::spawn(move || {
+            // Far beyond any tty input queue: this write blocks.
+            let _ = writer.write_agent(AgentWriteRequest {
+                agent_id: "agent-1".to_string(),
+                data: b"line\n".repeat(100_000),
+            });
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let other = runtime.clone();
+        std::thread::spawn(move || {
+            let count = other.snapshot_agents().len();
+            other
+                .close_agent(TerminalCloseRequest {
+                    session_id: "agent-1".to_string(),
+                })
+                .expect("close the blocked pane");
+            let _ = done.send(count);
+        });
+        let count = finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("snapshot and close must not wait on the blocked write");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_writes_past_the_input_queue_fail_instead_of_blocking() {
+        let runtime = DesktopRuntime::default();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.args = vec!["-c".to_string(), "sleep 60".to_string()];
+        runtime
+            .spawn_agent(request)
+            .expect("spawn a child that never reads");
+
+        // The first write fills the tty and parks the pane's writer thread;
+        // the queue then takes PANE_INPUT_QUEUE more before refusing.
+        let write = |data: Vec<u8>| {
+            runtime.write_agent(AgentWriteRequest {
+                agent_id: "agent-1".to_string(),
+                data,
+            })
+        };
+        assert!(write(b"line\n".repeat(100_000)).is_ok());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let started = std::time::Instant::now();
+        let refused = (0..PANE_INPUT_QUEUE + 2)
+            .map(|_| write(b"x".to_vec()))
+            .find_map(Result::err)
+            .expect("a full queue must refuse");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            refused.to_string().contains("not reading its input"),
+            "{refused}"
+        );
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: "agent-1".to_string(),
+            })
+            .expect("close the busy pane");
+    }
+
+    /// Verification round on 0abe1a1: the queue counted writes, not bytes,
+    /// so large pastes to a pane that is not reading could queue without
+    /// bound.
+    #[test]
+    fn test_queued_input_bytes_are_bounded() {
+        let runtime = DesktopRuntime::default();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.args = vec!["-c".to_string(), "sleep 60".to_string()];
+        runtime
+            .spawn_agent(request)
+            .expect("spawn a child that never reads");
+        let chunk = vec![b'x'; 4 * 1024 * 1024];
+        let refused = (0..8)
+            .map(|_| {
+                runtime.write_agent(AgentWriteRequest {
+                    agent_id: "agent-1".to_string(),
+                    data: chunk.clone(),
+                })
+            })
+            .find_map(Result::err)
+            .expect("16 MiB of queued input must be refused well before 8 chunks");
+        assert!(
+            refused.to_string().contains("bytes are already queued"),
+            "{refused}"
+        );
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: "agent-1".to_string(),
+            })
+            .expect("close the busy pane");
+    }
+
+    /// Round 3 on 84493f1: writes a failed writer left in the channel stay
+    /// counted, so a later write was refused as "already queued" instead of
+    /// getting the writer's own error.
+    #[test]
+    fn test_pane_input_reports_the_writer_failure_before_the_byte_cap() {
+        let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(1);
+        drop(receiver);
+        let input = PaneInput {
+            sender,
+            failure: Arc::new(Mutex::new(Some(
+                "Input/output error (os error 5)".to_string(),
+            ))),
+            queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(PANE_INPUT_BYTES)),
+        };
+        assert_eq!(
+            input.send(vec![b'x'; 16]),
+            Err(DesktopBridgeError::TerminalWriteFailed {
+                message: "Input/output error (os error 5)".to_string(),
+            })
+        );
+    }
+
+    /// Verification round on af63095: a single write over the byte cap was
+    /// refused even with nothing queued, blaming a pane that was reading.
+    #[test]
+    fn test_one_large_write_goes_through_when_nothing_is_queued() {
+        let runtime = DesktopRuntime::default();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        request.args = vec!["-c".to_string(), "cat > /dev/null".to_string()];
+        runtime.spawn_agent(request).expect("spawn a reading pane");
+        let result = runtime.write_agent(AgentWriteRequest {
+            agent_id: "agent-1".to_string(),
+            data: vec![b'x'; PANE_INPUT_BYTES + 1024 * 1024],
+        });
+        assert!(result.is_ok(), "{result:?}");
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: "agent-1".to_string(),
+            })
+            .expect("close the pane");
     }
 
     #[test]

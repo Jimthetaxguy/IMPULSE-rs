@@ -1,7 +1,265 @@
 use anyhow::Result;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::{guardrail, state};
+use crate::{guardrail, state, storage};
+
+/// Largest PreToolUse payload the hook reads. Write payloads carry the whole
+/// file, so this is generous; a larger payload blocks the call.
+const MAX_HOOK_PAYLOAD_BYTES: u64 = 32 * 1024 * 1024;
+
+/// How long the hook waits for Claude Code to finish writing stdin.
+const HOOK_PAYLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Claude Code blocks a PreToolUse call only on exit code 2 (stderr goes to
+/// the model); any other non-zero code is a non-blocking error.
+const HOOK_BLOCK: i32 = 2;
+
+/// The outcome of guarding one Claude Code tool call.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct HookDecision {
+    /// 0 lets the call run; [`HOOK_BLOCK`] stops it.
+    pub exit_code: i32,
+    /// Written to stderr: the reason when blocking, a note when warning.
+    pub message: Option<String>,
+}
+
+impl HookDecision {
+    fn allow(message: Option<String>) -> Self {
+        Self {
+            exit_code: 0,
+            message,
+        }
+    }
+
+    fn block(message: String) -> Self {
+        Self {
+            exit_code: HOOK_BLOCK,
+            message: Some(message),
+        }
+    }
+}
+
+/// Decides one PreToolUse call from Claude Code's stdin payload
+/// (`{"tool_name": ..., "tool_input": {...}}`). Bash commands are checked
+/// against `bash` rules; Write, Edit, MultiEdit, and NotebookEdit content
+/// against `file-write` rules. Other tools pass. The guard fails closed: a
+/// payload it cannot read, one with no tool name, a checked tool missing the
+/// field it checks, or rules it cannot evaluate, block the call.
+pub(crate) fn decide_pre_tool_use(payload: &str, guards: &guardrail::GuardConfig) -> HookDecision {
+    let call: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(call) => call,
+        Err(error) => {
+            return HookDecision::block(format!(
+                "Impulse guard could not read the PreToolUse payload ({error}); the call is blocked"
+            ))
+        }
+    };
+    let Some(tool_name) = call["tool_name"].as_str() else {
+        return HookDecision::block(
+            "Impulse guard got a PreToolUse payload with no tool_name; the call is blocked"
+                .to_string(),
+        );
+    };
+    let input = &call["tool_input"];
+    // A checked tool without the field it checks is a payload this guard does
+    // not understand, not an empty one.
+    let required = |field: &str| input[field].as_str().map(str::to_string);
+    let (target, action) = match tool_name {
+        "Bash" => ("bash", required("command")),
+        "Write" => ("file", required("content")),
+        "Edit" => ("file", required("new_string")),
+        // Every edit must carry its new text; one without it is a payload
+        // this guard does not understand.
+        "MultiEdit" => (
+            "file",
+            input["edits"].as_array().and_then(|edits| {
+                edits
+                    .iter()
+                    .map(|edit| edit["new_string"].as_str())
+                    .collect::<Option<Vec<_>>>()
+                    .map(|texts| texts.join("\n"))
+            }),
+        ),
+        // A cell deletion carries no source and there is nothing to check;
+        // a source that is not text is not understood.
+        "NotebookEdit" => (
+            "file",
+            match input.get("new_source") {
+                None | Some(serde_json::Value::Null) => Some(String::new()),
+                Some(source) => source.as_str().map(str::to_string),
+            },
+        ),
+        _ => return HookDecision::allow(None),
+    };
+    let Some(action) = action else {
+        return HookDecision::block(format!(
+            "Impulse guard could not find the {tool_name} input it checks; the call is blocked"
+        ));
+    };
+    match guardrail::evaluate_action(&action, target, guards) {
+        Err(error) => HookDecision::block(format!(
+            "Impulse guard could not evaluate its rules ({error}); the call is blocked"
+        )),
+        Ok(results) if results.is_empty() => HookDecision::allow(None),
+        Ok(results) => {
+            let report = results
+                .iter()
+                .map(|result| result.format_human())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if guardrail::GuardEngine::has_blocking(&results) {
+                HookDecision::block(format!("Blocked by the Impulse guard:\n{report}"))
+            } else {
+                HookDecision::allow(Some(report))
+            }
+        }
+    }
+}
+
+/// The `.impulse` directory whose rules the hook applies, or the decision to
+/// block when the hook cannot tell which project it guards.
+///
+/// The installed hook names `$CLAUDE_PROJECT_DIR/.impulse`. Claude Code
+/// started in a subdirectory names one that does not exist while the
+/// project's own sits higher up, and the built-in rules alone would skip the
+/// project's custom Block rules, so the nearest enclosing one counts, up to
+/// the repository root (see [`holds_git_repository`]). An `.impulse` above
+/// the repository root never counts, so a user-level one does not either
+/// unless the home directory is itself a repository; outside a repository
+/// only the named directory counts. The nearest one wins, as a nested
+/// project's own config should; a worktree's or submodule's `.git` file ends
+/// the search, since it is a checkout of its own.
+///
+/// With none found, a set `CLAUDE_PROJECT_DIR` means the project has no rules
+/// of its own yet: the built-in rules apply, so `impulse-rs init` can run.
+/// Unset or blank, the hook names `/.impulse` and blocks.
+fn guard_impulse_dir(
+    impulse_dir: &Path,
+    project_dir: Option<&str>,
+) -> std::result::Result<PathBuf, HookDecision> {
+    if impulse_dir.is_dir() {
+        return Ok(impulse_dir.to_path_buf());
+    }
+    let named = std::path::absolute(impulse_dir).unwrap_or_else(|_| impulse_dir.to_path_buf());
+    let enclosing = named
+        .file_name()
+        .zip(named.parent())
+        .and_then(|(name, start)| {
+            let root = start.ancestors().find(|dir| holds_git_repository(dir))?;
+            start
+                .ancestors()
+                .take_while(|dir| dir.starts_with(root))
+                .map(|dir| dir.join(name))
+                .find(|candidate| candidate.is_dir())
+        });
+    if let Some(found) = enclosing {
+        return Ok(found);
+    }
+    if project_dir.is_some_and(|dir| !dir.trim().is_empty()) {
+        return Ok(named);
+    }
+    Err(HookDecision::block(format!(
+        "Impulse guard cannot tell which project it guards: CLAUDE_PROJECT_DIR is unset or empty \
+         and {} does not exist; the call is blocked",
+        impulse_dir.display()
+    )))
+}
+
+/// Whether `dir` is the root of a git checkout, by git's own rules: a `.git`
+/// directory with a `HEAD` file and `objects` and `refs` directories, or a
+/// `.git` file whose `gitdir:` names an existing directory with a `HEAD`, as
+/// a worktree or submodule has. Any `.git` entry used to count, so an empty
+/// `.git` file in a subdirectory, or a `gitdir:` naming nothing, cut the
+/// search short of the project's own `.impulse`.
+fn holds_git_repository(dir: &Path) -> bool {
+    let marker = dir.join(".git");
+    let Ok(meta) = std::fs::metadata(&marker) else {
+        return false;
+    };
+    if meta.is_dir() {
+        return marker.join("HEAD").is_file()
+            && marker.join("objects").is_dir()
+            && marker.join("refs").is_dir();
+    }
+    // Opened without blocking and checked through the open handle: a FIFO
+    // named `.git` blocked the hook in `open()` until Claude Code's timeout,
+    // after which the call ran unguarded, and checking the type before the
+    // open left a window to swap one in.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let Ok(file) = options.open(&marker) else {
+        return false;
+    };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return false;
+    }
+    let mut content = String::new();
+    if std::io::Read::read_to_string(&mut std::io::Read::take(file, 4096), &mut content).is_err() {
+        return false;
+    }
+    // Git's own format: exactly `gitdir: `, then the path to the end of the
+    // line, with only the line ending removed. A relative path is relative
+    // to `dir`; `join` keeps an absolute one.
+    content
+        .strip_prefix("gitdir: ")
+        .map(|target| target.trim_end_matches(['\r', '\n']))
+        .is_some_and(|target| !target.is_empty() && dir.join(target).join("HEAD").is_file())
+}
+
+/// Runs `impulse-rs guard --hook` and exits. It reads only `config.json`'s
+/// guardrail section (not the governed ledgers `State::new` loads), so an
+/// unrelated state problem cannot turn into an exit code Claude Code treats
+/// as "allow".
+pub fn run_guard_hook(impulse_dir: &Path) -> ! {
+    let decision = guard_hook_decision(impulse_dir);
+    if let Some(message) = &decision.message {
+        eprintln!("{message}");
+    }
+    std::process::exit(decision.exit_code)
+}
+
+fn guard_hook_decision(impulse_dir: &Path) -> HookDecision {
+    let project_dir = std::env::var("CLAUDE_PROJECT_DIR").ok();
+    let impulse_dir = match guard_impulse_dir(impulse_dir, project_dir.as_deref()) {
+        Ok(dir) => dir,
+        Err(blocked) => return blocked,
+    };
+    let config = match storage::Storage::new(impulse_dir.clone())
+        .read_json::<state::Config>("config.json")
+    {
+        Ok(config) => config,
+        Err(error) => {
+            return HookDecision::block(format!(
+                "Impulse guard could not load {}/config.json ({error:#}); the call is blocked",
+                impulse_dir.display()
+            ))
+        }
+    };
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return HookDecision::block(
+            "impulse-rs guard --hook reads a Claude Code PreToolUse payload from stdin".to_string(),
+        );
+    }
+    match super::common::read_payload_with_deadline(
+        stdin,
+        HOOK_PAYLOAD_TIMEOUT,
+        MAX_HOOK_PAYLOAD_BYTES,
+    ) {
+        Some(payload) => decide_pre_tool_use(&payload, &config.guardrails),
+        None => HookDecision::block(
+            "Impulse guard received no PreToolUse payload on stdin; the call is blocked"
+                .to_string(),
+        ),
+    }
+}
 
 /// Load the current guardrail config and confirm `rule_id` is known (either
 /// a builtin rule or an already-configured rule). Exits the process with
@@ -19,6 +277,42 @@ fn resolve_known_rule_id(state: &Arc<state::State>, rule_id: &str) -> Result<sta
         std::process::exit(1);
     }
     Ok(config)
+}
+
+/// Enables or disables `rule_id` in the configured rules. A built-in rule is
+/// disabled by a configured override entry with its id and removed again to
+/// enable it. A user-defined rule is toggled in place: replacing it with an
+/// override entry used to discard its pattern, so disabling and then
+/// enabling it deleted the rule.
+fn set_rule_enabled(rules: &mut Vec<guardrail::GuardRule>, rule_id: &str, enabled: bool) {
+    let builtin = guardrail::defaults::builtin_rules()
+        .iter()
+        .any(|rule| rule.id == rule_id);
+    // A user's own rule under a built-in id (an override with its own
+    // pattern) is toggled in place too; only the empty placeholder below is
+    // added and removed.
+    let user_rule = rules
+        .iter()
+        .any(|rule| rule.id == rule_id && !rule.pattern.is_empty());
+    if !builtin || user_rule {
+        for rule in rules.iter_mut().filter(|rule| rule.id == rule_id) {
+            rule.enabled = enabled;
+        }
+        return;
+    }
+    rules.retain(|rule| rule.id != rule_id);
+    if !enabled {
+        rules.push(guardrail::GuardRule {
+            id: rule_id.to_string(),
+            pattern: String::new(),
+            action: guardrail::GuardAction::Log,
+            target: guardrail::GuardTarget::Any,
+            reason: "Disabled by user".to_string(),
+            suggestion: None,
+            enabled: false,
+            builtin: false,
+        });
+    }
 }
 
 /// Handle the `guard` command.
@@ -55,25 +349,12 @@ pub fn handle_guard(
         }
     } else if let Some(ref rule_id) = enable {
         let mut config = resolve_known_rule_id(state, rule_id)?;
-        config
-            .guardrails
-            .rules
-            .retain(|r| r.id != *rule_id || r.enabled);
+        set_rule_enabled(&mut config.guardrails.rules, rule_id, true);
         state.update_guardrail_rules(config.guardrails.rules.clone())?;
         println!("Enabled rule: {}", rule_id);
     } else if let Some(ref rule_id) = disable {
         let mut config = resolve_known_rule_id(state, rule_id)?;
-        config.guardrails.rules.retain(|r| r.id != *rule_id);
-        config.guardrails.rules.push(guardrail::GuardRule {
-            id: rule_id.clone(),
-            pattern: String::new(),
-            action: guardrail::GuardAction::Log,
-            target: guardrail::GuardTarget::Any,
-            reason: "Disabled by user".to_string(),
-            suggestion: None,
-            enabled: false,
-            builtin: false,
-        });
+        set_rule_enabled(&mut config.guardrails.rules, rule_id, false);
         state.update_guardrail_rules(config.guardrails.rules.clone())?;
         println!("Disabled rule: {}", rule_id);
     } else if let Some(ref action_str) = action {
@@ -201,10 +482,7 @@ pub fn handle_analytics(
             }
         }
     } else {
-        println!(
-            "Unknown analytics type: {}. Available: conflicts",
-            subcommand
-        );
+        anyhow::bail!("Unknown analytics type: {subcommand}. Available: conflicts");
     }
     Ok(())
 }
@@ -218,6 +496,378 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    // ── enable / disable ──────────────────────────────────────────────────
+
+    fn custom_rule() -> guardrail::GuardRule {
+        guardrail::GuardRule {
+            id: "no-sudo".to_string(),
+            pattern: r"\bsudo\b".to_string(),
+            action: guardrail::GuardAction::Block,
+            target: guardrail::GuardTarget::Bash,
+            reason: "no sudo here".to_string(),
+            suggestion: None,
+            enabled: true,
+            builtin: false,
+        }
+    }
+
+    fn blocks(rules: &[guardrail::GuardRule], action: &str) -> bool {
+        let config = guardrail::GuardConfig {
+            rules: rules.to_vec(),
+            ..guardrail::GuardConfig::default()
+        };
+        guardrail::GuardEngine::has_blocking(
+            &guardrail::evaluate_action(action, "bash", &config).unwrap(),
+        )
+    }
+
+    /// Review P2: disabling and re-enabling a user rule deleted it.
+    #[test]
+    fn test_disable_then_enable_keeps_a_custom_rule() {
+        let mut rules = vec![custom_rule()];
+        set_rule_enabled(&mut rules, "no-sudo", false);
+        assert!(!blocks(&rules, "sudo rm x"));
+        set_rule_enabled(&mut rules, "no-sudo", true);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].pattern, custom_rule().pattern);
+        assert!(blocks(&rules, "sudo rm x"));
+    }
+
+    /// Refutation review of c2afe88: a user's override of a built-in rule
+    /// (same id, own pattern) was deleted by disable then enable.
+    #[test]
+    fn test_disable_then_enable_keeps_a_users_override_of_a_builtin_rule() {
+        let mut rules = vec![guardrail::GuardRule {
+            id: "block-force-push-main".to_string(),
+            pattern: "custom-pattern".to_string(),
+            action: guardrail::GuardAction::Block,
+            target: guardrail::GuardTarget::Bash,
+            reason: "mine".to_string(),
+            suggestion: None,
+            enabled: true,
+            builtin: false,
+        }];
+        set_rule_enabled(&mut rules, "block-force-push-main", false);
+        assert_eq!(rules.len(), 1);
+        assert!(!rules[0].enabled);
+        set_rule_enabled(&mut rules, "block-force-push-main", true);
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].pattern, "custom-pattern");
+        assert!(rules[0].enabled);
+    }
+
+    /// Refutation review of c2afe88: these payloads were allowed (exit 0).
+    #[test]
+    fn test_hook_blocks_payloads_it_does_not_understand() {
+        let guards = guardrail::GuardConfig::default();
+        for payload in [
+            "{}",
+            "null",
+            r#"{"name": "Bash", "input": {"command": "ls"}}"#,
+            r#"{"tool_name": 7}"#,
+            r#"{"tool_name": "Bash", "tool_input": {}}"#,
+            r#"{"tool_name": "Write", "tool_input": {"file_path": "a.txt"}}"#,
+        ] {
+            assert_eq!(
+                decide_pre_tool_use(payload, &guards).exit_code,
+                2,
+                "should block: {payload}"
+            );
+        }
+        let read = r#"{"tool_name": "Read", "tool_input": {"file_path": "a.txt"}}"#;
+        assert_eq!(decide_pre_tool_use(read, &guards).exit_code, 0);
+    }
+
+    /// Verification round on 385b4ea: these were skipped, not blocked.
+    #[test]
+    fn test_hook_blocks_edits_missing_their_text_and_a_missing_impulse_dir() {
+        let guards = guardrail::GuardConfig::default();
+        for payload in [
+            r#"{"tool_name": "MultiEdit", "tool_input": {"edits": [{"old_string": "a"}]}}"#,
+            r#"{"tool_name": "NotebookEdit", "tool_input": {"new_source": ["x"]}}"#,
+        ] {
+            assert_eq!(
+                decide_pre_tool_use(payload, &guards).exit_code,
+                2,
+                "{payload}"
+            );
+        }
+        let missing = std::path::Path::new("/definitely/not/a/project/.impulse");
+        for project_dir in [None, Some(""), Some("  ")] {
+            assert_eq!(
+                guard_impulse_dir(missing, project_dir)
+                    .err()
+                    .map(|d| d.exit_code),
+                Some(2),
+                "CLAUDE_PROJECT_DIR = {project_dir:?}"
+            );
+        }
+        // A project without `.impulse` yet still runs on the built-in rules,
+        // so `impulse-rs init` is not blocked.
+        assert_eq!(
+            guard_impulse_dir(missing, Some("/definitely/not/a/project")).ok(),
+            Some(missing.to_path_buf())
+        );
+        let existing = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            guard_impulse_dir(existing.path(), None).ok(),
+            Some(existing.path().to_path_buf())
+        );
+    }
+
+    /// Round 3 on d2789af: with Claude Code started in a subdirectory, the
+    /// hook named `src/.impulse`, which does not exist, and ran on the
+    /// built-in rules, skipping the project's custom Block rules.
+    #[test]
+    fn test_guard_impulse_dir_finds_the_projects_own_from_a_subdirectory() {
+        let project = TempDir::new().unwrap();
+        make_git_repository(project.path());
+        std::fs::create_dir(project.path().join(".impulse")).unwrap();
+        let deep = project.path().join("src").join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        let named = deep.join(".impulse");
+        let own = project.path().join(".impulse");
+        assert_eq!(
+            guard_impulse_dir(&named, deep.to_str()).ok(),
+            Some(own.clone())
+        );
+        // Without CLAUDE_PROJECT_DIR the repository still tells the project.
+        assert_eq!(guard_impulse_dir(&named, None).ok(), Some(own));
+    }
+
+    /// Round 4 (reviewer A): any `.git` entry ended the search, so an empty
+    /// `.git` file in a subdirectory hid the project's own `.impulse`.
+    #[test]
+    fn test_guard_impulse_dir_needs_a_real_repository_root() {
+        let project = TempDir::new().unwrap();
+        make_git_repository(project.path());
+        std::fs::create_dir(project.path().join(".impulse")).unwrap();
+        let deep = project.path().join("c").join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(project.path().join("c/.git"), "").unwrap();
+        let named = deep.join(".impulse");
+        assert_eq!(
+            guard_impulse_dir(&named, deep.to_str()).ok(),
+            Some(project.path().join(".impulse"))
+        );
+        assert!(holds_git_repository(project.path()));
+        assert!(!holds_git_repository(&project.path().join("c")));
+        // Round 5 (reviewer A): a `gitdir:` naming nothing, or a `.git`
+        // holding only `HEAD`, still counted; git rejects both.
+        std::fs::write(project.path().join("c/.git"), "gitdir: nowhere\n").unwrap();
+        assert!(!holds_git_repository(&project.path().join("c")));
+        let only_head = project.path().join("c3");
+        std::fs::create_dir_all(only_head.join(".git")).unwrap();
+        std::fs::write(only_head.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert!(!holds_git_repository(&only_head));
+        // A worktree's or submodule's `.git` file does end the search.
+        let worktree_git_dir = project.path().join(".git/worktrees/c");
+        std::fs::create_dir_all(&worktree_git_dir).unwrap();
+        std::fs::write(worktree_git_dir.join("HEAD"), "ref: refs/heads/c\n").unwrap();
+        std::fs::write(
+            project.path().join("c/.git"),
+            format!("gitdir: {}\n", worktree_git_dir.display()),
+        )
+        .unwrap();
+        assert!(holds_git_repository(&project.path().join("c")));
+        std::fs::write(
+            project.path().join("c/.git"),
+            "gitdir: ../.git/worktrees/c\n",
+        )
+        .unwrap();
+        assert!(holds_git_repository(&project.path().join("c")));
+        std::fs::write(
+            project.path().join("c/.git"),
+            "gitdir: ../.git/worktrees/c\r\n",
+        )
+        .unwrap();
+        assert!(holds_git_repository(&project.path().join("c")));
+        // Round 6 (reviewer A): git rejects a gitfile without the space after
+        // the colon, or with trailing spaces after the path.
+        for content in [
+            "gitdir:../.git/worktrees/c\n",
+            "gitdir: ../.git/worktrees/c   \n",
+        ] {
+            std::fs::write(project.path().join("c/.git"), content).unwrap();
+            assert!(
+                !holds_git_repository(&project.path().join("c")),
+                "{content:?}"
+            );
+        }
+    }
+
+    /// Round 6 (reviewer A): a FIFO named `.git` blocked the hook in
+    /// `open()`; Claude Code's timeout then let the call run unguarded. The
+    /// check runs on its own thread, and the test opens the FIFO's write side
+    /// if it blocks, so a regression fails instead of hanging.
+    #[cfg(unix)]
+    #[test]
+    fn test_holds_git_repository_does_not_open_a_fifo() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join(".git");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed");
+        let (sent, received) = std::sync::mpsc::channel();
+        let checked = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = sent.send(holds_git_repository(&checked));
+        });
+        let answer = received.recv_timeout(std::time::Duration::from_secs(2));
+        if answer.is_err() {
+            // Release a reader blocked in open(), so the thread can finish.
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo);
+        }
+        assert_eq!(answer, Ok(false), "the check blocked on a FIFO");
+    }
+
+    /// A `.git` directory as git requires it: `HEAD`, `objects`, `refs`.
+    fn make_git_repository(dir: &Path) {
+        std::fs::create_dir_all(dir.join(".git/objects")).unwrap();
+        std::fs::create_dir_all(dir.join(".git/refs")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    }
+
+    #[test]
+    fn test_guard_impulse_dir_never_looks_past_the_repository_root() {
+        // An `.impulse` above the repository, such as a user-level one, is
+        // not this project's.
+        let outer = TempDir::new().unwrap();
+        std::fs::create_dir(outer.path().join(".impulse")).unwrap();
+        let repo = outer.path().join("repo");
+        let src = repo.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        make_git_repository(&repo);
+        let named = src.join(".impulse");
+        assert_eq!(
+            guard_impulse_dir(&named, src.to_str()).ok(),
+            Some(named.clone())
+        );
+        // Outside any repository only the named directory counts. A temp dir
+        // inside a repository would make this half meaningless, so it checks.
+        let loose = outer.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        assert!(
+            !loose.ancestors().any(|dir| dir.join(".git").exists()),
+            "the temp dir {} is inside a git repository",
+            loose.display()
+        );
+        let named = loose.join(".impulse");
+        assert_eq!(
+            guard_impulse_dir(&named, loose.to_str()).ok(),
+            Some(named.clone())
+        );
+        assert_eq!(
+            guard_impulse_dir(&named, None).err().map(|d| d.exit_code),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_hook_checks_notebook_cell_source() {
+        let guards = guardrail::GuardConfig::default();
+        let secret = format!("api_key = \"{}\"", "sk-live-0123456789abcdefghijklmnop");
+        let payload = serde_json::json!({
+            "tool_name": "NotebookEdit",
+            "tool_input": {"notebook_path": "a.ipynb", "new_source": secret},
+        })
+        .to_string();
+        // The built-in `block-write-secret` rule blocks this content in a
+        // Write; a notebook cell with it used to pass unchecked.
+        assert_eq!(decide_pre_tool_use(&payload, &guards).exit_code, 2);
+        let deletion = r#"{"tool_name": "NotebookEdit", "tool_input": {"notebook_path": "a.ipynb", "edit_mode": "delete"}}"#;
+        assert_eq!(decide_pre_tool_use(deletion, &guards).exit_code, 0);
+    }
+
+    #[test]
+    fn test_disable_then_enable_a_builtin_rule() {
+        let force_push = "git push --force origin main";
+        let mut rules = Vec::new();
+        assert!(blocks(&rules, force_push));
+        set_rule_enabled(&mut rules, "block-force-push-main", false);
+        assert!(!blocks(&rules, force_push));
+        set_rule_enabled(&mut rules, "block-force-push-main", true);
+        assert!(rules.is_empty());
+        assert!(blocks(&rules, force_push));
+    }
+
+    // ── PreToolUse hook decisions ─────────────────────────────────────────
+
+    fn hook(payload: serde_json::Value) -> HookDecision {
+        decide_pre_tool_use(&payload.to_string(), &guardrail::GuardConfig::default())
+    }
+
+    /// Review P1: a Block used to exit 1, which Claude Code treats as a
+    /// non-blocking error, so the guard never stopped a call.
+    #[test]
+    fn test_hook_blocks_a_force_push_with_exit_two() {
+        let decision = hook(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push --force origin main"}
+        }));
+        assert_eq!(decision.exit_code, 2);
+        assert!(decision
+            .message
+            .unwrap()
+            .contains("Blocked by the Impulse guard"));
+    }
+
+    #[test]
+    fn test_hook_allows_a_benign_command_silently() {
+        let decision = hook(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test --workspace"}
+        }));
+        assert_eq!(decision, HookDecision::allow(None));
+    }
+
+    #[test]
+    fn test_hook_warns_without_blocking() {
+        let decision = hook(serde_json::json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "git add .env"}
+        }));
+        assert_eq!(decision.exit_code, 0);
+        assert!(decision.message.is_some());
+    }
+
+    #[test]
+    fn test_hook_checks_written_and_edited_content() {
+        let secret = "api_key = 'sk_live_0123456789abcdefghij'";
+        for payload in [
+            serde_json::json!({"tool_name": "Write", "tool_input": {"file_path": "a.rs", "content": secret}}),
+            serde_json::json!({"tool_name": "Edit", "tool_input": {"file_path": "a.rs", "old_string": "x", "new_string": secret}}),
+            serde_json::json!({"tool_name": "MultiEdit", "tool_input": {"file_path": "a.rs", "edits": [
+                {"old_string": "a", "new_string": "fine"},
+                {"old_string": "b", "new_string": secret}
+            ]}}),
+        ] {
+            assert_eq!(hook(payload.clone()).exit_code, 2, "{payload}");
+        }
+    }
+
+    #[test]
+    fn test_hook_passes_tools_it_does_not_guard() {
+        let decision = hook(serde_json::json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "README.md"}
+        }));
+        assert_eq!(decision, HookDecision::allow(None));
+    }
+
+    #[test]
+    fn test_hook_fails_closed_on_an_unreadable_payload() {
+        let decision = decide_pre_tool_use("not json", &guardrail::GuardConfig::default());
+        assert_eq!(decision.exit_code, 2);
+        assert!(decision.message.unwrap().contains("could not read"));
+    }
 
     fn test_state() -> (TempDir, Arc<state::State>) {
         let tmp = TempDir::new().unwrap();
@@ -381,38 +1031,43 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_analytics_unknown_subcommand_returns_ok() {
+    fn test_handle_analytics_unknown_subcommand_is_an_error() {
         let (_tmp, st) = test_state();
-        // Unknown subcommand prints a message but returns Ok
         let result = handle_analytics(&st, "unknown".to_string(), false, "day".to_string());
-        assert!(result.is_ok());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Unknown analytics type"));
     }
 
     // ── handle_analytics with recorded conflicts ───────────────────────
 
-    #[test]
-    fn test_handle_analytics_with_recorded_conflicts() {
+    /// Review P3-3: analytics read a file only tests wrote, so conflicts
+    /// that detection recorded never showed up.
+    #[tokio::test]
+    async fn test_analytics_counts_conflicts_that_detection_recorded() {
         let (_tmp, st) = test_state();
-        st.record_conflict(
-            "src/main.rs",
-            vec!["session-a".to_string(), "session-b".to_string()],
-        )
-        .unwrap();
-        st.record_conflict_resolution("src/main.rs", "manual-merge")
-            .unwrap();
+        let a = st.create_session("a".to_string(), None).await.unwrap();
+        let b = st.create_session("b".to_string(), None).await.unwrap();
+        st.track_file(&a.id, "src/main.rs").await.unwrap();
+        st.track_file(&b.id, "src/main.rs").await.unwrap();
+        assert_eq!(
+            st.check_file_conflict(&b.id, "src/main.rs").await.unwrap(),
+            ["a"]
+        );
 
-        let result = handle_analytics(&st, "conflicts".to_string(), false, "day".to_string());
-        assert!(result.is_ok());
-    }
+        let analytics = st.get_conflict_analytics().unwrap().get_analytics();
+        assert_eq!(analytics.total_conflicts, 1);
+        assert_eq!(analytics.unresolved_count, 1);
+        assert_eq!(
+            analytics.most_common_files,
+            [("src/main.rs".to_string(), 1)]
+        );
 
-    #[test]
-    fn test_handle_analytics_with_conflicts_json_output() {
-        let (_tmp, st) = test_state();
-        st.record_conflict("src/lib.rs", vec!["s1".to_string()])
-            .unwrap();
-
-        let result = handle_analytics(&st, "conflicts".to_string(), true, "day".to_string());
-        assert!(result.is_ok());
+        for json in [false, true] {
+            let result = handle_analytics(&st, "conflicts".to_string(), json, "day".to_string());
+            assert!(result.is_ok());
+        }
     }
 
     // ── handle_guard: list confirms rules are returned ─────────────────

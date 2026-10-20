@@ -11,6 +11,58 @@ use serde::{Deserialize, Serialize};
 /// Maximum depth of nested delegation (from Hermes Agent pattern).
 pub const MAX_DELEGATION_DEPTH: u8 = 2;
 
+/// Most delegations a tracker holds. A new one past this replaces the oldest
+/// finished delegation; when every held delegation is still active, the new
+/// one is refused rather than dropping active work.
+pub const MAX_TRACKED_DELEGATIONS: usize = 256;
+
+/// Most of a coordinator's context snapshot a delegation keeps. Nothing
+/// reads the snapshot back yet, so the rest would only cost memory.
+pub const MAX_CONTEXT_SNAPSHOT_BYTES: usize = 64 * 1024;
+
+/// Most a delegation's spec may weigh, and separately its completion
+/// (summary and tool trace) or failure message: their text, plus
+/// [`DELEGATION_ITEM_BYTES`] for each list entry.
+pub const MAX_DELEGATION_TEXT_BYTES: usize = 256 * 1024;
+
+/// What one string list entry (a target file, a restricted tool) counts
+/// toward [`MAX_DELEGATION_TEXT_BYTES`] besides its text, so millions of
+/// empty entries can't pass as a few bytes: each costs a `String` header and
+/// an allocation whatever it holds (40 bytes, rounded up).
+pub const DELEGATION_ITEM_BYTES: usize = 64;
+
+/// What one tool-trace record counts besides its text: three `String`
+/// headers (72 bytes) and up to three allocations, rounded up.
+pub const DELEGATION_TRACE_RECORD_BYTES: usize = 128;
+
+/// How long a delegation may stay pending or in progress before a full
+/// tracker treats it as abandoned. Nothing in the protocol fails or cancels
+/// a delegation, so one whose worker died would otherwise hold its slot
+/// until the daemon restarts.
+pub const STALE_DELEGATION_SECS: i64 = 60 * 60;
+
+/// Why the tracker refused a delegation request.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DelegationError {
+    #[error("delegation rejected: max depth ({max}) would be exceeded")]
+    DepthExceeded { max: u8 },
+    #[error("delegation rejected: all {limit} tracked delegations are still active")]
+    TrackerFull { limit: usize },
+    #[error(
+        "delegation {part} refused: it weighs {bytes} (its text plus a fixed cost per list \
+         entry), over the {limit} limit"
+    )]
+    TooLarge {
+        part: &'static str,
+        bytes: usize,
+        limit: usize,
+    },
+    #[error("delegation not found: {id}")]
+    NotFound { id: String },
+    #[error("delegation {id} is already {state}")]
+    AlreadyFinished { id: String, state: &'static str },
+}
+
 /// Specification of a delegated task.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegationSpec {
@@ -53,7 +105,7 @@ pub enum DelegationState {
 }
 
 impl DelegationState {
-    pub fn as_str(&self) -> &str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::InProgress => "in_progress",
@@ -154,6 +206,39 @@ mod tests {
         };
         assert!(d.is_active());
         assert!(!d.is_completed());
+    }
+
+    #[test]
+    fn test_delegation_error_display_names_the_cause() {
+        assert_eq!(
+            DelegationError::DepthExceeded { max: 2 }.to_string(),
+            "delegation rejected: max depth (2) would be exceeded"
+        );
+        assert!(DelegationError::TrackerFull { limit: 256 }
+            .to_string()
+            .contains("all 256 tracked delegations are still active"));
+        assert_eq!(
+            DelegationError::TooLarge {
+                part: "spec",
+                bytes: 300,
+                limit: 200
+            }
+            .to_string(),
+            "delegation spec refused: it weighs 300 (its text plus a fixed cost per list entry), \
+             over the 200 limit"
+        );
+        assert_eq!(
+            DelegationError::NotFound { id: "del-9".into() }.to_string(),
+            "delegation not found: del-9"
+        );
+        assert_eq!(
+            DelegationError::AlreadyFinished {
+                id: "del-1".into(),
+                state: "completed"
+            }
+            .to_string(),
+            "delegation del-1 is already completed"
+        );
     }
 
     #[test]

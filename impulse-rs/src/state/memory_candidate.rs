@@ -481,7 +481,11 @@ impl State {
             .lock()
             .map_err(|error| anyhow::anyhow!("memory candidate ledger lock poisoned: {error}"))?;
         if let Some(stored) = ledger.candidates.get(&candidate.id) {
-            if stored != &candidate {
+            // The derived candidate is always `PendingReview`, while a decided
+            // one is stored as promoted or dismissed; compare everything else,
+            // as reconcile and decide do, or any later mutation of a task
+            // whose candidate was decided fails after it has been persisted.
+            if !matches_ignoring_status(stored, &candidate) {
                 anyhow::bail!(
                     "memory candidate `{}` conflicts with its deterministic accepted-run projection",
                     candidate.id
@@ -1228,6 +1232,31 @@ pub(in crate::state) mod tests {
 
         // GENOME.md is a separate, hand-curated artifact and stays untouched.
         assert!(!state.storage().path("GENOME.md").exists());
+    }
+
+    /// Review P3: the guard compared the stored candidate with full
+    /// equality, but derivation is always `PendingReview`, so once a candidate
+    /// was decided, any later mutation of its accepted task failed after the
+    /// mutation had been persisted.
+    #[test]
+    fn test_a_decided_candidate_still_matches_its_accepted_run() {
+        let (_root, state, candidate_id) = state_with_candidate();
+        state
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-later", 0), &state),
+                OperatorAuthentication::CapabilityAuthenticated,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        let task = state
+            .list_governed_tasks(&state.governed_project_id())
+            .unwrap()
+            .into_iter()
+            .find(|task| task.is_accepted())
+            .expect("the accepted run");
+        state
+            .ensure_accepted_run_memory_candidate(&task)
+            .expect("a decided candidate still matches its run");
     }
 
     #[test]

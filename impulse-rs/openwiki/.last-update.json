@@ -1,0 +1,1459 @@
+{
+  "schema_version": 2,
+  "mode": "code",
+  "file_count": 360,
+  "chunk_count": 7587,
+  "page_paths": [
+    "quickstart.md",
+    "code/impulse-rs.md",
+    "code/impulse-desktop.md",
+    "code/impulse-ion.md",
+    "code/impulse-ops.md",
+    "code/impulse-step-model.md",
+    "code/impulse-term.md"
+  ],
+  "inventory_hash": "12956dfaf51b7b7949c262a33541611109cd2f8bba1d576b717d90a7ff5898c5",
+  "files": [
+    {
+      "path": "Cargo.lock",
+      "hash": "c1eb0f07f0e70c3ced6ccf5eb4ee3e663512b152da7e0965c125d1fd3079ede7"
+    },
+    {
+      "path": "Cargo.toml",
+      "hash": "0ae685b6830d88b61dc428968dfdc302360c3ab87f5aeb8a2593a37a53d6f578"
+    },
+    {
+      "path": "LICENSE",
+      "hash": "5aaaaee24c5bed465b0e5e67c2ab93b42b58e977ad71ebb987ddd3b9b27094c5"
+    },
+    {
+      "path": "NOTICE",
+      "hash": "4d6f15d4435e0cba1cb7a675ea2718a7721d98347dc7239fd5699b6abacef5c7"
+    },
+    {
+      "path": "PLATFORMS.md",
+      "hash": "d992a7d566f1589c87602bff8a321373fcb502a3f753c16a8f6b431c96d4b357"
+    },
+    {
+      "path": "QUICKSTART.md",
+      "hash": "b970f9a0f8ebb4174fe83f2b8e8ec3651dc14b3c20f3bb38deab3bf24e76f790"
+    },
+    {
+      "path": "README.md",
+      "hash": "4e1e0ebbf36a3ad141653547fe6976c9aa7105929c22d30d885c128b8fd6e9b4"
+    },
+    {
+      "path": "docs/IMPULSE_TERM_STATUS.md",
+      "hash": "f5ec2285e362b5d95ea468dfeaf3f01c5bebe1b8503a95af37474edad410a1a5"
+    },
+    {
+      "path": "docs/PHASE3_SQLITE_VEC_RESEARCH.md",
+      "hash": "da044228abb75dff89111f17cea40cca184bfbe42367bf9b59b1bc221aeb82da"
+    },
+    {
+      "path": "docs/plans/2026-02-27-guardrail-module-design.md",
+      "hash": "564c65f8bf6cb5fcff3bfc2508f607d6c1262f054ecd5fed11e2c633e74cc476"
+    },
+    {
+      "path": "docs/plans/2026-02-27-guardrail-module.md",
+      "hash": "45efc05fe84e4419c527bd325624a79081149c0a10e64b3bb2904dcb9acc2143"
+    },
+    {
+      "path": "docs/plans/2026-02-27-two-layer-identity-design.md",
+      "hash": "692341192f054f51a50928963da81f26a13255502a329500d114da584b3681b4"
+    },
+    {
+      "path": "docs/plans/2026-02-27-two-layer-identity-plan.md",
+      "hash": "908034797ae339627f592edd57abd261466c572868d8bd2e9afa5849fa4defb6"
+    },
+    {
+      "path": "docs/spec-cli-provider-extension.md",
+      "hash": "f95285a569d7cbefb30b48d36ead97f0746c2458091bc0edd0ceb9e619d3714a"
+    },
+    {
+      "path": "docs/spec-nullclaw-agent-patterns.md",
+      "hash": "8d286d6eef4f2e25105c318356976bfdda69b885a5d190180e268e12ecdeca5a"
+    },
+    {
+      "path": "docs/spec-retrieval-pipeline-upgrade.md",
+      "hash": "ea5e1bc68cc8960973e78fae5ec193b75ca4106506611e8a81b973037f93cf60"
+    },
+    {
+      "path": "docs/spec-sandbox-integration.md",
+      "hash": "f22bf74f70d8debee65137f17e7a2b8f06c2aa394244d19e697c72f598d1f260"
+    },
+    {
+      "path": "docs/specs/CLEANUP-ROUND2-PLAN.md",
+      "hash": "ccd607fa8009b3bbe142c561c8c99e95bf9731532cf2b7664e3dd844e6888d4a"
+    },
+    {
+      "path": "docs/specs/CLEANUP-SPEC-2026-04-04.md",
+      "hash": "d4bf0b6355f17d7a2e429eb9b02f431ef04ac86ed98355b61eb718001dec37a2"
+    },
+    {
+      "path": "docs/specs/NEXT-GOALS.md",
+      "hash": "e0a49b0a45f89623fa7dd91e10c309600b11ff326fc4e581ef75b946a0203b10"
+    },
+    {
+      "path": "docs/superpowers/plans/2026-04-02-impulse-redesign.md",
+      "hash": "589969ad0b2ea0c904f796ed3f8d281e00dc6ff787ecd674a23527161bce835a"
+    },
+    {
+      "path": "docs/superpowers/specs/2026-04-02-impulse-redesign-design.md",
+      "hash": "8704df9bf13b1b7bb66a65365e6e336232c928fd9738bc94d650546692bf35bd"
+    },
+    {
+      "path": "impulse-desktop/Cargo.toml",
+      "hash": "94bb8c5493b768edabd4d2c732d7aff95fb559db2343468412d64c0f7ecdf170"
+    },
+    {
+      "path": "impulse-desktop/README.md",
+      "hash": "f2696941c96b67246ba9337e1551b6152ea482be2897ffc20c46d8b4a605ba8d"
+    },
+    {
+      "path": "impulse-desktop/_archive-2026-05-22-loop3/tauri_commands-2.rs",
+      "hash": "5fd4c80a98256d7a5ef2fd2ae57b3d24bfa0b4c592a0506dafda3a97bdc9e9fc"
+    },
+    {
+      "path": "impulse-desktop/assets/impulse_crt.css",
+      "hash": "d076afa8a27c6ca6d24cc426cefefe0316a67a000e2f3244962b10dd2cfc058a"
+    },
+    {
+      "path": "impulse-desktop/assets/vendor/xterm/LICENSE.addon-fit.txt",
+      "hash": "ea5a02d218423b9b19995f1ed19290a3e63a37a91ec07cc47b8a02e56b101642"
+    },
+    {
+      "path": "impulse-desktop/assets/vendor/xterm/LICENSE.xterm.txt",
+      "hash": "622f83fda05e07ef1611bd0b90fe8cd8b181e486accb63816dd7a558a1967288"
+    },
+    {
+      "path": "impulse-desktop/assets/vendor/xterm/addon-fit.js",
+      "hash": "e421d1792b8813a2d497704ba7624ccb5c1394c176168771055e2122b0fd5e19"
+    },
+    {
+      "path": "impulse-desktop/assets/vendor/xterm/manifest.json",
+      "hash": "4a9d047ff01adf670602ce95fb44c0962b91a9079c390897a8273fd91a16bee6"
+    },
+    {
+      "path": "impulse-desktop/assets/vendor/xterm/xterm.css",
+      "hash": "7245fbf91260b1188f1515513c7e0ba35cffdbed8caf88818c1c940571bcb191"
+    },
+    {
+      "path": "impulse-desktop/assets/vendor/xterm/xterm.js",
+      "hash": "2ea89507f14364e6839b05da18ddcb7c0cfdd2942cbc14e7154205a39b5c627c"
+    },
+    {
+      "path": "impulse-desktop/docs/native-islands.md",
+      "hash": "8ce778593f854ebb8afbbbb0cc06f0e38193d92b0fcf7b8684536259d7b2f325"
+    },
+    {
+      "path": "impulse-desktop/examples/emit_dioxus_host_bootstrap.rs",
+      "hash": "7d2e5313cd306611128fff27bf6d2b7af0aac9d27397a23cce222ac3ba970b7c"
+    },
+    {
+      "path": "impulse-desktop/examples/emit_terminal_interop_script.rs",
+      "hash": "476752de24a61e688da4ee2d8df3f24b6ff9f5761df77aa257fc6a635d891e15"
+    },
+    {
+      "path": "impulse-desktop/examples/render_visual_fixtures.rs",
+      "hash": "4b6197548aac7838467dd62827cd03a79bde473a64193ad423aa992e8ae4cb39"
+    },
+    {
+      "path": "impulse-desktop/package-lock.json",
+      "hash": "b72be1f56b1ffd9b0194c68b96ce4f7ca6653d8e4e03d99b2e05aeb187dfc488"
+    },
+    {
+      "path": "impulse-desktop/package.json",
+      "hash": "d01992e568df77473d95891ff3ed3fb0f69a0f38f0084c4e7d8d7197242ceb8f"
+    },
+    {
+      "path": "impulse-desktop/scripts/host_readiness_smoke.mjs",
+      "hash": "ae369be6f27426f0910b7a92463df9cf47463e533db011f0cbc1753f8558bb0d"
+    },
+    {
+      "path": "impulse-desktop/scripts/vendor_xterm_assets.mjs",
+      "hash": "be354f0039ecfa997b9b2c3ce3e3875b99f3428dc81b883ec195683c696ea7b5"
+    },
+    {
+      "path": "impulse-desktop/scripts/visual_smoke.mjs",
+      "hash": "0e1eb758a809fb17dcb853620430b54b64a74f98bb09b813fa4dc2b9d02e1c64"
+    },
+    {
+      "path": "impulse-desktop/src/bin/impulse_desktop.rs",
+      "hash": "7b371e2889bc22ae802f55a8b1285e9d594021d3c7339723cf5a51a7e37d240c"
+    },
+    {
+      "path": "impulse-desktop/src/bridge.rs",
+      "hash": "ec7e98b850e42952f25a799f9729e622feb33de01692137f07b4c0afe4c7332f"
+    },
+    {
+      "path": "impulse-desktop/src/daemon_ops.rs",
+      "hash": "7d05869faad47b5540b560b779ad4d94430ea1692de5b41833412263bfb960ec"
+    },
+    {
+      "path": "impulse-desktop/src/desktop_host.rs",
+      "hash": "e03ceda9f89f71e01625394d63f8abd517ece4993675a1edb3ad6ebd0e948f4c"
+    },
+    {
+      "path": "impulse-desktop/src/host_bridge.rs",
+      "hash": "ec22725ec67bbacd2232e1df93a2198434ac942ad2b6dff82d0ed50c7d767cd6"
+    },
+    {
+      "path": "impulse-desktop/src/host_commands.rs",
+      "hash": "3e0215b34ef09eb268181665c6e8ca3c553ef638b571c3d1b3371f4bf38f8803"
+    },
+    {
+      "path": "impulse-desktop/src/lib.rs",
+      "hash": "fd596b0a3660d6190a7408434020c3b7669bf002bd48850592b02f43bc95e04b"
+    },
+    {
+      "path": "impulse-desktop/src/mcp.rs",
+      "hash": "799249a6f90f422c26dd1cd6c67d0315816e0630a57b84868ba62861f06431ef"
+    },
+    {
+      "path": "impulse-desktop/src/native.rs",
+      "hash": "ca2999b62b547e04c6f65b49fe3651864c54240db61e43c3d3a897bac060547b"
+    },
+    {
+      "path": "impulse-desktop/src/runtime.rs",
+      "hash": "801889279953db066227ca442113941722fca211208659b6e5aa6bae27e11c22"
+    },
+    {
+      "path": "impulse-desktop/src/theme.rs",
+      "hash": "fd48f300bd3c09639affb3a11a81ac11b52b7a4e223bf4e10e362f4c88f5121c"
+    },
+    {
+      "path": "impulse-desktop/src/ui.rs",
+      "hash": "263608d26091e1746df8ae26aa0e00e621fb3ebf0b693ba4222e397962a6a163"
+    },
+    {
+      "path": "impulse-desktop/src/views.rs",
+      "hash": "e811fe5a5774b64f6724420abfdaaec0246e236acb5fd912c17d4ee64321f037"
+    },
+    {
+      "path": "impulse-desktop/src/workspace.rs",
+      "hash": "4163fb506962f56054a546eb410a749a99dd98d1253d7bb87db48403fb1f35cd"
+    },
+    {
+      "path": "impulse-desktop/tests/desktop_contract.rs",
+      "hash": "73dfca6655a076ab7046c671f4e8f8e7c888950ee26b32573f4ba88a5bc588b2"
+    },
+    {
+      "path": "impulse-desktop/tests/host_surface.rs",
+      "hash": "7efd37e7a4cbe26480d3135db5a72a62c71051785e7d3585215598c1ef1cbbb5"
+    },
+    {
+      "path": "impulse-desktop/tests/runtime.rs",
+      "hash": "0df59916bfb98291ec84beecb52d4296a7fc58f537f3eca2a15a243f87173c94"
+    },
+    {
+      "path": "impulse-desktop/tests/views_ssr.rs",
+      "hash": "ea7c09d9e989fcc914215d86b51f4e9f468a5b5f24009cb085e6350b9028ef6a"
+    },
+    {
+      "path": "impulse-gui/Cargo.lock",
+      "hash": "16cad21d6dcbd5c8ac887ac7e1f25ac56e7a995277cf74c542112473eeb1d0be"
+    },
+    {
+      "path": "impulse-gui/Cargo.toml",
+      "hash": "3d118da0b46a93d52946b5fdbb14dba75fc321444a1c1faa9fb94808a5354190"
+    },
+    {
+      "path": "impulse-gui/README.md",
+      "hash": "1420e232003ea8018b8847333068cd217e4f5e3a8a751faf8acc9ade97421363"
+    },
+    {
+      "path": "impulse-gui/resources/Info.plist",
+      "hash": "5a843064f3970c9e3afda5a384b57ec5dc0206062067d5b5203850b59bfa72da"
+    },
+    {
+      "path": "impulse-gui/src/agent_panel/actions.rs",
+      "hash": "053ce1b7e109f54e40bae7eb641e13c8915af53d28cf91e693ef54394da43bdf"
+    },
+    {
+      "path": "impulse-gui/src/agent_panel/backend.rs",
+      "hash": "bf70082b2b3d665f841b6db32b4b3ddf8e789fc9a363530360c86553c4631163"
+    },
+    {
+      "path": "impulse-gui/src/agent_panel/chat.rs",
+      "hash": "a1c7da94629d93973762abd0be7f3deb8039e571b1aaab60b993446b30f773d8"
+    },
+    {
+      "path": "impulse-gui/src/agent_panel/mod.rs",
+      "hash": "436c7ffabedd5f4eb31237453a8e4fed8fcd14aefa87c9998403d186f7de5c61"
+    },
+    {
+      "path": "impulse-gui/src/agent_panel/persistence.rs",
+      "hash": "9edb23923437dd058c685080d9cf83f2b370e89d94efb383535c2e50804f97ab"
+    },
+    {
+      "path": "impulse-gui/src/app.rs",
+      "hash": "edb4a1877e13db0717152768ce91d90c5e03fce29f8e75f45fc4c5d737a9ec10"
+    },
+    {
+      "path": "impulse-gui/src/error.rs",
+      "hash": "685486e07a2a897739210a5db70a5eab374e35943c0b5cf8e5aa47f9c9dabf72"
+    },
+    {
+      "path": "impulse-gui/src/global_config.rs",
+      "hash": "cc6e46b430c8baba445a56160f8979ad0a8085d697d13313a46129f121aa07a5"
+    },
+    {
+      "path": "impulse-gui/src/identity.rs",
+      "hash": "3257faeae2fb0e52d1468fdb5ce379bb1cdcf51ab3df8249774d5a0842b7f63a"
+    },
+    {
+      "path": "impulse-gui/src/ipc/client.rs",
+      "hash": "b0286d3134a400b3f2dd1a5bf6434b83b461ef70324def63d09fa531aff14e6e"
+    },
+    {
+      "path": "impulse-gui/src/ipc/mod.rs",
+      "hash": "97ab769437d3901ab3c426c151627decaf7d28d929e1c8e541c043536da6c0d4"
+    },
+    {
+      "path": "impulse-gui/src/ipc/types.rs",
+      "hash": "ce6aaa05d5f98c2387848c6621c7ec7576888073d630b2211860c1e2d56e6ee2"
+    },
+    {
+      "path": "impulse-gui/src/main.rs",
+      "hash": "1ef3ee1a6cf72b73c2acf1aeb06659eef1ac08de95d83f546e0311ae8395509d"
+    },
+    {
+      "path": "impulse-gui/src/project_context.rs",
+      "hash": "97d9f5bd9595db82070e3a5af0ac4a5c7dbf751648b2e0cf2726b9b3f4d9a3af"
+    },
+    {
+      "path": "impulse-gui/src/project_scaffold.rs",
+      "hash": "905adfc619ad39ab7c7f1121a24fe71e5f86a1788d66377bffb9292c4b28a7c2"
+    },
+    {
+      "path": "impulse-gui/src/state.rs",
+      "hash": "16db4ad7452d6cda6b114e5b16d92781fa6cb08a912b9201fbe4a3bcbda28320"
+    },
+    {
+      "path": "impulse-gui/src/theme.rs",
+      "hash": "e3744f6bb8ef962f33f103ed8fadad080bdd2facdfd017e82494b8475e3a08ac"
+    },
+    {
+      "path": "impulse-gui/src/views/genome.rs",
+      "hash": "adaa4d3c6d7b9f10ae32822656db9d6b5939c5fa790b66001b0a43c620586c27"
+    },
+    {
+      "path": "impulse-gui/src/views/guardrails.rs",
+      "hash": "229396b9b32c3c4ff8575c94bb9f697afebc1cc05c821870419aa06c511991d7"
+    },
+    {
+      "path": "impulse-gui/src/views/memory.rs",
+      "hash": "80fdcd9e65d0dc12c13c5f205e224e7a009f91ec82e5122010e10451ce1ca5fe"
+    },
+    {
+      "path": "impulse-gui/src/views/memory_persistence.rs",
+      "hash": "5f5d4b93cec8ca87ef7dd039b86fe210101f6fe675de99a6ca70edd8dcc26c02"
+    },
+    {
+      "path": "impulse-gui/src/views/mod.rs",
+      "hash": "13314767048a77dcaa6e9a2c1778e07e1b18e90c812dd4bfac4c6e267c9404c5"
+    },
+    {
+      "path": "impulse-gui/src/views/overview.rs",
+      "hash": "58d91d97dd1ec4d4b293684d89e7b775232a06e53810bcd0ef6b6266cbc53d17"
+    },
+    {
+      "path": "impulse-gui/src/views/search.rs",
+      "hash": "7d45eade12f92172f78e6654acedb91cf8dacc00a6c0bc3d3d767d6d7c938979"
+    },
+    {
+      "path": "impulse-gui/src/views/sessions.rs",
+      "hash": "69eede60e404137874a7f37f2811b77a78c61c2f2807c44f46c4a8a1786cef08"
+    },
+    {
+      "path": "impulse-gui/src/views/settings.rs",
+      "hash": "0f80897df104cc29b8bd24b7c16633639fd82e7fb1a233ab47a5bc839fd07d66"
+    },
+    {
+      "path": "impulse-gui/src/views/terminal_context.rs",
+      "hash": "01d2a3dba2504bae69c4d73a4c1309ccdb913547457ea7c6815d9f0cb230548e"
+    },
+    {
+      "path": "impulse-gui/src/views/terminal_insights.rs",
+      "hash": "2b0efc3cbd26d5b45ffe5b6accbcdfa290a27b8a241285d635c49db9ff80fc8c"
+    },
+    {
+      "path": "impulse-gui/src/views/terminal_search.rs",
+      "hash": "f9b197c0ad97d0a5fea3765c3f3714edc59e86101582f95f472c9943ee9a9589"
+    },
+    {
+      "path": "impulse-gui/src/views/terminals.rs",
+      "hash": "08effcb85d293e03f4684ab8a849b8838a1a2712208b47184e411a41427aad6d"
+    },
+    {
+      "path": "impulse-gui/src/widgets/command_palette.rs",
+      "hash": "9c1fc8fb2592f9e13961ffebf166eb3532e0bad498d82efac1a4748b3b309bf0"
+    },
+    {
+      "path": "impulse-gui/src/widgets/conflict_banner.rs",
+      "hash": "a1490e0e38eb71ea3cdb0a67ab6646a77d3ca32518c551f15bdade440fe33d40"
+    },
+    {
+      "path": "impulse-gui/src/widgets/mod.rs",
+      "hash": "036449db76476d81d89a9c7c03205a9bb92987c2899e733f1c96a3ea7a2dd7e9"
+    },
+    {
+      "path": "impulse-gui/src/widgets/notifications.rs",
+      "hash": "7ba5fe951b3b162474b9893de68cc6d31b1e5cf5e16e76f875c09b937f3cfac7"
+    },
+    {
+      "path": "impulse-gui/src/widgets/project_selector.rs",
+      "hash": "ccea5b69ae56acaef33108bb35f01edf6f4486d9c78194a7b5cca7791b4fd120"
+    },
+    {
+      "path": "impulse-gui/src/widgets/sidebar.rs",
+      "hash": "5d42ff91ddfdc0a356fde6401cde8c962de1b863f27a126fa70607fad05f93d9"
+    },
+    {
+      "path": "impulse-gui/src/widgets/signal_bus.rs",
+      "hash": "bfd805c609dab9433ecb512c8a8024cc1c17ac0361681ae68f2a50898f06c870"
+    },
+    {
+      "path": "impulse-gui/src/widgets/status_bar.rs",
+      "hash": "6981ac85c1850c2c556379e6ea4e95ddc7741ce7c9e2a9d1ec6a1328d39981e2"
+    },
+    {
+      "path": "impulse-ion/Cargo.toml",
+      "hash": "a389e576f9c969c4278f812cf5f0e8e8349244ce26244e3ad82a3e1a7eb7fec0"
+    },
+    {
+      "path": "impulse-ion/T5_IMPLEMENTATION_NOTES.md",
+      "hash": "f0d6300ad184482f22d023e7b86883a177e8f1f610036335093e809007fdd248"
+    },
+    {
+      "path": "impulse-ion/TUI_SPEC.md",
+      "hash": "e42d6bd144c2ef90d305a7077d5cbcb94666722d2b378aa98e4437c60d1d87e0"
+    },
+    {
+      "path": "impulse-ion/src/lib.rs",
+      "hash": "149df343d9e77deefa084fee25f83a3cb207d3ebb9db6abc4e7917f5f3ec4af7"
+    },
+    {
+      "path": "impulse-ion/src/pi_adapter.rs",
+      "hash": "5ab6df17667463f795ca9f3b54f22b3da2956b992f56a21b181838a06ebc1f85"
+    },
+    {
+      "path": "impulse-ion/tests/fakes/hang-gate.sh",
+      "hash": "46462da08f50e91452c1bf6600eee8ce1e1e66065abcd0036a1d07f9904f7061"
+    },
+    {
+      "path": "impulse-ion/tests/fakes/orphan-grandchild-gate.sh",
+      "hash": "5c2840fb229e03e00c9ff83dcc99958c2cd6d6e5b5fd1d0858beeaba1e8e3322"
+    },
+    {
+      "path": "impulse-ops/Cargo.toml",
+      "hash": "b731fdb9b51eeeee977ef73aa711603b54f8c4587036bfdbfeba53ef0ea17a90"
+    },
+    {
+      "path": "impulse-ops/README.md",
+      "hash": "381845b1b9c4078b097b254afa452449d34ae6f9e359e2f85f54887a9445bdf7"
+    },
+    {
+      "path": "impulse-ops/src/agent_registry.rs",
+      "hash": "873336d2d787eb7557b9e923e2c7f4c4151548dc33795c2315d16f261a1c2f80"
+    },
+    {
+      "path": "impulse-ops/src/governed_task.rs",
+      "hash": "d2ad5613e0ddcb3b576b4fb7d4079dcb2e82bad10f324370303e8e2798b10223"
+    },
+    {
+      "path": "impulse-ops/src/lib.rs",
+      "hash": "116331a642273a84125ac48bd4e2af309b89ca125f11124d115ca95f76892526"
+    },
+    {
+      "path": "impulse-ops/src/memory_candidate.rs",
+      "hash": "80b3e60c891a06c2a2ca778803da338b9f5b21710032f63ba8a9c16b4cfd0e83"
+    },
+    {
+      "path": "impulse-ops/src/role_assignment.rs",
+      "hash": "432aa21a3cbae4c52cd31a3fbc51cf83186204c15605f9517a138eb5db894baa"
+    },
+    {
+      "path": "impulse-ops/tests/governed_producer_contract.rs",
+      "hash": "5b871f9292b9de2cf089e98cea83dbd4adcd14c3656886e6d4a5a5f2f0131c94"
+    },
+    {
+      "path": "impulse-ops/tests/governed_task_contract.rs",
+      "hash": "9c4ed2f368f65b149226df9a6d7bef562bd12656f1448939d38c0ccf53290c12"
+    },
+    {
+      "path": "impulse-ops/tests/memory_candidate_contract.rs",
+      "hash": "e7fe3eaf174ee79eec30b5a44b16a5a1c1019b1534243edf0fafcc22954fedce"
+    },
+    {
+      "path": "impulse-step-model/Cargo.toml",
+      "hash": "03e7bde016311c81919b1c2b07fbf3a8b9e80c86b905b8c9d96b53066784a452"
+    },
+    {
+      "path": "impulse-step-model/README.md",
+      "hash": "ee52f2abd635191406a11140ffdffcad6852b9c9b95bd772526b230ad9b7d357"
+    },
+    {
+      "path": "impulse-step-model/src/lib.rs",
+      "hash": "fc182154f9dc96c73091cff566f657866aace20f15c798cd3546c665d60e18f0"
+    },
+    {
+      "path": "impulse-term/Cargo.toml",
+      "hash": "77f83db273ab283245c05f5e9287ea8c65831c38f6e20069aa5357136565eadc"
+    },
+    {
+      "path": "impulse-term/README.md",
+      "hash": "1a9bd75c2302e013f4a2b81107fe6ef517cac9d1aade7370422d0d8b2b37164f"
+    },
+    {
+      "path": "impulse-term/src/backend.rs",
+      "hash": "a88c13ec3461b0ae3ab23a0bb7821086939a018f7dfeceff2af2557989f6369e"
+    },
+    {
+      "path": "impulse-term/src/context.rs",
+      "hash": "4860e11a56740be86d751833ecd6bc151163d47751297a63dbab6be3ecddf681"
+    },
+    {
+      "path": "impulse-term/src/input.rs",
+      "hash": "35ae52f4f7a0b01ef629a665ee423ca374786ad463a284226e3c86fe14b3b935"
+    },
+    {
+      "path": "impulse-term/src/lib.rs",
+      "hash": "5ef1845756727eee61c38f4a6cbf67cf9cf423b1d5ed9cdc8d1b794dda66d266"
+    },
+    {
+      "path": "impulse-term/src/panel.rs",
+      "hash": "ba5dc1a44e4efff91d2b8945454f8f9f5b2e6a8c9617d71215ad915e7230f0b3"
+    },
+    {
+      "path": "impulse-term/src/paste.rs",
+      "hash": "c54b287c256c8a96463c562aeb0b5e942eefdfce6ad5b63afab5d90894214055"
+    },
+    {
+      "path": "impulse-term/src/renderer.rs",
+      "hash": "e0582eb8997503990f7371ec502912662bc8b94c990535129fc219cd75c033fe"
+    },
+    {
+      "path": "impulse-term/src/status_bar.rs",
+      "hash": "f3a4df14519c985b272d131b2af8742c75c541b7a72891fda53353a79a0c5df9"
+    },
+    {
+      "path": "impulse-term/src/theme.rs",
+      "hash": "a6a513ff664c36377a1f2e03512754fe97500547298b5f21a798492f060d17cb"
+    },
+    {
+      "path": "impulse-term/tests/backend_tests.rs",
+      "hash": "1781b11e8385ae755e310d90291bb38c58b85d2d253fec7a74953ff1fad291e0"
+    },
+    {
+      "path": "impulse-term/tests/boundary_tests.rs",
+      "hash": "97e91d34ea6fad3ccd76c0ee5d4483f9ff036ca2148665dd18619f7128b95d9b"
+    },
+    {
+      "path": "impulse.sh",
+      "hash": "881b9086b2501492443831a342fe9446cb49f7befa18e7370b286a98e19d9a0e"
+    },
+    {
+      "path": "scripts/build-macos-app.sh",
+      "hash": "c0245f828e2914aa7143df1a1be9af03b3e973812b22afd7de13779bae1c4ede"
+    },
+    {
+      "path": "scripts/capture-plan-evidence.sh",
+      "hash": "995023d2d2090dffbfd46d8675e1667d1f698d005f0999ce8286c96b69fe55b2"
+    },
+    {
+      "path": "scripts/check-mcp-fallbacks.sh",
+      "hash": "51cd84f20bf1be002d93de5748d378744291c1270b8b74596e82420ca955d0ef"
+    },
+    {
+      "path": "src/agent/coordinator.rs",
+      "hash": "235cc8fdd6dca92c112443908e633f3b76b05774dbbbace5433f7e14159de016"
+    },
+    {
+      "path": "src/agent/harness.rs",
+      "hash": "794f59e4c53b1337966fcafcbe760756d659bab4bbb478f3586c5bd04518112c"
+    },
+    {
+      "path": "src/agent/mod.rs",
+      "hash": "796b10bcf55a75155f1eff1d4984c6dd85deb5a56468737def426a11b95c345e"
+    },
+    {
+      "path": "src/agent/prompts.rs",
+      "hash": "d6e645af8439948e8d15db768c1b3dce33b3d749e28cbc393dc2f9739626c12a"
+    },
+    {
+      "path": "src/agent/step_model.rs",
+      "hash": "9fd762e479ed093c044e31b4b326106c16743fbecac07a789e9e0028d4410d63"
+    },
+    {
+      "path": "src/agent_discovery/mod.rs",
+      "hash": "f16c58973bd8bc4c9fd0485d12a4253ed9662611c947a06daf7a5a5f6050f30d"
+    },
+    {
+      "path": "src/basis.rs",
+      "hash": "30d452cdc927d8ae1fde0b8225db9f201478cde2c2efec0ca774a54041d33509"
+    },
+    {
+      "path": "src/bin/ion.rs",
+      "hash": "ce62398170e558acc147d6564868eb8048d6917a524821d1560c76e5abe79a0a"
+    },
+    {
+      "path": "src/branding.rs",
+      "hash": "3e1f737082b134220dd4f56145dcd365dbb18ee6c0babc333ca2ad7d6ea6bf6e"
+    },
+    {
+      "path": "src/build_hygiene/clean_all.rs",
+      "hash": "8ad7a8957870029710a7ca9640f191fe3ff8dfd7f3c322becdb57c1c6c3094b4"
+    },
+    {
+      "path": "src/build_hygiene/discovery.rs",
+      "hash": "9c38ac1611a3da11a7dd0a4cb6c204d3971f69a36cce39a814b852892c489bd0"
+    },
+    {
+      "path": "src/build_hygiene/measurement.rs",
+      "hash": "207c16feaaa3923470ee3c104f973b06c727dfe153883fe0fa209ac07bc6099b"
+    },
+    {
+      "path": "src/build_hygiene/mod.rs",
+      "hash": "967ff9ec000f18eb75b4248e49d06434c630925be1b024cd58140ab19a9913ba"
+    },
+    {
+      "path": "src/build_hygiene/native.rs",
+      "hash": "918cffe22c606af290d9da71b49cdd42fe5da3fc081d463e6e1bd4374cf0bd29"
+    },
+    {
+      "path": "src/build_hygiene/sccache.rs",
+      "hash": "f17e3cbf40636603a66bde33992dab81aa3183e519676f5a3b4aac8035a67f31"
+    },
+    {
+      "path": "src/build_hygiene/sweep.rs",
+      "hash": "2eca206ff230c48594a74846d22a9a1146eccfb5a4a205637282ec7587f77a55"
+    },
+    {
+      "path": "src/build_hygiene/tests.rs",
+      "hash": "2ab29f20430b1725ba1a4910696210307c1f7787d3d882a07145a0679b44dac9"
+    },
+    {
+      "path": "src/build_hygiene/wipe.rs",
+      "hash": "d03e4545418751ee2210839c24accb51d89e2e8877dff3fd295ddfeeff619f82"
+    },
+    {
+      "path": "src/cli.rs",
+      "hash": "e9cd6b4cf63d709f34ab7b3f8633399095fa6ecef3976710425796562fe113d2"
+    },
+    {
+      "path": "src/client/mod.rs",
+      "hash": "9f93c6c499c19165c42e1739c6346eaa13ce72bb771413f156af4093b1f90bf3"
+    },
+    {
+      "path": "src/context_lifecycle/detector.rs",
+      "hash": "9a6d8820f58fdd142eddcf696e19e46bc338f40bcf9e05b5662bfab4ee1e8cfe"
+    },
+    {
+      "path": "src/context_lifecycle/extractor.rs",
+      "hash": "cb7f85c8176d02f1fdfbd5a89b2147ad19e349b0bd10b272e578b7a517293d43"
+    },
+    {
+      "path": "src/context_lifecycle/injector.rs",
+      "hash": "d3d9ba86b6fbee807ec14537cdd953108c12218b8dd5b0fb44aea78136691b54"
+    },
+    {
+      "path": "src/context_lifecycle/intent.rs",
+      "hash": "345e55f2eb5c20d95041c134405068cfd61ad9b694b9dea57b4e7d276976d25e"
+    },
+    {
+      "path": "src/context_lifecycle/mod.rs",
+      "hash": "049a098cc41a75b89f7b2013396f3ee6161d56b7d344d81173d1503f09d5cb36"
+    },
+    {
+      "path": "src/context_lifecycle/monitor.rs",
+      "hash": "f9238a81c84bbd646e3f1516393979030fe017245b1c2e89f739c87427fad9ae"
+    },
+    {
+      "path": "src/context_lifecycle/parser.rs",
+      "hash": "cf783beee219f936a37f9573152a6f250d289ce320991830b3c8bd3e66e2e2e4"
+    },
+    {
+      "path": "src/context_lifecycle/templates.rs",
+      "hash": "4fc248bf38455b35757ba5eea2924d0059dfaa16ecca4abfc54b178a983694df"
+    },
+    {
+      "path": "src/context_lifecycle/types.rs",
+      "hash": "deead070a78db6f5d2334671f6b486187a11dfc27432d9ee067aa9758db7c01e"
+    },
+    {
+      "path": "src/credentials/cli_proxy.rs",
+      "hash": "44045243fcf1854974a1286e09027c3273157ea68a7eeda840af0bae13c394bd"
+    },
+    {
+      "path": "src/credentials/keychain.rs",
+      "hash": "247be7211b2a1046bd6084de86b383a45312b9c69a8042b71b4040e0fb146f77"
+    },
+    {
+      "path": "src/credentials/mod.rs",
+      "hash": "828501dff665439b3bb93a1b765c14e92605397111f6c3fc074d97a2ce741f1a"
+    },
+    {
+      "path": "src/credentials/socket.rs",
+      "hash": "c8bfc174f2a6a46403bbbd20bf1b5a480394ff90c3ccdf788af31d5656adb914"
+    },
+    {
+      "path": "src/daemon/handlers.rs",
+      "hash": "a14a52a871002da5e005f50c5130cfe8e29af7ef5efca1033561776d8e216a12"
+    },
+    {
+      "path": "src/daemon/mod.rs",
+      "hash": "fcaa218d9e6ffcfc9d2f30bd8119f200ddef0793f40b9ecf9258f90f6e6e917d"
+    },
+    {
+      "path": "src/daemon/protocol.rs",
+      "hash": "1761c73c1d7e6026bb7e39ea260e30a4ad004e271b323639d788c9490d3cb8dd"
+    },
+    {
+      "path": "src/daemon/tests.rs",
+      "hash": "e1ba9aa17546fc55feded2bd2ff2ba5e5ca47a6ee2cadd8b4449d93f2611feec"
+    },
+    {
+      "path": "src/delegation/detector.rs",
+      "hash": "ce7fcf14054f662cd91c3c64d22d47f178781ec6a3cce4fb9cc16ca80748edf7"
+    },
+    {
+      "path": "src/delegation/mod.rs",
+      "hash": "e92a6814ab4f4deb4309d904843b14fcdc5b0fd154781233cac26df8f11d242a"
+    },
+    {
+      "path": "src/delegation/tracker.rs",
+      "hash": "9f431d6ff75dd57de4d730099776af3cc1ad1590670d411a34bac3b5c99126f4"
+    },
+    {
+      "path": "src/delegation/types.rs",
+      "hash": "453dac30695cedefe2f1fcd5fd86edda245770dd0d45d3a2cab7812e4ad10a3c"
+    },
+    {
+      "path": "src/docs/cache.rs",
+      "hash": "2f37d2808d3ab1eee4dbf5eb0a259983796a0af728cf1478aab89d659ae5baec"
+    },
+    {
+      "path": "src/docs/fetch.rs",
+      "hash": "e44ac0804288752e1ff17131c735f28e155390128da98045326eafae14c15e4b"
+    },
+    {
+      "path": "src/docs/mod.rs",
+      "hash": "e185788ebdb85d0995a562fa52e8a9559ca0879a872dca801f5287ba2f5c0a5f"
+    },
+    {
+      "path": "src/docs/models.rs",
+      "hash": "32fec6493a549cac2f5be60a1ac7d0425f0917767e4572597eef7bb883160f80"
+    },
+    {
+      "path": "src/envelope.rs",
+      "hash": "e8b0433fef8379163db12bf85d9aced18a8c21c46e50d34fdf0cf156b433aedb"
+    },
+    {
+      "path": "src/error.rs",
+      "hash": "1727a748d9dbb1a790687d733ae893c6fe402dfb4d7a54fb4c673738d17f75c9"
+    },
+    {
+      "path": "src/governed_producers.rs",
+      "hash": "931d37f5ffdb8b804994fc431765f271b7cbb7ebe9f04186da98f0c7ff6fb52c"
+    },
+    {
+      "path": "src/guardrail/config.rs",
+      "hash": "b3c04f5a482384454fb4fbec9234aa28cfb7d23847c0285ed5de0d054d073bcc"
+    },
+    {
+      "path": "src/guardrail/defaults.rs",
+      "hash": "4a75ad3f37abe34c662e7e2319d34de25cec0278956799ee750df48fb14aca3d"
+    },
+    {
+      "path": "src/guardrail/engine.rs",
+      "hash": "0af10ee5de9ef379afbac45aa919c5809fb8faf17810c2daf7d089a241811c85"
+    },
+    {
+      "path": "src/guardrail/mod.rs",
+      "hash": "cc35abb145f0a95ccae405dedae7c52cb72054d649eb71cc8e28d96589be4674"
+    },
+    {
+      "path": "src/guardrail/types.rs",
+      "hash": "93aea99e981e16894c09fe0df2e23dbda152919c0c769063f071f4dcafe7a92b"
+    },
+    {
+      "path": "src/handlers/agent.rs",
+      "hash": "00d4b04bef2dbcec189d4a6a3a9ba2f03aeb44bbc30fd574454744caa8b29879"
+    },
+    {
+      "path": "src/handlers/build.rs",
+      "hash": "646b4025f44278a510f88a7c441a0c3612c554f6a6f1dc8bc45b2217a9749aee"
+    },
+    {
+      "path": "src/handlers/common.rs",
+      "hash": "24fa010fac97232649f0990a1c55050c8a37100ed03c7687b2114c43b5e7bd80"
+    },
+    {
+      "path": "src/handlers/config.rs",
+      "hash": "8ddd6217924c415d817f157669836338e93d3c84dea10848ea13bccaa88f4601"
+    },
+    {
+      "path": "src/handlers/daemon_dispatch.rs",
+      "hash": "4474f42d1b3a95ebc7d28108c9377cc9b4e1e774e3475a94112604089ad969af"
+    },
+    {
+      "path": "src/handlers/describe.rs",
+      "hash": "bde1c42fb4ce598609b74524c673da6b3fb670c802604ea5cf92cbcf7c3a4490"
+    },
+    {
+      "path": "src/handlers/direct_dispatch.rs",
+      "hash": "fb93cee5c52e3ccb39b4108eabd6c0502de3c9565571b05ff9691b331c7ee2b5"
+    },
+    {
+      "path": "src/handlers/guard.rs",
+      "hash": "1ecc163aaeb7305bb627ccc7d1f21ec6acf24ed7835ef98247e4cd3833a5c4a6"
+    },
+    {
+      "path": "src/handlers/injection_handlers.rs",
+      "hash": "a27cac405ee8010748fca77ae74ebbcc9c91966f343908047a6919fbdc799ad6"
+    },
+    {
+      "path": "src/handlers/ion.rs",
+      "hash": "b9d8d0b8c84f7324dcc3dd3dff80a9d771a78cbe8e0f2f24e6ce103716b1408d"
+    },
+    {
+      "path": "src/handlers/memory.rs",
+      "hash": "84f3c3b5cbec9eaed41beb55eb38ad1ee7a69c4693e082d18c1be1a582064cae"
+    },
+    {
+      "path": "src/handlers/mod.rs",
+      "hash": "400490aa4a93f27d9eb4e940c495eee812588b003b34cb3d02f52094a91aef5c"
+    },
+    {
+      "path": "src/handlers/office.rs",
+      "hash": "968e8f3d87a502945baada0273f2e598454e9209432da130f4e0c9cb5bfa21f5"
+    },
+    {
+      "path": "src/handlers/plugin_handlers.rs",
+      "hash": "8dfa3231d4541e99f61076c4b580b8738ffbb0f8af356f93cdabcebec078b993"
+    },
+    {
+      "path": "src/handlers/retrieval.rs",
+      "hash": "649b558cc11f38465fbf2e77f26ab2cd107a93ec456ff86cfe8ff2f3dd6330a1"
+    },
+    {
+      "path": "src/handlers/semantic_diff_handlers.rs",
+      "hash": "90f017e45f3ea5da6a07c4bf765b3fe549aa73e39ad853014efd77fe5d1d2097"
+    },
+    {
+      "path": "src/handlers/session.rs",
+      "hash": "cecf027ee6f06f83ad714da5fcffa23ef5f35bb0790231818cb14bfea19bb18b"
+    },
+    {
+      "path": "src/handlers/stewardship_handlers.rs",
+      "hash": "0db098c2ea01f524f3cbe1abd0387bd483d2a458164100a85e0668eb93954633"
+    },
+    {
+      "path": "src/handlers/system.rs",
+      "hash": "0b79ada32e6adc8ecf6ecfbb58a33189ec5eb214fe57a79d54b9508b9527f9bb"
+    },
+    {
+      "path": "src/handlers/tooling_handlers.rs",
+      "hash": "6f184ac2e65c44b675f438cd9a2ef60b5f32343b70e6ba8f78b5d4ce488b3145"
+    },
+    {
+      "path": "src/handlers/voice_handlers.rs",
+      "hash": "d8a8f351aad28c8d4ed06e295f127a9ddbc4975fb500f36bf926afb3ae0fe057"
+    },
+    {
+      "path": "src/injection/engine.rs",
+      "hash": "e8219b774f6e84ce07d1dcf0dcc3b12b706b4351ad89d9455317a4b32ea7fc75"
+    },
+    {
+      "path": "src/injection/mod.rs",
+      "hash": "7cfe0ed9d2f87d8d2a24973eadbbcad6119342d2b00e9c7031a75ca6c2f57083"
+    },
+    {
+      "path": "src/injection/staging.rs",
+      "hash": "bc94d4481265cb65ff34ec784e4af3b2f2d5e0e0f1f3b2fb8676cc60bf1b4fce"
+    },
+    {
+      "path": "src/injection/types.rs",
+      "hash": "53af9dd17dc9e7485e4067ec4ab0514c7b2dd8b6e5c63936b00dc84a41e2b03c"
+    },
+    {
+      "path": "src/integration_tests.rs",
+      "hash": "2c1201d31028d86a6b27f2e9845853b6635ee70d9e7434cb5192cc61fa533c1d"
+    },
+    {
+      "path": "src/ion_repl/chat.rs",
+      "hash": "0d95161b3c0adc4df52a4031babac496612e02ea503db83276f58fac09b3e8fb"
+    },
+    {
+      "path": "src/ion_repl/history.rs",
+      "hash": "20fff72e955204ea6e936633ecca787b03e9d02e73a3a1a2817ef27b5f057379"
+    },
+    {
+      "path": "src/ion_repl/mod.rs",
+      "hash": "d4cb79541b83f027eff1e72e1039174cce850fe09b349dfd6f69d17618ad5476"
+    },
+    {
+      "path": "src/ion_repl/registry.rs",
+      "hash": "63127375984917e7de3ff651d298627efac7b7d28ea7c4e1cbb5b57441a55931"
+    },
+    {
+      "path": "src/ion_repl/router.rs",
+      "hash": "2fa8dfbbd64aa12f50c713207f527cc4fb8f5c9f7cdbea5df40f4bc808ff429e"
+    },
+    {
+      "path": "src/ion_repl/tool_bridge.rs",
+      "hash": "13b9d0e234c36e22aa3ce69f2d94669b77f6df684748df54885e1cb2a331d4d8"
+    },
+    {
+      "path": "src/ion_repl/tool_claim.rs",
+      "hash": "85466129154fdd8bad3cc8233a434f4d2d1c7d45430fdeea2d278a0f06662f0c"
+    },
+    {
+      "path": "src/ion_repl/tool_verify.rs",
+      "hash": "a705432269cd1aa1676b08b98550ee89b4c976914b7770a1a7b3894cff34534e"
+    },
+    {
+      "path": "src/ion_repl/tools.rs",
+      "hash": "43fec23ab918ad56bc32fe4c982109b3a60ddaf23ebc5e0ce41bed9ce4a1e2cf"
+    },
+    {
+      "path": "src/lib.rs",
+      "hash": "371c9de39d850098a41f73a9e0550888ea21493184ae70e43f670697f1a2dd1a"
+    },
+    {
+      "path": "src/llm_backends/anthropic.rs",
+      "hash": "98f52ab025ac78a9f8ece6e8720fb49687c6f93e26b136906d55bea79940ea61"
+    },
+    {
+      "path": "src/llm_backends/mod.rs",
+      "hash": "02c8129b59148d482aebecb9bf304329edbdb64104b86e57a677dd0fcc306272"
+    },
+    {
+      "path": "src/main.rs",
+      "hash": "3edcddb42025a72f0b88b900bf054df95075a3214760238d4403260c48f3f1cd"
+    },
+    {
+      "path": "src/mcp/mod.rs",
+      "hash": "ca797b454565fe480da88a1dfecb857bf85b958ac64aeb1b65419c9c4b46d0f8"
+    },
+    {
+      "path": "src/mcp/server.rs",
+      "hash": "d2ef71fab57a23b03d841bef1c2d054e5158cc0120194ad56feff8debe868541"
+    },
+    {
+      "path": "src/memory/mod.rs",
+      "hash": "b4d254e2be7f7e888bb7577d22cdc9a96cfebb96034f723b3b5801fdd3da316d"
+    },
+    {
+      "path": "src/monty/datafusion.rs",
+      "hash": "49a93857e4d27bd87510f14bf361531fa21c3820a8d0f463d8e81b4ff0904797"
+    },
+    {
+      "path": "src/monty/kdb.rs",
+      "hash": "43a02985952bbe42d1d514d57c29b8e7e7d425b0ab39931c8d27992804f3776e"
+    },
+    {
+      "path": "src/monty/mod.rs",
+      "hash": "b3c799a1d2890800c7b328de0d09ec90727785539094de22cb5b4996859857cf"
+    },
+    {
+      "path": "src/monty/python.rs",
+      "hash": "d922604e5a0b09420f3661e81e3a854d4de58a1ecf5bcaeca721dc43ce4fcece"
+    },
+    {
+      "path": "src/monty/routing.rs",
+      "hash": "79805b80dc8d87f1de10bec072e5ac607ca2d08f4b8f1749275200b68bd3e8cd"
+    },
+    {
+      "path": "src/monty/swarm.rs",
+      "hash": "084ba6368351f946c733f7ed8500469804e5620dc96109ad2ca3ec6a26a27f1c"
+    },
+    {
+      "path": "src/notification/mod.rs",
+      "hash": "b1bfbc51d393dbaf93c636e1e465c8b9a42ce2c0d305264f4f13057b6a0fdca2"
+    },
+    {
+      "path": "src/office/excel.rs",
+      "hash": "fd42a173be84197aa7d057b9590ae8bb1b60ec487909a9feab2acb25a8c271e1"
+    },
+    {
+      "path": "src/office/extraction.rs",
+      "hash": "d46a7b5539a066eead3284936e9ac88020f5c80901666489cba1a7ad3c9d5693"
+    },
+    {
+      "path": "src/office/mod.rs",
+      "hash": "37677303b505f08e059a033dbe13c32141f39ccf3365f205934a93f8f9b88155"
+    },
+    {
+      "path": "src/office/word.rs",
+      "hash": "24abdee1923794a5dfa6b44e98cc3512e6f1a546e2f3735cd17db53f587a36d9"
+    },
+    {
+      "path": "src/ops_workbench.rs",
+      "hash": "0f5ada06442ceba7ead75d6ad082e024ae43a2a407e72b4101492144bb3ffb19"
+    },
+    {
+      "path": "src/orchestration/mod.rs",
+      "hash": "5909054a62991c030da9d387940a2c7580fb060baffbda112679966674e98c0e"
+    },
+    {
+      "path": "src/plugin/action.rs",
+      "hash": "554d1be0914089906c2ebe053c5885ea1000c05f01279203b340eb95875668db"
+    },
+    {
+      "path": "src/plugin/context.rs",
+      "hash": "a75e2fd60ed164c57a5ae6c491e943e13dbd253cea7cde031e2ac026b26d840e"
+    },
+    {
+      "path": "src/plugin/mod.rs",
+      "hash": "0156cb2b45a31daa3867997461fb02fbdd8b09ab26814775038e2d3385f0b6d8"
+    },
+    {
+      "path": "src/plugin/registry.rs",
+      "hash": "72228475eb14f69ee37211fee6bb0a5ed2fff1404728ef1ee628918de3165f96"
+    },
+    {
+      "path": "src/process_group.rs",
+      "hash": "7dcca3ecabed32e585642a834321c1f1af66983d46a18fdefd53219c4d80c035"
+    },
+    {
+      "path": "src/process_util.rs",
+      "hash": "358edb49cf970e05c338d5cd475cb1d470a8cebae126c025dfd6f82773c097a5"
+    },
+    {
+      "path": "src/retrieval/embedding.rs",
+      "hash": "d85b1fad2b9bad8fa2c38ab0cc8f0c31503d407b56bdea8f6e712463ab651427"
+    },
+    {
+      "path": "src/retrieval/fuzzy.rs",
+      "hash": "8fba7dac464eef5363e77743e590c8277b916bdbb5181fb944e9a3a1c73efa4b"
+    },
+    {
+      "path": "src/retrieval/indexer.rs",
+      "hash": "67cc65ab6034561cf01d4c9f767206c950df57bccba37c481ff2e1bb846993ae"
+    },
+    {
+      "path": "src/retrieval/mod.rs",
+      "hash": "087d1085daa062dafea30e9aeb590538ba58f765ba55bc3504046eeffaeface0"
+    },
+    {
+      "path": "src/retrieval/pageindex.rs",
+      "hash": "26a90882acef48914e5c8e26d5fce9caf54a95403003f4d9105ffbf6c17e1a37"
+    },
+    {
+      "path": "src/retrieval/query.rs",
+      "hash": "5317f2f527870f4d3444f3718fde9c24c0d9770c150acd38cf1ee9ec4401de55"
+    },
+    {
+      "path": "src/retrieval/store.rs",
+      "hash": "8bb821aaede2b540424990c6b5043197d972b22ed78411711aa83d8ed47b9b9e"
+    },
+    {
+      "path": "src/retrieval/types.rs",
+      "hash": "dbba2c908f13350c7877fb8e1fb6cf38ca6a6ae88808416bc885212a653a79d9"
+    },
+    {
+      "path": "src/semantic_diff/mod.rs",
+      "hash": "942eb755485d9a36f7a9b1df860dff9582774afca0513b3f455b5db6b901f094"
+    },
+    {
+      "path": "src/semantic_diff/runner.rs",
+      "hash": "e42180d0f2066ce70d70c461ebaf190cfacc1af933e1fb85fa5fb82d3ace8670"
+    },
+    {
+      "path": "src/semantic_diff/types.rs",
+      "hash": "2499435b4599daf2379f67d0421c18d08277b56b97bdb4d43167c890b9bbc4db"
+    },
+    {
+      "path": "src/settlement.rs",
+      "hash": "c0ae084ac2a778f5727d66e9c7f5f05f5c832e6f05eeba71d346cdbfe6b953dd"
+    },
+    {
+      "path": "src/state/config.rs",
+      "hash": "0a5a5044ab84de4ca446c3bac5e82d23a4a579acf59e3a37425082e2a2aa797b"
+    },
+    {
+      "path": "src/state/config_keys/mod.rs",
+      "hash": "1fa238a98221d730c7af0187cc1c14caa728f698bc7cab0099bd7d78449443bb"
+    },
+    {
+      "path": "src/state/config_keys/rules.rs",
+      "hash": "10f47140922c234898552d5e548f1d1f11b79c0ca6a86ed4a99ae2b148cdaaa6"
+    },
+    {
+      "path": "src/state/config_keys/tests.rs",
+      "hash": "298829fe95ea220da80f3c7d09ec63378003879167744357709c99d2bc8a54c4"
+    },
+    {
+      "path": "src/state/governed_task.rs",
+      "hash": "9988dbb368a5f391b4a0dd11021e14080385fcf9fb9223b88175c2bb1e7250b0"
+    },
+    {
+      "path": "src/state/memory_candidate.rs",
+      "hash": "1a70c107342b7b82b96dc7aed64a856e819ba542208f2a6be31dbdc82834662e"
+    },
+    {
+      "path": "src/state/mod.rs",
+      "hash": "731ba711e4ede5ae60b7433d27a25bc7d53ea91aa646af4b2feca1b630285217"
+    },
+    {
+      "path": "src/state/persistence.rs",
+      "hash": "6a66bec4140a97965319b6fa2da13496f4aa72acf6e9420433c5d2d7f38bec4e"
+    },
+    {
+      "path": "src/state/session.rs",
+      "hash": "ef48582829fab385ca9c1bdfda165913bff8b7b15f2886de341b3a6ff00b2752"
+    },
+    {
+      "path": "src/stewardship/analyzer.rs",
+      "hash": "9c06d3766652fb089ebd4ce741f357ef83931366c855e8a1560d5c8c01fabf10"
+    },
+    {
+      "path": "src/stewardship/approval.rs",
+      "hash": "e63ecc3674555c9e1276ea96c488ee5ec37f4b5fdd842c79317a6df0b6c80e0c"
+    },
+    {
+      "path": "src/stewardship/cleanup.rs",
+      "hash": "78d58cec8d9f31b39ec9c2a656780667b9e6a7efdc698fbc449911f11d531db7"
+    },
+    {
+      "path": "src/stewardship/cross_project.rs",
+      "hash": "047938c79ddaf569e8dc9e5a0c4e9063451f7bc16262185f5ae3623731bed162"
+    },
+    {
+      "path": "src/stewardship/mod.rs",
+      "hash": "4c1e0660e8cf388609a0213ec3ce26369266f69f25db94417f17bc262f9282c6"
+    },
+    {
+      "path": "src/stewardship/monitor.rs",
+      "hash": "fff0cdccbd9ee8c403ad85e08e547724b40a6482b81677a76ecce36d8808475d"
+    },
+    {
+      "path": "src/stewardship/types.rs",
+      "hash": "04dc331c1e79040305f90be481fdd973c2e0eaa5256af3b5329638e31cbc6330"
+    },
+    {
+      "path": "src/storage/mod.rs",
+      "hash": "22a07dc2b6b17747a5894ad4ab586267beb09850d781fefae274534bf370e0c2"
+    },
+    {
+      "path": "src/test_support.rs",
+      "hash": "f0ed75a171118565f5c78a65ae8f7ccc67d3b65be8d58e2dec64a3097edaa62f"
+    },
+    {
+      "path": "src/token_tracker/algorithm.rs",
+      "hash": "d4ff620ccd6717bd3f973bba4d61085fdb0896cfaa2bc1d3032be321365b17f8"
+    },
+    {
+      "path": "src/token_tracker/cross_platform.rs",
+      "hash": "46f8c4740a2ea735909e305f90556eec3b0d5f0e0ec2179395ae58faedb2e9ee"
+    },
+    {
+      "path": "src/token_tracker/metrics.rs",
+      "hash": "afbb6d36af96a09ea2723e5fbc2301404cb280ca97a46433271e45662e5ee1c6"
+    },
+    {
+      "path": "src/token_tracker/mod.rs",
+      "hash": "0737dcdc6f92b0816167145f8452957f3820062308afb32277ef2a23c2ca9498"
+    },
+    {
+      "path": "src/token_tracker/research.rs",
+      "hash": "aab7b3e979ec17a2bb973657eb572dbd5fab54fc3c3cd3a7bced2c964ac76415"
+    },
+    {
+      "path": "src/token_tracker/types.rs",
+      "hash": "24fc9f4bb4a36854b3ac59f3df6b1bf8ea60ec7ab34d210104791e815b6faa62"
+    },
+    {
+      "path": "src/tooling/builtin/bash_exec.rs",
+      "hash": "68a51233755ff0fc9d35f8dd2d7ce474ea2f0bb1198ac189632da8dba03d664b"
+    },
+    {
+      "path": "src/tooling/builtin/benchmarker.rs",
+      "hash": "3aee4e97a407c57fbfef407478826fdffaac95467d367d08e4998b91a733c4a8"
+    },
+    {
+      "path": "src/tooling/builtin/build_health.rs",
+      "hash": "43024608c8721a0729c694405318ff928bb52d6c7b26ac50b2088f73f8cb87a3"
+    },
+    {
+      "path": "src/tooling/builtin/calculator.rs",
+      "hash": "7fe7b4f8841f935be1ba2d55ac4b752d8ca24bd174b6ec5d70affd183ef99084"
+    },
+    {
+      "path": "src/tooling/builtin/config_get.rs",
+      "hash": "4cb2a969049bc10fe92b3ac950ee1242a6195eb19d44ee060a589f27e7c501ba"
+    },
+    {
+      "path": "src/tooling/builtin/document_extract.rs",
+      "hash": "c57f262a05201b3f994d67de2ad6fe422b33ef09dff7f6dc85c2d31ad6b13f06"
+    },
+    {
+      "path": "src/tooling/builtin/file_read.rs",
+      "hash": "462aff0037bfb22a471339f5a6723720cd7967a76aa8aa3469552db8a6109aa6"
+    },
+    {
+      "path": "src/tooling/builtin/file_write.rs",
+      "hash": "69248352480806a5a9f41f6f5e22acc6aedbffd1f9d26a72c66f005f7944e085"
+    },
+    {
+      "path": "src/tooling/builtin/genome_read.rs",
+      "hash": "6b0db84767079c74441358c157dc9b0a9ceeb3dfe914d0c6c22ab1b692228b9b"
+    },
+    {
+      "path": "src/tooling/builtin/health_check.rs",
+      "hash": "1902cce3f06b6a8d68b6c11afce09d20ee14fafcd0cb6a3bafbbc8181d7ad90c"
+    },
+    {
+      "path": "src/tooling/builtin/memory_search.rs",
+      "hash": "25f67af2a248b73d2d29c19e83dab6ff2027127b554950728632e32e59525039"
+    },
+    {
+      "path": "src/tooling/builtin/mod.rs",
+      "hash": "eeac001e1ed9aa77fd83f19dcdf248c9a9b917b70a6010ba4bb25572a5237da2"
+    },
+    {
+      "path": "src/tooling/builtin/python_exec.rs",
+      "hash": "2c7b01e6301f93a37aec0bd03aaf323f852ec3ceca0fd31b1bc73754b15e8c72"
+    },
+    {
+      "path": "src/tooling/builtin/session_query.rs",
+      "hash": "1a1139cb3e93839c756c9f53cdd3520fe329fea49ac8db5712be06879f033263"
+    },
+    {
+      "path": "src/tooling/builtin/steward_status.rs",
+      "hash": "6a0a18d349a14e978e47d91858e5519457109525f9cab0e62d490c931915820b"
+    },
+    {
+      "path": "src/tooling/builtin/system_info.rs",
+      "hash": "83af10f0bf4cdbfd7ce0015c543653a93fed6d821b5f8d104e352a9c9b93d8c3"
+    },
+    {
+      "path": "src/tooling/document/document_parse.rs",
+      "hash": "ccefb6cb57fcbf8182830f1a1e6bf57000bf141fc7f70ea77112fe009942b274"
+    },
+    {
+      "path": "src/tooling/document/excel_read.rs",
+      "hash": "497ff86490d07f88ff144f0c691ac00b255bb7697e15d9ef81f7a2af0b780572"
+    },
+    {
+      "path": "src/tooling/document/mod.rs",
+      "hash": "252cf45801e05271222cb0156cec267b0a938b640d46291e9a0005c1e96351b8"
+    },
+    {
+      "path": "src/tooling/document/word_read.rs",
+      "hash": "d03976a00d64cb0f744ed03e979df6029e689cc29b2d46050de96b7ab85b0f4a"
+    },
+    {
+      "path": "src/tooling/env_scrub.rs",
+      "hash": "31055eba8b3e51dfc2e1509219ec9bda689bfe7be982fe34118de4bb9ce5da96"
+    },
+    {
+      "path": "src/tooling/error.rs",
+      "hash": "8630c96f8f7fccc5bf1734ca8afaf3505b0c15da1760e62a0dd89ed7a9416474"
+    },
+    {
+      "path": "src/tooling/executor.rs",
+      "hash": "72e389d5c907bbb2504208366040d8ca354bb7659f335ad2f23a64a8693f8f60"
+    },
+    {
+      "path": "src/tooling/external.rs",
+      "hash": "0202d5407fb7fe57599f60bcf180383453f22cacb954c67cd2de6bcc76f35dc6"
+    },
+    {
+      "path": "src/tooling/mod.rs",
+      "hash": "3ee511caec8813ae89b2f9a2601c476ba70cd89a71bef3e99b545aa1a08020d3"
+    },
+    {
+      "path": "src/tooling/registry.rs",
+      "hash": "cb7423b390eb07bbd10a43ba5a2f2023bae57a570510a02b48e5a60478afbf4d"
+    },
+    {
+      "path": "src/tooling/traits.rs",
+      "hash": "66194fe153391213cb893d8a43b4603ba1a415939daccb42d9325e2d3ada84b4"
+    },
+    {
+      "path": "src/tools/benchmark.rs",
+      "hash": "c819acbf96c082254aea819bb985f9f4f2fadaab35662398d1d8c1b026738ce4"
+    },
+    {
+      "path": "src/tools/health.rs",
+      "hash": "567a4296ea194f1da00537e7564a43ece79acad611849ac6530e48362c649f33"
+    },
+    {
+      "path": "src/tools/init.rs",
+      "hash": "cf3d22e05f75156a9bd975f4ef4a4dc0cc5c02b447b0c4f30e3fffd069de0882"
+    },
+    {
+      "path": "src/tools/list.rs",
+      "hash": "ac7986d07158cb97102925511998e3ac64145097b03aad8320542b8808c3688b"
+    },
+    {
+      "path": "src/tools/mod.rs",
+      "hash": "a8bdbb4546070b995ca716b175207de5acf7a058aeb94305b74624dde7139dbd"
+    },
+    {
+      "path": "src/tools/python.rs",
+      "hash": "e316f932e3183b4f5cd990ab98621dd3de537a44b2daf90f8c3ae0d6278ce6a1"
+    },
+    {
+      "path": "src/tools/system.rs",
+      "hash": "4d92d3620c8c9a437f049c9cfe87333e5b9804f0c2f27b396d23f56bd98a441b"
+    },
+    {
+      "path": "src/tools/update.rs",
+      "hash": "fc9078c9c9d95ffbe145b0c248f95891894b13138bab9e64c01aefc50605f6f5"
+    },
+    {
+      "path": "src/ui/agent_terminal.rs",
+      "hash": "0de8a262582e314365ec4db200b01469a4b4d63344cd49a53ffbd97bda7b8d46"
+    },
+    {
+      "path": "src/ui/lifecycle.rs",
+      "hash": "40f1c30f9da1828d8cce000cfbc0ae64ad53fd0591548400832c90ae0a54f245"
+    },
+    {
+      "path": "src/ui/mod.rs",
+      "hash": "1e6eb61334221e4639b8c4a95d7b2ad3d027fac39ac05ba09321b8600c481ebe"
+    },
+    {
+      "path": "src/ui/pane_manager.rs",
+      "hash": "c1828761577556c86e1d574b1e02f5b9249b62e6eebf451d135903ecf2d14a2a"
+    },
+    {
+      "path": "src/ui/render_content.rs",
+      "hash": "d8848b1ede3f5f51a933f1c0958d712cf31c1b1279038a53f79b2e9bbc95a03f"
+    },
+    {
+      "path": "src/ui/render_dashboard.rs",
+      "hash": "c75ff4c118be0d970c50d68659efef7345380a2869eebf6469f4e2a25627243f"
+    },
+    {
+      "path": "src/ui/render_menu.rs",
+      "hash": "9b0d78c3297c677ba512562f3a39f461739abe7341b53d5f9a058810ac006e1c"
+    },
+    {
+      "path": "src/ui/render_status.rs",
+      "hash": "c298bedc32cfcfa8e8a3f3667cf8d52a1eaca62b21fbbdee52e45bf17b023f49"
+    },
+    {
+      "path": "src/ui/render_tabs.rs",
+      "hash": "7c2c8fe2df793883a6fc14fd1fd39233a7ddb570f44c2b64da7452444cfde8b4"
+    },
+    {
+      "path": "src/ui/runner.rs",
+      "hash": "42ba07b1ed0955d91708b04a3603cbb4bb377382759bc1034b0b0e4e273e9078"
+    },
+    {
+      "path": "src/ui/terminal_pane.rs",
+      "hash": "c9be6ddab2ef6896ef95d27422dca7ff1b6d0aa14e7f905d384dc76454927e3b"
+    },
+    {
+      "path": "src/ui/types.rs",
+      "hash": "aeefc65046d41012f450bf936be0cb534789ed45640277b1cd7591fe5fa4380d"
+    },
+    {
+      "path": "src/ui/visualization.rs",
+      "hash": "c6fcdd8dcdf892e140e5ba0e383e44497a0725d4d5f52cdb4f24250abef1ebb4"
+    },
+    {
+      "path": "src/validate.rs",
+      "hash": "06b1b2f31cb7be4c5c7a2e0c771abfddb3db1165195fbd4236b24a3eea8b9043"
+    },
+    {
+      "path": "src/verify/mod.rs",
+      "hash": "05bac99fc8d84a61bea2d81b336e2279e2abacacf455afd0abf6939eb561fc3e"
+    },
+    {
+      "path": "src/voice/adapter.rs",
+      "hash": "2877ffec0a2e1d22fae516739444b36e26602f3b8ff8ce7d43bf97871b2018ab"
+    },
+    {
+      "path": "src/voice/envelope.rs",
+      "hash": "b8df56e02caa531e8c1bf35ac29cc6c5cc1d7828682c2e519ec530920b31fab5"
+    },
+    {
+      "path": "src/voice/mod.rs",
+      "hash": "021f21dfe62caee5fe69b484e261ff89431d1f0beb9ca469ff3f37fd4c9d4f23"
+    },
+    {
+      "path": "src/voice/policy.rs",
+      "hash": "5595b37decae65eb65337d40b83c1adf26bb831e592a1b772b880247cabe5927"
+    },
+    {
+      "path": "src/voice/provider.rs",
+      "hash": "300aa7a8ee833b901e3a3eb56f7c5d9107075a1aab331edbbb9b5c5c75e2713b"
+    },
+    {
+      "path": "src/voice/schema.rs",
+      "hash": "bca1f94a9e4f7d668a078bd8d68001caf21c4065fdb2d7f5cb299b29de7e8025"
+    },
+    {
+      "path": "src/voice/secrets.rs",
+      "hash": "e892a85b50bdc3dfe39a47a7cfb597681a2bb7d2afd30de282e24293bd69fac4"
+    },
+    {
+      "path": "src/voice/server.rs",
+      "hash": "940d8dbbb16d26db21abecb2b446c537db9f404305b95682d54b9cd8f9f3098a"
+    },
+    {
+      "path": "src/voice/webhook.rs",
+      "hash": "4baaabab24c3941037010758eb64f5bf0fe62e42f0771e7182bf982ec947449d"
+    },
+    {
+      "path": "tests/fakes/ion-verify-stub-gate-approve-no-commands.sh",
+      "hash": "0b2817ca9697057c872a1b4bfac55117ec915fc32171ff9d12794b2b54542110"
+    },
+    {
+      "path": "tests/fakes/ion-verify-stub-gate-changes-requested.sh",
+      "hash": "230c6b762f1b685a53e434d6086e7732f6446c5a69e5a4696249742a29b09633"
+    },
+    {
+      "path": "tests/fakes/ion-verify-stub-gate-contract-violation.sh",
+      "hash": "d8c23aa44660017312d221bb0ee6ff456dc0ca39e986e8ec9d303474214b3bde"
+    },
+    {
+      "path": "tests/fakes/ion-verify-stub-gate-nonzero-exit.sh",
+      "hash": "4d44ee28b7e45e4725ddaee7c9febdec88e85320403e0a7ec001bdb99c8427fc"
+    },
+    {
+      "path": "tests/fakes/ion-verify-stub-gate.sh",
+      "hash": "c4e85a1411425ec6be698290d3ed8ed471582885c1528a893641f533cf71710c"
+    },
+    {
+      "path": "tests/fixtures/sample-session.jsonl",
+      "hash": "ae2845aba96e86217376306e8955dcc7be219a0289b0919dacc9e31062d3f52c"
+    },
+    {
+      "path": "tests/governed_process_flow.rs",
+      "hash": "4dc494eedde95084178e34bed6a6eaaf936f1033f47fee2850cf70b0bff27fc5"
+    },
+    {
+      "path": "tests/hook_validation_extraction_benchmark.rs",
+      "hash": "939a9181e1d7c3716b173c27438a836e00eeccd78386113441ace8e1943912a4"
+    },
+    {
+      "path": "tests/hook_validation_precompact.rs",
+      "hash": "b97ee59890d465157966333b788211abd1efaa5d17c255c92431a7ae7d2dcce1"
+    },
+    {
+      "path": "tests/hook_validation_session_start.rs",
+      "hash": "b16bae9584518e5484814389d10a40e1d7349e7cbb85efbcce2f6a0e8362f2ad"
+    },
+    {
+      "path": "tests/integration_enhancements.rs",
+      "hash": "d798a737851e8c98fbf449509a8de73b28e0cc87921cfa2b10878c569c7de2da"
+    },
+    {
+      "path": "tests/ion_binary.rs",
+      "hash": "c85195890e7ff6d7af9a42ae04be544e6418915c170ea91128d99afaeb8c38d3"
+    },
+    {
+      "path": "tests/ion_verify_cli.rs",
+      "hash": "d10d8add0ec6116266704f41af22d0badc5e57a73b2b4c9ffd48d1405cc3db26"
+    }
+  ],
+  "status": "complete"
+}

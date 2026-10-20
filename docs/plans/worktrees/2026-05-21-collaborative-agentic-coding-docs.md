@@ -1,11 +1,11 @@
 ---
 title: Collaborative Agentic Coding Docs Lane
 description: Work card for the collaborative agentic coding documentation and validator update.
-updated: 2026-05-21
+updated: 2026-10-04
 type: doc
 category: planning
 phase: all
-status: active
+status: complete
 audience: builders
 tags: [worktree, lane, handoff, docs]
 ---
@@ -22,7 +22,9 @@ tags: [worktree, lane, handoff, docs]
 - Blocked/shared paths: existing dirty Rust workspace files and pre-existing desktop/Rust WIP
 - Plan/spec: user-provided Collaborative Agentic Coding Documentation Plan
 - Verification: docs validator plus Rust workspace gate from `impulse-rs`
-- Latest status: implementation complete; verification complete
+- Latest status: implementation complete; verification complete. Status corrected from `active`
+  to `complete` on 2026-10-04; the guide itself lives on in
+  `docs/guides/COLLABORATIVE-AGENTIC-CODING.md`.
 
 ## Decisions
 

@@ -173,6 +173,23 @@ fn file_fallback_genome(base_path: &Path, query: &str, limit: usize) -> Vec<Sear
         .collect()
 }
 
+/// The most results a search returns across all its pages. The keyword
+/// candidate pool is at least this large and does not depend on the page
+/// asked for, so every page of one search ranks the same candidates; a pool
+/// sized by the page window ranked a different set for later pages.
+pub const MAX_RESULT_WINDOW: usize = 1000;
+
+/// The entries semantic search scores, or `None` for all of them. The
+/// keyword prefilter exists to bound scoring on a large corpus, so it applies
+/// only when its candidates fill the pool; with fewer, every vector is
+/// scored. Restricting to a handful of keyword matches dropped entries that
+/// are close in meaning but share no word with the query, which is what
+/// semantic search is for.
+fn candidate_filter(keyword_candidates: Vec<SearchResult>, pool: usize) -> Option<HashSet<String>> {
+    (keyword_candidates.len() >= pool)
+        .then(|| keyword_candidates.into_iter().map(|r| r.id).collect())
+}
+
 fn semantic_history_rust(
     store: &RetrievalStore,
     config: &Config,
@@ -224,15 +241,14 @@ fn semantic_history_rust(
         }
     };
 
-    let candidate_limit = config.retrieval_candidate_pool.max(10);
+    // The same pool for every page, and large enough for the last one.
+    // Candidates match any query word, so the keyword filter does not decide
+    // semantic recall.
+    let candidate_limit = config.retrieval_candidate_pool.max(MAX_RESULT_WINDOW);
     let keyword_candidates = store
-        .search_history_keyword(query, candidate_limit)
+        .history_keyword_candidates(query, candidate_limit)
         .unwrap_or_default();
-    let candidate_ids: Option<HashSet<String>> = if keyword_candidates.is_empty() {
-        None
-    } else {
-        Some(keyword_candidates.into_iter().map(|r| r.id).collect())
-    };
+    let candidate_ids = candidate_filter(keyword_candidates, candidate_limit);
 
     let mut vectors = store.read_history_vectors()?;
     if let Some(ids) = &candidate_ids {
@@ -419,15 +435,11 @@ fn semantic_genome_rust(
         }
     };
 
-    let candidate_limit = config.retrieval_candidate_pool.max(10);
+    let candidate_limit = config.retrieval_candidate_pool.max(MAX_RESULT_WINDOW);
     let keyword_candidates = store
-        .search_genome_keyword(query, candidate_limit)
+        .genome_keyword_candidates(query, candidate_limit)
         .unwrap_or_default();
-    let candidate_ids: Option<HashSet<String>> = if keyword_candidates.is_empty() {
-        None
-    } else {
-        Some(keyword_candidates.into_iter().map(|r| r.id).collect())
-    };
+    let candidate_ids = candidate_filter(keyword_candidates, candidate_limit);
 
     let mut vectors = store.read_genome_vectors()?;
     if let Some(ids) = &candidate_ids {
@@ -570,12 +582,9 @@ pub fn search_history(
     mode_override: Option<RetrievalMode>,
     backend_override: Option<SearchBackend>,
     limit_override: Option<usize>,
-    offset_override: Option<usize>,
 ) -> Result<SearchResponse> {
     let started = Instant::now();
     let limit = limit_override.unwrap_or(config.retrieval_default_limit.max(1));
-    let offset = offset_override.unwrap_or(0);
-    let _ = offset; // offset parameter reserved for future use
     let mode = resolve_mode(config, mode_override);
 
     if query.trim().is_empty() {
@@ -732,12 +741,9 @@ pub fn search_genome(
     mode_override: Option<RetrievalMode>,
     backend_override: Option<SearchBackend>,
     limit_override: Option<usize>,
-    offset_override: Option<usize>,
 ) -> Result<SearchResponse> {
     let started = Instant::now();
     let limit = limit_override.unwrap_or(config.retrieval_default_limit.max(1));
-    let offset = offset_override.unwrap_or(0);
-    let _ = offset; // offset parameter reserved for future use
     let mode = resolve_mode(config, mode_override);
 
     if query.trim().is_empty() {
@@ -888,6 +894,24 @@ pub fn search_genome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verification round on 388967e: any-word candidates made the prefilter
+    /// apply more often, so close-in-meaning entries without a shared word
+    /// were never scored. Below a full pool, everything is scored.
+    #[test]
+    fn test_candidate_filter_applies_only_when_it_fills_the_pool() {
+        let hit = |id: &str| SearchResult {
+            source: "history".to_string(),
+            id: id.to_string(),
+            title: String::new(),
+            snippet: String::new(),
+            score: 0.0,
+        };
+        assert_eq!(candidate_filter(vec![hit("a")], 10), None);
+        assert_eq!(candidate_filter(Vec::new(), 10), None);
+        let full = candidate_filter((0..10).map(|i| hit(&format!("e{i}"))).collect(), 10);
+        assert_eq!(full.map(|ids| ids.len()), Some(10));
+    }
 
     #[test]
     fn test_cosine_similarity_identical() {

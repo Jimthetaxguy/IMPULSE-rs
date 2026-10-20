@@ -392,6 +392,21 @@ fn reap_sync_child_after_kill(
     }
 }
 
+/// Run `command` until it exits or `timeout` passes, whichever comes first,
+/// with bounded output capture and process-group cleanup.
+///
+/// The child is polled every 10 ms. A poll that finds an exit status wins over
+/// a deadline that expired during the sleep before it: a child that finished is
+/// reported as finished.
+///
+/// A **zero** `timeout` is a deadline that has already expired. The child is
+/// spawned, killed and reaped without being polled, so the result is always
+/// `timed_out`. Polling first would leave the outcome to the scheduler: a fast
+/// child can exit between `spawn` and the first poll whenever this thread loses
+/// the CPU there, and the caller would see a completed process for a deadline
+/// that gave it no time to run. Production callers pass the fixed timeouts at
+/// the top of this module; zero is what a test passes to reach the deadline
+/// path without waiting for one.
 fn run_bounded_process(
     command: &mut std::process::Command,
     label: &str,
@@ -427,12 +442,16 @@ fn run_bounded_process(
 
     let started = Instant::now();
     let (status, timed_out) = loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("failed waiting for {label}"))?
-        {
-            process_group.kill_now();
-            break (Some(status), false);
+        // An already-expired deadline is never polled. That has to be decided
+        // here and not left to timing; see the function comment.
+        if !timeout.is_zero() {
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("failed waiting for {label}"))?
+            {
+                process_group.kill_now();
+                break (Some(status), false);
+            }
         }
         if started.elapsed() >= timeout {
             process_group.kill_now();
@@ -841,7 +860,13 @@ fn is_untracked_impulse_runtime_artifact(path: &[u8]) -> bool {
             // promotion, which is only reachable *after* an approval, failed on
             // a tree the daemon had dirtied itself.
             | b".impulse/MEMORY_CANDIDATES.json"
+            // ADR-0023's blackboard. Ion opens it inside whatever worktree it
+            // runs in, including a staged Builder worktree, the moment a tool
+            // result spills; an ungitignored `.impulse` would then report the
+            // very tree the Builder is about to claim as dirty.
+            | b".impulse/blackboard.db"
     ) || path.starts_with(b".impulse/GOVERNED_TASKS.tmp.")
+        || path.starts_with(b".impulse/blackboard.db-")
         || path.starts_with(b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-")
         || path.starts_with(b".impulse/PRODUCER_RESERVATIONS.tmp.")
         || path.starts_with(b".impulse/MEMORY_CANDIDATES.tmp.")
@@ -2413,6 +2438,53 @@ fn observe_head_oid(workspace: &Path) -> Result<String> {
 /// then writes, leaving a window for a concurrent commit. Returns `false` when
 /// the swap lost, which the caller reports as a blocked promotion rather than
 /// an error.
+/// The reflog message the compare-and-swap writes, naming the exact move.
+/// A retried promotion looks for it to tell its own landed swap apart from
+/// a branch that merely sits at the accepted commit.
+fn promotion_reflog_message(initial_revision: &str, accepted_revision: &str) -> String {
+    format!("impulse governed promotion {initial_revision}..{accepted_revision}")
+}
+
+/// Whether `branch_ref`'s recent reflog shows this promotion moving it from
+/// `initial_revision` to `accepted_revision`, with nothing moving it off the
+/// accepted commit since. No reflog, or a probe that fails, is no evidence.
+fn branch_carries_this_promotion(
+    workspace: &Path,
+    branch_ref: &str,
+    initial_revision: &str,
+    accepted_revision: &str,
+) -> Result<bool> {
+    let mut command = hook_free_git(workspace);
+    command
+        .args(["reflog", "show", "-n", "20", "--format=%H%x09%gs"])
+        .arg(branch_ref);
+    let output = run_bounded_process(
+        &mut command,
+        "governed outcome promotion reflog check",
+        GIT_PROBE_TIMEOUT,
+    )?;
+    if !git_completed_successfully(&output, "git reflog show")? {
+        return Ok(false);
+    }
+    if output.stdout_truncated {
+        anyhow::bail!("promotion reflog check exceeded the bounded Git output limit");
+    }
+    let entries = String::from_utf8(output.stdout).context("branch reflog is not valid UTF-8")?;
+    let expected = promotion_reflog_message(initial_revision, accepted_revision);
+    // Newest first: every entry down to ours must leave the branch at the
+    // accepted commit (a later `reset` to the same commit does).
+    for entry in entries.lines() {
+        let (revision, subject) = entry.split_once('\t').unwrap_or((entry, ""));
+        if revision != accepted_revision {
+            return Ok(false);
+        }
+        if subject == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn compare_and_swap_canonical_branch(
     workspace: &Path,
     branch_ref: &str,
@@ -2422,8 +2494,16 @@ fn compare_and_swap_canonical_branch(
     validate_oid(expected_revision)?;
     validate_oid(accepted_revision)?;
     let mut command = hook_free_git(workspace);
+    // `--create-reflog` writes the entry even where `core.logAllRefUpdates`
+    // is off, so a retry can always find it.
     command
         .arg("update-ref")
+        .arg("--create-reflog")
+        .arg("-m")
+        .arg(promotion_reflog_message(
+            expected_revision,
+            accepted_revision,
+        ))
         .arg(branch_ref)
         .arg(accepted_revision)
         .arg(expected_revision);
@@ -2571,6 +2651,26 @@ pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromot
             PromotionBlockedReason::DetachedHead,
         ));
     };
+    // A retry after the branch already advanced -- the swap landed, then the
+    // receipt failed or the daemon died before recording it, or the worktree
+    // sync failed and was redone by hand as its error asks -- finds the clean
+    // canonical branch at the accepted commit. When the branch's reflog shows
+    // this promotion's own swap, that is its effect, not a concurrent move;
+    // reporting it as `CanonicalHeadMoved` left the run unpromotable. A branch
+    // that only happens to sit there (say, one checked out at the accepted
+    // commit to inspect it) has no such entry and is still reported as moved.
+    if canonical_head == accepted_revision
+        && branch_carries_this_promotion(&workspace, &branch_ref, &initial, &accepted_revision)?
+    {
+        return Ok(GovernedPromotionInput {
+            actor: staged_system_actor(),
+            accepted_revision: accepted_revision.clone(),
+            initial_subject_revision: initial,
+            outcome: GovernedPromotionOutcome::Promoted {
+                promoted_revision: accepted_revision,
+            },
+        });
+    }
     if canonical_head != initial {
         return Ok(blocked(
             canonical_head,
@@ -2697,6 +2797,7 @@ mod tests {
             staged_worktree: None,
             promotions: Vec::new(),
             execution_state: GovernedExecutionState::Running,
+            exit_kind: Default::default(),
             review_state: GovernedReviewState::AwaitingSupervisor,
             claims: vec![WorkerCompletionClaim {
                 id: claim_id.clone(),
@@ -2816,6 +2917,41 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("dirty"));
+    }
+
+    /// ADR-0023: a real blackboard (database plus its WAL and shared-memory
+    /// sidecars) in an ungitignored `.impulse` leaves the subject clean.
+    #[test]
+    fn clean_git_subject_exempts_the_blackboard_database_and_sidecars() {
+        let repo = init_repo();
+        let initial = observe_clean_git_subject(repo.path(), None).unwrap();
+        let impulse = repo.path().join(".impulse");
+        let board = crate::blackboard::Blackboard::open(&impulse).unwrap();
+        board
+            .put(crate::blackboard::NewEntry {
+                task_id: "spill:bash_exec:1",
+                payload: b"output",
+                content_type: "text/plain",
+                ttl_seconds: None,
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        // Keep the connection open so the WAL sidecars exist during the check.
+        assert!(impulse.join("blackboard.db").exists());
+        assert_eq!(
+            observe_clean_git_subject(repo.path(), Some(&initial)).unwrap(),
+            initial
+        );
+        assert!(is_untracked_impulse_runtime_artifact(
+            b".impulse/blackboard.db-wal"
+        ));
+        assert!(is_untracked_impulse_runtime_artifact(
+            b".impulse/blackboard.db-shm"
+        ));
+        assert!(!is_untracked_impulse_runtime_artifact(
+            b".impulse/blackboard.dbx"
+        ));
+        drop(board);
     }
 
     /// ADR-0020 rule 3a. `.impulse/MEMORY.jsonl` and `.impulse/GENOME_PROJECTION.md`
@@ -4077,9 +4213,11 @@ mod tests {
     /// and reaped, so it comes back as simply "not success". Under load that
     /// reported a violation that never happened.
     ///
-    /// A zero deadline makes this deterministic: the bounded runner checks
-    /// `try_wait` once and then the elapsed time, and no spawned process can
-    /// have exited in that window.
+    /// A zero deadline makes this deterministic because the bounded runner
+    /// treats it as already expired: the child is killed and reaped without
+    /// being polled. Until 2026-09-27 the runner polled first and this test
+    /// relied on no child being able to exit between `spawn` and that poll. On
+    /// a loaded CI runner one did, and the probe came back as a success.
     #[test]
     fn test_a_timed_out_ancestry_probe_is_not_reported_as_a_governance_finding() {
         let dir = init_repo();
@@ -4107,6 +4245,72 @@ mod tests {
                 command: "git merge-base --is-ancestor".to_string()
             }),
             "and it must be typed, so a caller can tell 'unknown' from 'violated'"
+        );
+    }
+
+    /// The race the zero-deadline contract removes. `true` exits within a
+    /// millisecond or two of `spawn`, so a runner that polls before it checks
+    /// the deadline returns that exit status whenever its thread loses the CPU
+    /// in between. Repeated, because one pass proves little about a race.
+    #[test]
+    fn test_run_bounded_process_zero_deadline_always_times_out() {
+        for attempt in 0..100 {
+            let mut command = std::process::Command::new("true");
+            let output = run_bounded_process(&mut command, "true", Duration::ZERO)
+                .expect("spawning `true` must succeed");
+            assert!(
+                output.timed_out,
+                "attempt {attempt}: a zero deadline reported a completed child (status {:?})",
+                output.status
+            );
+        }
+    }
+
+    /// Any non-zero deadline keeps the poll-first order: a child that finished
+    /// is reported as finished, with its own exit status.
+    #[test]
+    fn test_run_bounded_process_nonzero_deadline_reports_the_exit_status() {
+        for (program, succeeds) in [("true", true), ("false", false)] {
+            let mut command = std::process::Command::new(program);
+            let output = run_bounded_process(&mut command, program, Duration::from_secs(30))
+                .expect("spawning must succeed");
+            assert!(
+                !output.timed_out,
+                "`{program}` finished well inside its deadline"
+            );
+            let status = output.status.expect("a finished child has a status");
+            assert_eq!(status.success(), succeeds, "`{program}` exit status");
+        }
+    }
+
+    /// A child that outlives a real deadline is killed at it, not waited for.
+    #[test]
+    fn test_run_bounded_process_kills_a_child_that_outlives_its_deadline() {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        let started = Instant::now();
+        let output = run_bounded_process(&mut command, "sleep 30", Duration::from_millis(50))
+            .expect("spawning `sleep` must succeed");
+        assert!(output.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the runner waited {:?} for a child it should have killed at 50 ms",
+            started.elapsed()
+        );
+    }
+
+    /// Error path: a program that cannot be spawned is an error naming the
+    /// command, neither a timeout nor a status.
+    #[test]
+    fn test_run_bounded_process_spawn_failure_names_the_command() {
+        let mut command =
+            std::process::Command::new("/nonexistent/impulse-test-program-that-does-not-exist");
+        let error = run_bounded_process(&mut command, "missing program", Duration::from_secs(1))
+            .err()
+            .expect("a missing program cannot be spawned");
+        assert!(
+            format!("{error:#}").contains("failed to spawn missing program"),
+            "unexpected error: {error:#}"
         );
     }
 

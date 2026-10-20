@@ -1778,6 +1778,7 @@ mod unix {
                 staged_worktree: None,
                 promotions: vec![],
                 execution_state: GovernedExecutionState::Registered,
+                exit_kind: Default::default(),
                 review_state: GovernedReviewState::AwaitingClaim,
                 claims: vec![],
                 verifications: vec![],
@@ -1877,6 +1878,7 @@ mod unix {
                 staged_worktree: None,
                 promotions: vec![],
                 execution_state: GovernedExecutionState::Registered,
+                exit_kind: Default::default(),
                 review_state: GovernedReviewState::AwaitingClaim,
                 claims: vec![],
                 verifications: vec![],
@@ -1952,6 +1954,7 @@ mod unix {
                 staged_worktree: None,
                 promotions: vec![],
                 execution_state: GovernedExecutionState::Running,
+                exit_kind: Default::default(),
                 review_state: GovernedReviewState::AwaitingClaim,
                 claims: vec![],
                 verifications: vec![],
@@ -1967,6 +1970,7 @@ mod unix {
                     id: "desktop-runtime".to_string(),
                 },
                 reason: Some("worker exited while daemon was unavailable".to_string()),
+                exit_kind: Default::default(),
             };
             let mut client = UnixDaemonOpsClient::new(socket.clone())
                 .with_lifecycle_outbox(Some(outbox_path.clone()));
@@ -2053,6 +2057,7 @@ mod unix {
             let first_mutation = GovernedTaskMutation::MarkRuntimeExited {
                 actor: actor.clone(),
                 reason: Some("first runtime exited".to_string()),
+                exit_kind: Default::default(),
             };
             let client = UnixDaemonOpsClient::new(socket.clone())
                 .with_lifecycle_outbox(Some(outbox_path.clone()));
@@ -2084,6 +2089,7 @@ mod unix {
                 staged_worktree: None,
                 promotions: vec![],
                 execution_state: GovernedExecutionState::Running,
+                exit_kind: Default::default(),
                 review_state: GovernedReviewState::AwaitingClaim,
                 claims: vec![],
                 verifications: vec![],
@@ -2153,6 +2159,7 @@ mod unix {
                     mutation: GovernedTaskMutation::MarkRuntimeExited {
                         actor,
                         reason: Some("second runtime exited".to_string()),
+                        exit_kind: Default::default(),
                     },
                 });
                 append_tx.send(result).unwrap();
@@ -2219,6 +2226,7 @@ mod unix {
                     mutation: GovernedTaskMutation::MarkRuntimeExited {
                         actor,
                         reason: Some("later runtime exited".to_string()),
+                        exit_kind: Default::default(),
                     },
                 })
                 .unwrap();
@@ -2242,6 +2250,7 @@ mod unix {
                 staged_worktree: None,
                 promotions: vec![],
                 execution_state: GovernedExecutionState::Running,
+                exit_kind: Default::default(),
                 review_state: GovernedReviewState::AwaitingClaim,
                 claims: vec![],
                 verifications: vec![],
@@ -2338,6 +2347,7 @@ mod unix {
                         id: "desktop-runtime".to_string(),
                     },
                     reason: Some("confirmed runtime termination".to_string()),
+                    exit_kind: Default::default(),
                 },
             };
             let first_pending = queue("outbox-writer-a", "task-writer-a");
@@ -2394,6 +2404,7 @@ mod unix {
                         id: "desktop-runtime".to_string(),
                     },
                     reason: Some("confirmed runtime termination".to_string()),
+                    exit_kind: Default::default(),
                 },
             };
             UnixDaemonOpsClient::new(PathBuf::from("unused.sock"))
@@ -2452,6 +2463,7 @@ mod unix {
                         id: "desktop-runtime".to_string(),
                     },
                     reason: Some("confirmed parent runtime termination".to_string()),
+                    exit_kind: Default::default(),
                 },
             };
             UnixDaemonOpsClient::write_lifecycle_outbox(
@@ -2722,6 +2734,7 @@ mod unix {
                 staged_worktree: None,
                 promotions: vec![],
                 execution_state: impulse_ops::governed_task::GovernedExecutionState::Registered,
+                exit_kind: Default::default(),
                 review_state: impulse_ops::governed_task::GovernedReviewState::Accepted,
                 claims: vec![],
                 verifications: vec![],
@@ -2832,6 +2845,7 @@ mod unix {
                 staged_worktree: None,
                 promotions: vec![],
                 execution_state: gt::GovernedExecutionState::Running,
+                exit_kind: Default::default(),
                 review_state: gt::GovernedReviewState::AwaitingClaim,
                 claims: vec![],
                 verifications: vec![],
@@ -2887,6 +2901,7 @@ mod unix {
                             id: "cockpit-runtime".to_string(),
                         },
                         reason: Some("builder exited".to_string()),
+                        exit_kind: Default::default(),
                     },
                 )
                 .expect("a profiled runtime exit must reconcile from the cockpit");
@@ -3123,6 +3138,7 @@ mod unix {
                 }),
                 promotions: vec![],
                 execution_state: gt::GovernedExecutionState::RuntimeExited,
+                exit_kind: Default::default(),
                 review_state: gt::GovernedReviewState::Accepted,
                 claims: vec![],
                 verifications: vec![],

@@ -119,6 +119,19 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// The longest prefix of `text` that is at most `max` bytes and ends on a
+/// char boundary, for a fixed-width column. Slicing at a raw byte count
+/// panicked when it landed inside a multi-byte character, and names, session
+/// ids and GENOME entries may all contain them. A character's UTF-8 length
+/// is at least its display width, so the prefix still fits the column.
+pub fn prefix_on_char_boundary(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// Truncate text with ellipsis. UTF-8 safe — never slices mid-character.
 pub fn truncate(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
@@ -404,6 +417,19 @@ pub fn search_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_prefix_on_char_boundary_never_splits_a_character() {
+        assert_eq!(prefix_on_char_boundary("abcdef", 4), "abcd");
+        assert_eq!(prefix_on_char_boundary("abc", 30), "abc");
+        assert_eq!(prefix_on_char_boundary("", 5), "");
+        assert_eq!(prefix_on_char_boundary("abc", 0), "");
+        // "é" is two bytes and "日" three; a cut inside either backs off.
+        assert_eq!(prefix_on_char_boundary("aé", 2), "a");
+        assert_eq!(prefix_on_char_boundary("日本", 4), "日");
+        let decision = "x".repeat(29) + "日本語の決定";
+        assert_eq!(prefix_on_char_boundary(&decision, 30), "x".repeat(29));
+    }
 
     #[test]
     fn test_sparkline() {

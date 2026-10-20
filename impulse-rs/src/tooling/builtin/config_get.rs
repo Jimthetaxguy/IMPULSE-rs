@@ -51,15 +51,18 @@ impl DynamicTool for ConfigGetTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
+        // Without an explicit `impulse_dir`, the session's own directory: a
+        // relative `.impulse` named whatever directory the process ran from.
         let impulse_dir = params
             .get("impulse_dir")
             .and_then(|v| v.as_str())
-            .unwrap_or(".impulse");
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| ctx.impulse_dir.clone());
         let key = params.get("key").and_then(|v| v.as_str());
 
-        let config_path = std::path::PathBuf::from(impulse_dir).join("config.json");
+        let config_path = impulse_dir.join("config.json");
 
         if !config_path.exists() {
             return Ok(ToolResult::json(serde_json::json!({
@@ -101,6 +104,34 @@ impl DynamicTool for ConfigGetTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recorded review P3: with no `impulse_dir`, the tool read a
+    /// `.impulse` relative to the process's working directory instead of the
+    /// session's own directory.
+    #[tokio::test]
+    async fn test_execute_defaults_to_the_contexts_impulse_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.json"), r#"{"log_level": "trace"}"#).unwrap();
+        let ctx = ToolContext {
+            impulse_dir: dir.path().to_path_buf(),
+            ..ToolContext::with_all_capabilities()
+        };
+        let result = ConfigGetTool
+            .execute(serde_json::json!({"key": "log_level"}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            result.output["exists"],
+            serde_json::json!(true),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.to_string().contains("trace"),
+            "{}",
+            result.output
+        );
+    }
 
     #[test]
     fn test_descriptor() {

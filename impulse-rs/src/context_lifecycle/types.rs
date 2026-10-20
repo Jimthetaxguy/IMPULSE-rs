@@ -175,6 +175,9 @@ pub struct PaneContextState {
     pub extracted_insights: Vec<ExtractedInsight>,
     /// Last time output was scanned for compaction patterns
     pub last_compaction_scan_at: Option<Instant>,
+    /// The compaction lines on screen at the last scan; a compaction counts
+    /// only when a line not among them appears.
+    pub last_compaction_lines: Vec<String>,
     /// Last time output was scanned for extraction patterns
     pub last_extraction_at: Option<Instant>,
 }
@@ -208,6 +211,7 @@ impl PaneContextState {
             compaction_count: 0,
             extracted_insights: Vec::new(),
             last_compaction_scan_at: None,
+            last_compaction_lines: Vec::new(),
             last_extraction_at: None,
         }
     }

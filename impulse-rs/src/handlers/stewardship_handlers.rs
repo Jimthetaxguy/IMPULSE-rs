@@ -242,9 +242,9 @@ pub fn handle_steward(
                 print!("{}", context);
             }
         }
-        _ => {
-            eprintln!("Unknown steward subcommand: '{}'. Available: status, analyze, list, approve, reject, memory, compact", subcommand);
-        }
+        _ => anyhow::bail!(
+            "Unknown steward subcommand: '{subcommand}'. Available: status, analyze, list, approve, reject, memory, compact"
+        ),
     }
     Ok(())
 }
@@ -291,9 +291,7 @@ pub async fn handle_analyze(
             println!("  tokens   - Token usage analysis");
             println!("  all      - This help message");
         }
-        _ => {
-            eprintln!("Unknown scope: {}. Use: session, tokens, all", scope);
-        }
+        _ => anyhow::bail!("Unknown scope: {scope}. Use: session, tokens, all"),
     }
     Ok(())
 }

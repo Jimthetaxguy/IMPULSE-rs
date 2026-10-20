@@ -51,9 +51,47 @@ pub fn get_env_vars(prefix: &str) -> Vec<EnvInfo> {
         .collect()
 }
 
-/// Get impulse-specific environment variables
+/// `IMPULSE_*` variables whose values are shown. They say where and how
+/// Impulse is running; none grants anything.
+const SHOWN_IMPULSE_VARS: &[&str] = &[
+    "IMPULSE_HOME",
+    "IMPULSE_SESSION_ID",
+    "IMPULSE_SOCKET_PATH",
+    "IMPULSE_MODEL",
+    "IMPULSE_PROVIDER",
+    "IMPULSE_PROJECT_ID",
+    "IMPULSE_GOVERNED_TASK_ID",
+    "IMPULSE_PANE_ID",
+    "IMPULSE_CAPABILITIES_PATH",
+    "IMPULSE_CONTROL_CLI",
+];
+
+/// What stands in for a value that is not shown.
+const WITHHELD: &str = "(withheld)";
+
+/// Impulse-specific environment variables, for `system_info`.
+///
+/// Only the variables in [`SHOWN_IMPULSE_VARS`] keep their values; any other
+/// `IMPULSE_*` name is listed with its value withheld. `system_info` reaches
+/// voice and MCP callers, and an `IMPULSE_*` variable can hold a secret: the
+/// operator capability token (`IMPULSE_OPERATOR_CAPABILITY`) was handed to
+/// any of them that asked.
 pub fn get_impulse_env_vars() -> Vec<EnvInfo> {
-    get_env_vars("IMPULSE_")
+    shown_impulse_vars(get_env_vars("IMPULSE_"))
+}
+
+/// [`get_impulse_env_vars`]'s filter, over any list of variables.
+fn shown_impulse_vars(vars: Vec<EnvInfo>) -> Vec<EnvInfo> {
+    vars.into_iter()
+        .map(|EnvInfo { key, value }| {
+            let value = if SHOWN_IMPULSE_VARS.contains(&key.as_str()) {
+                value
+            } else {
+                WITHHELD.to_string()
+            };
+            EnvInfo { key, value }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -107,5 +145,36 @@ mod tests {
         assert_eq!(info.arch, recovered.arch);
         assert_eq!(info.current_dir, recovered.current_dir);
         assert_eq!(info.python_available, recovered.python_available);
+    }
+
+    /// Review finding: `system_info` (reachable from voice and MCP) returned
+    /// every `IMPULSE_*` value, the operator capability token included.
+    #[test]
+    fn test_impulse_vars_show_only_informational_values() {
+        let vars = vec![
+            EnvInfo {
+                key: "IMPULSE_HOME".to_string(),
+                value: "/tmp/impulse".to_string(),
+            },
+            EnvInfo {
+                key: "IMPULSE_OPERATOR_CAPABILITY".to_string(),
+                value: "secret-token".to_string(),
+            },
+            EnvInfo {
+                key: "IMPULSE_SOMETHING_NEW".to_string(),
+                value: "unknown".to_string(),
+            },
+        ];
+        let shown = shown_impulse_vars(vars);
+        let value_of = |key: &str| {
+            shown
+                .iter()
+                .find(|var| var.key == key)
+                .map(|var| var.value.as_str())
+        };
+        assert_eq!(value_of("IMPULSE_HOME"), Some("/tmp/impulse"));
+        assert_eq!(value_of("IMPULSE_OPERATOR_CAPABILITY"), Some(WITHHELD));
+        assert_eq!(value_of("IMPULSE_SOMETHING_NEW"), Some(WITHHELD));
+        assert!(!format!("{shown:?}").contains("secret-token"));
     }
 }

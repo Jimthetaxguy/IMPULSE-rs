@@ -257,12 +257,21 @@ pub fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
     {
         return true;
     }
-    // A worktree with no shared-configuration pin can never be promoted, so
-    // discarding it is the only way forward and must always be available.
-    if task
-        .staged_worktree
-        .as_ref()
-        .is_some_and(|staged| staged.shared_config_digest.is_unknown())
+    // A worktree whose shared-configuration pin this build cannot compare --
+    // absent, or recorded under a superseded digest scheme -- can never be
+    // promoted, so discarding it is the only way forward and must always be
+    // available. This must match the state layer's rule exactly: checking only
+    // `is_unknown` left a superseded-scheme pin undiscardable here (the daemon
+    // preflight and the cockpit's Discard control) while every other path
+    // told the operator to discard it. A Builder still working in it (the
+    // scheme changed under a live run) is stopped first, which the clause
+    // above then covers: discarding would delete work it has not committed.
+    // Keep this clause identical to the state layer's copy.
+    if !builder_still_working(task)
+        && task
+            .staged_worktree
+            .as_ref()
+            .is_some_and(|staged| !staged.shared_config_digest.is_comparable())
     {
         return true;
     }
@@ -275,6 +284,18 @@ pub fn staged_worktree_is_discardable(task: &GovernedTaskRun) -> bool {
         GovernedReviewState::Accepted => task.latest_promotion().is_some(),
         _ => false,
     }
+}
+
+/// A runtime still running while its run is in the build loop: review has
+/// not reached a decision (accepted, rejected, or escalated).
+fn builder_still_working(task: &GovernedTaskRun) -> bool {
+    task.execution_state == GovernedExecutionState::Running
+        && !matches!(
+            task.review_state,
+            GovernedReviewState::Accepted
+                | GovernedReviewState::Rejected
+                | GovernedReviewState::Escalated
+        )
 }
 
 /// Whether a governed task's *state* admits a promotion attempt.
@@ -370,6 +391,7 @@ mod tests {
             staged_worktree: None,
             promotions: Vec::new(),
             execution_state: GovernedExecutionState::Running,
+            exit_kind: Default::default(),
             review_state: GovernedReviewState::AwaitingClaim,
             claims: Vec::new(),
             verifications: Vec::new(),
@@ -793,13 +815,27 @@ mod tests {
     }
 
     #[test]
-    fn test_a_launch_failure_and_an_unpinned_worktree_are_always_discardable() {
+    fn test_a_launch_failure_and_an_idle_unpinned_worktree_are_discardable() {
         let mut launch_failed = with_staged(task(), pinned());
         launch_failed.execution_state = GovernedExecutionState::LaunchFailed;
         assert!(staged_worktree_is_discardable(&launch_failed));
 
-        let unpinned = with_staged(task(), SharedRepositoryConfigPin::Unknown);
+        let mut unpinned = with_staged(task(), SharedRepositoryConfigPin::Unknown);
+        unpinned.execution_state = GovernedExecutionState::Registered;
         assert!(staged_worktree_is_discardable(&unpinned));
+    }
+
+    /// Refutation review of 5d60aa0: a pin the build cannot compare made a
+    /// worktree discardable even while its Builder was still running in it
+    /// (possible when an upgrade changes the scheme under a live run).
+    #[test]
+    fn test_an_unpinned_worktree_with_a_live_runtime_is_stopped_before_it_is_discardable() {
+        let mut live = with_staged(task(), SharedRepositoryConfigPin::Unknown);
+        live.execution_state = GovernedExecutionState::Running;
+        assert!(!staged_worktree_is_discardable(&live));
+
+        live.execution_state = GovernedExecutionState::RuntimeExited;
+        assert!(staged_worktree_is_discardable(&live));
     }
 
     /// ADR-0019 miss: cancelling a run records `RuntimeExited` and leaves

@@ -459,6 +459,29 @@ pub enum GovernedExecutionState {
     RuntimeExited,
 }
 
+/// Why a governed run left `Running`.
+///
+/// Carried on the run record and on `MarkRuntimeExited`, not as a new
+/// execution state. Older ledgers omit the field and read as [`Natural`];
+/// replay must not reclassify them from the free-text exit reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernedExitKind {
+    /// The runtime ended on its own, or the ledger predates this field.
+    #[default]
+    Natural,
+    /// The operator's cancel was answered. A later worker claim is refused.
+    OperatorCancelled,
+    /// The runtime was stopped because its deadline elapsed.
+    Timeout,
+    /// The runtime process died without a clean exit.
+    Crashed,
+}
+
+fn exit_kind_is_natural(kind: &GovernedExitKind) -> bool {
+    matches!(kind, GovernedExitKind::Natural)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum GovernedReviewState {
@@ -1059,6 +1082,11 @@ pub enum GovernedTaskMutation {
     MarkRuntimeExited {
         actor: GovernedActor,
         reason: Option<String>,
+        /// Serde-default [`GovernedExitKind::Natural`], and omitted from the
+        /// fingerprint payload when natural, so a ledger written before this
+        /// field replays unchanged.
+        #[serde(default, skip_serializing_if = "exit_kind_is_natural")]
+        exit_kind: GovernedExitKind,
     },
     MaterializeStagedWorktree {
         staged: StagedWorktreeInput,
@@ -1276,6 +1304,11 @@ pub struct GovernedTaskRun {
     pub promotions: Vec<GovernedPromotion>,
     #[serde(default)]
     pub execution_state: GovernedExecutionState,
+    /// Why `execution_state` became `RuntimeExited`. `Natural` on every
+    /// record that has not exited, and on ledgers written before the field
+    /// existed.
+    #[serde(default)]
+    pub exit_kind: GovernedExitKind,
     #[serde(default)]
     pub review_state: GovernedReviewState,
     #[serde(default)]
@@ -1730,6 +1763,7 @@ mod tests {
             staged_worktree: staged,
             promotions: Vec::new(),
             execution_state: GovernedExecutionState::Registered,
+            exit_kind: Default::default(),
             review_state: GovernedReviewState::AwaitingClaim,
             claims: Vec::new(),
             verifications: Vec::new(),
@@ -2151,5 +2185,61 @@ mod tests {
             reason
         );
         assert_eq!(reason.to_string(), "repository_config_unpinned");
+    }
+
+    #[test]
+    fn test_exit_kind_round_trips_and_defaults_to_natural() {
+        for kind in [
+            GovernedExitKind::Natural,
+            GovernedExitKind::OperatorCancelled,
+            GovernedExitKind::Timeout,
+            GovernedExitKind::Crashed,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            let recovered: GovernedExitKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(kind, recovered);
+        }
+
+        let legacy = serde_json::json!({
+            "kind": "mark_runtime_exited",
+            "data": {
+                "actor": {"kind": "system", "id": "impulse-daemon"},
+                "reason": "runtime exited"
+            }
+        });
+        let mutation: GovernedTaskMutation = serde_json::from_value(legacy).unwrap();
+        match mutation {
+            GovernedTaskMutation::MarkRuntimeExited {
+                exit_kind, reason, ..
+            } => {
+                assert_eq!(exit_kind, GovernedExitKind::Natural);
+                assert_eq!(reason.as_deref(), Some("runtime exited"));
+            }
+            other => panic!("expected mark_runtime_exited, got {other:?}"),
+        }
+
+        let natural = GovernedTaskMutation::MarkRuntimeExited {
+            actor: GovernedActor {
+                kind: GovernedActorKind::System,
+                id: "impulse-daemon".to_string(),
+            },
+            reason: Some("runtime exited".to_string()),
+            exit_kind: GovernedExitKind::Natural,
+        };
+        let natural_json = serde_json::to_value(&natural).unwrap();
+        assert!(natural_json["data"].get("exit_kind").is_none());
+
+        let cancelled = GovernedTaskMutation::MarkRuntimeExited {
+            actor: GovernedActor {
+                kind: GovernedActorKind::System,
+                id: "impulse-daemon".to_string(),
+            },
+            reason: Some("operator cancelled the run".to_string()),
+            exit_kind: GovernedExitKind::OperatorCancelled,
+        };
+        let cancelled_json = serde_json::to_value(&cancelled).unwrap();
+        assert_eq!(cancelled_json["data"]["exit_kind"], "operator_cancelled");
+        let recovered: GovernedTaskMutation = serde_json::from_value(cancelled_json).unwrap();
+        assert_eq!(recovered, cancelled);
     }
 }
