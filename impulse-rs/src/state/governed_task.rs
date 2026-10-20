@@ -5,7 +5,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
 use impulse_ops::governed_task::{
-    GovernedActor, GovernedActorKind, GovernedExecutionState, GovernedPromotion,
+    GovernedActor, GovernedActorKind, GovernedExecutionState, GovernedExitKind, GovernedPromotion,
     GovernedPromotionInput, GovernedPromotionOutcome, GovernedRecordId, GovernedRequestId,
     GovernedReviewState, GovernedTaskContractError, GovernedTaskEvent, GovernedTaskEventKind,
     GovernedTaskId, GovernedTaskMutation, GovernedTaskMutationRequest, GovernedTaskRegistration,
@@ -331,6 +331,7 @@ impl State {
             staged_worktree: None,
             promotions: Vec::new(),
             execution_state: GovernedExecutionState::Registered,
+            exit_kind: Default::default(),
             review_state: GovernedReviewState::AwaitingClaim,
             claims: Vec::new(),
             verifications: Vec::new(),
@@ -428,6 +429,29 @@ impl State {
                 current: current.revision,
             }
             .into());
+        }
+
+        // An answered cancel of an already-terminal run succeeds and changes
+        // nothing: no new event, no revision bump, and the recorded exit kind
+        // stays whatever was written first. A later natural exit still fails
+        // below, so the runner cannot overwrite a cancel the operator was told
+        // about.
+        if let GovernedTaskMutation::MarkRuntimeExited {
+            actor,
+            reason,
+            exit_kind: GovernedExitKind::OperatorCancelled,
+        } = &request.mutation
+        {
+            if matches!(
+                current.execution_state,
+                GovernedExecutionState::RuntimeExited | GovernedExecutionState::LaunchFailed
+            ) {
+                require_actor(actor, GovernedActorKind::System)?;
+                if let Some(reason) = reason.as_deref() {
+                    require_text("runtime exit reason", reason)?;
+                }
+                return Ok(current);
+            }
         }
 
         let next_revision = current.revision.checked_add(1).ok_or_else(|| {
@@ -633,6 +657,7 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
     let mut projection = task.clone();
     projection.revision = 0;
     projection.execution_state = GovernedExecutionState::Registered;
+    projection.exit_kind = GovernedExitKind::Natural;
     projection.review_state = GovernedReviewState::AwaitingClaim;
     projection.claims.clear();
     projection.verifications.clear();
@@ -741,9 +766,13 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
                 (mutation.clone(), mutation)
             }
             GovernedTaskEventKind::RuntimeExited => {
+                // The exit kind lives on the run record. A ledger that predates
+                // the field deserializes it as `Natural`, and replay must not
+                // re-read the free-text reason as a cancel.
                 let mutation = GovernedTaskMutation::MarkRuntimeExited {
                     actor: event.actor.clone(),
                     reason: Some(event.detail.clone()),
+                    exit_kind: task.exit_kind,
                 };
                 (mutation.clone(), mutation)
             }
@@ -1016,6 +1045,7 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
         anyhow::bail!("governed task contains records without matching lifecycle events");
     }
     if projection.execution_state != task.execution_state
+        || projection.exit_kind != task.exit_kind
         || projection.review_state != task.review_state
     {
         anyhow::bail!(
@@ -1149,9 +1179,11 @@ fn fingerprint_mutation(
         GovernedTaskMutation::MarkRuntimeExited {
             actor,
             reason: None,
+            exit_kind,
         } => GovernedTaskMutation::MarkRuntimeExited {
             actor: actor.clone(),
             reason: Some("runtime exited".to_string()),
+            exit_kind: *exit_kind,
         },
         mutation => mutation.clone(),
     };
@@ -1439,7 +1471,11 @@ fn apply_mutation(
                 now,
             ));
         }
-        GovernedTaskMutation::MarkRuntimeExited { actor, reason } => {
+        GovernedTaskMutation::MarkRuntimeExited {
+            actor,
+            reason,
+            exit_kind,
+        } => {
             require_actor(&actor, GovernedActorKind::System)?;
             if task.execution_state != GovernedExecutionState::Running {
                 return invalid_transition("runtime exit requires a running task");
@@ -1448,6 +1484,7 @@ fn apply_mutation(
                 require_text("runtime exit reason", reason)?;
             }
             task.execution_state = GovernedExecutionState::RuntimeExited;
+            task.exit_kind = exit_kind;
             task.events.push(new_event(
                 event_revision,
                 GovernedTaskEventKind::RuntimeExited,
@@ -1471,6 +1508,14 @@ fn apply_mutation(
                 GovernedExecutionState::Running | GovernedExecutionState::RuntimeExited
             ) {
                 return invalid_transition("claim requires a launched or exited runtime");
+            }
+            // An answered operator cancel wins over a later worker claim, for
+            // both staged and authoritative scope. Output already on the task
+            // stays; only the new claim is refused. Replay does not re-judge:
+            // a ledger written before this gate may already contain the
+            // transition (see `MutationContext::is_replay`).
+            if !context.is_replay && task.exit_kind == GovernedExitKind::OperatorCancelled {
+                return invalid_transition("run was cancelled; claim refused");
             }
             if !matches!(
                 task.review_state,
@@ -2920,6 +2965,7 @@ pub(in crate::state) mod tests {
                 GovernedTaskMutation::MarkRuntimeExited {
                     actor: actor(GovernedActorKind::System, "desktop"),
                     reason: None,
+                    exit_kind: Default::default(),
                 },
             ))
             .unwrap();
@@ -3005,6 +3051,7 @@ pub(in crate::state) mod tests {
             GovernedTaskMutation::MarkRuntimeExited {
                 actor: actor(GovernedActorKind::System, "desktop"),
                 reason: None,
+                exit_kind: Default::default(),
             },
         );
         stale.expected_revision = 0;
@@ -3026,6 +3073,7 @@ pub(in crate::state) mod tests {
                 GovernedTaskMutation::MarkRuntimeExited {
                     actor: actor(GovernedActorKind::System, "desktop"),
                     reason: None,
+                    exit_kind: Default::default(),
                 },
             ))
             .unwrap();
@@ -4178,6 +4226,7 @@ pub(in crate::state) mod tests {
                 GovernedTaskMutation::MarkRuntimeExited {
                     actor: actor(GovernedActorKind::System, "impulse-daemon"),
                     reason: Some("operator cancelled the run".into()),
+                    exit_kind: Default::default(),
                 },
             ))
             .unwrap();
@@ -4232,6 +4281,7 @@ pub(in crate::state) mod tests {
                 GovernedTaskMutation::MarkRuntimeExited {
                     actor: actor(GovernedActorKind::System, "impulse-daemon"),
                     reason: Some("operator cancelled the run".into()),
+                    exit_kind: Default::default(),
                 },
             ))
             .unwrap();
@@ -4289,6 +4339,271 @@ pub(in crate::state) mod tests {
             GovernedExecutionState::RuntimeExited
         );
         assert_eq!(stored.revision, discarded.revision);
+    }
+
+    fn operator_cancel(reason: &str) -> GovernedTaskMutation {
+        GovernedTaskMutation::MarkRuntimeExited {
+            actor: actor(GovernedActorKind::System, "impulse-daemon"),
+            reason: Some(reason.to_string()),
+            exit_kind: GovernedExitKind::OperatorCancelled,
+        }
+    }
+
+    fn worker_claim(summary: &str, subject: &str) -> GovernedTaskMutation {
+        GovernedTaskMutation::SubmitClaim {
+            claim: WorkerCompletionClaimInput {
+                actor: actor(GovernedActorKind::Worker, "worker-1"),
+                summary: summary.to_string(),
+                subject_revision: subject.to_string(),
+                artifact_ids: vec![],
+                diff_ref: None,
+            },
+        }
+    }
+
+    /// An answered cancel refuses a later claim on an authoritative task, and
+    /// keeps the claim that was recorded while the run was still going.
+    #[test]
+    fn test_submit_claim_refuses_after_operator_cancel_authoritative_scope() {
+        let (root, state) = state();
+        let task = state
+            .register_governed_task(registration(&state, "cancel-auth"))
+            .unwrap();
+        let running = launch(&state, &task, "cancel-auth-run");
+        let claimed = claim(&state, &running, "cancel-auth-claim");
+        let failed = verify(
+            &state,
+            &claimed,
+            "cancel-auth-verify",
+            GovernedVerificationOutcome::Failed,
+        );
+        assert_eq!(failed.review_state, GovernedReviewState::VerificationFailed);
+        let prior_summary = failed.latest_claim().unwrap().summary.clone();
+
+        let cancelled = state
+            .mutate_governed_task(mutation(
+                &failed,
+                "cancel-auth-exit",
+                operator_cancel("operator cancelled the run"),
+            ))
+            .unwrap();
+        assert_eq!(
+            cancelled.execution_state,
+            GovernedExecutionState::RuntimeExited
+        );
+        assert_eq!(cancelled.exit_kind, GovernedExitKind::OperatorCancelled);
+        assert_eq!(cancelled.claims.len(), 1);
+        assert_eq!(cancelled.latest_claim().unwrap().summary, prior_summary);
+
+        let error = state
+            .mutate_governed_task(mutation(
+                &cancelled,
+                "cancel-auth-late-claim",
+                worker_claim("late claim after cancel", "abc123"),
+            ))
+            .expect_err("a claim after an answered cancel is refused");
+        assert!(error
+            .to_string()
+            .contains("run was cancelled; claim refused"));
+
+        let stored = state
+            .get_governed_task("impulse-test", &cancelled.id)
+            .unwrap()
+            .expect("cancelled task remains on the ledger");
+        assert_eq!(stored.claims.len(), 1);
+        assert_eq!(stored.latest_claim().unwrap().summary, prior_summary);
+        assert_eq!(stored.revision, cancelled.revision);
+        assert_eq!(stored.exit_kind, GovernedExitKind::OperatorCancelled);
+        assert_eq!(stored.review_state, GovernedReviewState::VerificationFailed);
+
+        let base = root.path().join("impulse-test").join(".impulse");
+        let reloaded = State::new(base).expect("an operator-cancelled ledger must reload");
+        let reloaded_task = reloaded
+            .get_governed_task("impulse-test", &cancelled.id)
+            .unwrap()
+            .expect("cancelled task survives reload");
+        assert_eq!(reloaded_task.exit_kind, GovernedExitKind::OperatorCancelled);
+        assert_eq!(reloaded_task.claims.len(), 1);
+        assert_eq!(reloaded_task, stored);
+    }
+
+    /// The same refusal applies while the staged checkout is still active.
+    /// Discard is not what blocks the claim.
+    #[test]
+    fn test_submit_claim_refuses_after_operator_cancel_before_discard_staged_scope() {
+        let (_root, state) = state();
+        let task = state
+            .register_governed_task(staged_registration(&state, "cancel-staged"))
+            .unwrap();
+        let task = materialize(&state, &task, "cancel-staged-worktree");
+        let running = launch(&state, &task, "cancel-staged-run");
+        let claimed = staged_claim(&state, &running, "cancel-staged-claim", &staged_oid('b'));
+        let failed = verify(
+            &state,
+            &claimed,
+            "cancel-staged-verify",
+            GovernedVerificationOutcome::Failed,
+        );
+        assert!(failed.active_staged_worktree().is_some());
+        let prior_summary = failed.latest_claim().unwrap().summary.clone();
+
+        let cancelled = state
+            .mutate_governed_task(mutation(
+                &failed,
+                "cancel-staged-exit",
+                operator_cancel("operator cancelled the run"),
+            ))
+            .unwrap();
+        assert_eq!(cancelled.exit_kind, GovernedExitKind::OperatorCancelled);
+        assert!(cancelled.active_staged_worktree().is_some());
+        assert_eq!(cancelled.claims.len(), 1);
+
+        let error = state
+            .mutate_governed_task(mutation(
+                &cancelled,
+                "cancel-staged-late-claim",
+                worker_claim("late staged claim", &staged_oid('c')),
+            ))
+            .expect_err("a staged claim after cancel is refused before discard");
+        let message = error.to_string();
+        assert!(message.contains("run was cancelled; claim refused"));
+        assert!(!message.contains("active staged worktree"));
+
+        let stored = state
+            .get_governed_task("impulse-test", &cancelled.id)
+            .unwrap()
+            .expect("cancelled staged task remains on the ledger");
+        assert_eq!(stored.claims.len(), 1);
+        assert_eq!(stored.latest_claim().unwrap().summary, prior_summary);
+        assert!(stored.active_staged_worktree().is_some());
+        assert_eq!(stored.revision, cancelled.revision);
+    }
+
+    /// A ledger written before `exit_kind` existed must reload as a natural
+    /// exit, including a claim recorded after prose that merely says the
+    /// operator cancelled. Replay does not re-judge that claim.
+    #[test]
+    fn test_replay_of_pre_exit_kind_ledger_reads_as_natural_exit() {
+        let (root, state) = state();
+        let registered = state
+            .register_governed_task(registration(&state, "legacy-exit"))
+            .unwrap();
+        let running = launch(&state, &registered, "legacy-exit-run");
+        let exited = state
+            .mutate_governed_task(mutation(
+                &running,
+                "legacy-exit-exit",
+                GovernedTaskMutation::MarkRuntimeExited {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: Some("operator cancelled the run".into()),
+                    exit_kind: GovernedExitKind::Natural,
+                },
+            ))
+            .unwrap();
+        let claimed = claim(&state, &exited, "legacy-exit-claim");
+        assert_eq!(claimed.exit_kind, GovernedExitKind::Natural);
+        assert_eq!(claimed.claims.len(), 1);
+        let summary = claimed.latest_claim().unwrap().summary.clone();
+
+        rewrite_persisted_ledger(&state, |ledger| {
+            let tasks = ledger["tasks"].as_object_mut().expect("tasks object");
+            for task in tasks.values_mut() {
+                task.as_object_mut()
+                    .expect("task object")
+                    .remove("exit_kind");
+            }
+        });
+
+        let base = root.path().join("impulse-test").join(".impulse");
+        let reloaded = State::new(base).expect("a pre-exit_kind ledger must still load");
+        let stored = reloaded
+            .get_governed_task("impulse-test", &claimed.id)
+            .unwrap()
+            .expect("legacy task survives reload");
+        assert_eq!(stored.exit_kind, GovernedExitKind::Natural);
+        assert_eq!(
+            stored.execution_state,
+            GovernedExecutionState::RuntimeExited
+        );
+        assert_eq!(stored.claims.len(), 1);
+        assert_eq!(stored.latest_claim().unwrap().summary, summary);
+        assert_eq!(stored.revision, claimed.revision);
+    }
+
+    /// A second cancel of an already-exited run succeeds and writes nothing.
+    /// A later natural exit does not overwrite the answered cancel.
+    #[test]
+    fn test_second_cancel_on_exited_task_is_noop() {
+        let (_root, state) = state();
+        let registered = state
+            .register_governed_task(registration(&state, "second-cancel"))
+            .unwrap();
+        let running = launch(&state, &registered, "second-cancel-run");
+        let cancelled = state
+            .mutate_governed_task(mutation(
+                &running,
+                "second-cancel-exit",
+                operator_cancel("operator cancelled the run"),
+            ))
+            .unwrap();
+        assert_eq!(cancelled.exit_kind, GovernedExitKind::OperatorCancelled);
+
+        let again = state
+            .mutate_governed_task(mutation(
+                &cancelled,
+                "second-cancel-again",
+                operator_cancel("operator cancelled the run again"),
+            ))
+            .expect("cancelling an already-exited task succeeds");
+        assert_eq!(again, cancelled);
+        assert_eq!(again.revision, cancelled.revision);
+        assert_eq!(again.events.len(), cancelled.events.len());
+        assert_eq!(again.exit_kind, GovernedExitKind::OperatorCancelled);
+
+        let overwrite = state
+            .mutate_governed_task(mutation(
+                &again,
+                "second-cancel-natural",
+                GovernedTaskMutation::MarkRuntimeExited {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: Some("runtime exited".into()),
+                    exit_kind: GovernedExitKind::Natural,
+                },
+            ))
+            .expect_err("a later natural exit must not overwrite an answered cancel");
+        assert!(overwrite
+            .to_string()
+            .contains("runtime exit requires a running task"));
+        let stored = state
+            .get_governed_task("impulse-test", &cancelled.id)
+            .unwrap()
+            .expect("cancelled task remains");
+        assert_eq!(stored, cancelled);
+
+        let natural_registered = state
+            .register_governed_task(registration(&state, "natural-then-cancel"))
+            .unwrap();
+        let natural_running = launch(&state, &natural_registered, "natural-then-cancel-run");
+        let natural = state
+            .mutate_governed_task(mutation(
+                &natural_running,
+                "natural-then-cancel-exit",
+                GovernedTaskMutation::MarkRuntimeExited {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: Some("runtime exited".into()),
+                    exit_kind: GovernedExitKind::Natural,
+                },
+            ))
+            .unwrap();
+        let late_cancel = state
+            .mutate_governed_task(mutation(
+                &natural,
+                "natural-then-cancel-cancel",
+                operator_cancel("operator cancelled the run"),
+            ))
+            .expect("cancelling an already-terminal run succeeds");
+        assert_eq!(late_cancel, natural);
+        assert_eq!(late_cancel.exit_kind, GovernedExitKind::Natural);
     }
 
     #[test]

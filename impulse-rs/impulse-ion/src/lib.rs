@@ -120,7 +120,7 @@ pub struct HarnessResponse {
     pub metrics: Metrics,
 }
 
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum ContractViolation {
     #[error("verdict {0:?} forbidden: a CRITICAL finding is present")]
     CriticalBlocksApprove(Verdict),
@@ -226,6 +226,132 @@ impl HarnessResponse {
                 .findings
                 .iter()
                 .any(|f| f.severity == Severity::Critical)
+    }
+
+    /// Replace each oversized `output_logs` body with a JSON object naming the
+    /// dropped size. The log key stays, so the omission is explicit.
+    pub fn omit_oversized_output_logs(&mut self) {
+        for body in self.output_logs.values_mut() {
+            let omitted_bytes = body.len();
+            if omitted_bytes > MAX_OUTPUT_LOG_BYTES {
+                *body = serde_json::json!({ "omitted_bytes": omitted_bytes }).to_string();
+            }
+        }
+    }
+}
+
+/// Per-log ceiling applied by [`HarnessResponse::omit_oversized_output_logs`].
+/// Bodies at or under this size are kept verbatim.
+pub const MAX_OUTPUT_LOG_BYTES: usize = 64 * 1024;
+
+/// Typed result of one Ion verify round trip.
+///
+/// `Pass` is the only success. `Undecided` is an abstention
+/// (`NeedsDiscussion`) and is never folded into `Refused`. `GateError` means
+/// there is no usable verdict.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GateOutcome {
+    #[error("gate passed")]
+    Pass,
+    #[error("gate refused with verdict {verdict:?}")]
+    Refused { verdict: Verdict },
+    #[error("gate abstained: needs discussion")]
+    Undecided,
+    #[error("gate response violated the contract: {0}")]
+    ContractViolation(ContractViolation),
+    #[error("gate error: {0}")]
+    GateError(GateErrorKind),
+}
+
+/// Why a verify round trip produced no usable verdict.
+///
+/// [`ModelUnavailable`] is reserved for a structured signal the launcher emits
+/// (a dedicated exit code or a JSON error field). It is not inferred from
+/// stderr prose, and nothing in this crate produces it until that signal exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GateErrorKind {
+    #[error("gate process failed to spawn")]
+    Spawn,
+    #[error("gate response was not parseable")]
+    Unparseable,
+    #[error("gate timed out")]
+    TimedOut,
+    #[error("gate process exited non-zero")]
+    NonZeroExit,
+    #[error("gate response request_id does not match the request")]
+    RequestIdMismatch,
+    #[error("gate model is unavailable")]
+    ModelUnavailable,
+}
+
+impl GateErrorKind {
+    /// Snake_case tag stored on `ToolOutcome.payload` so callers can branch
+    /// without reading prose.
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn",
+            Self::Unparseable => "unparseable",
+            Self::TimedOut => "timed_out",
+            Self::NonZeroExit => "non_zero_exit",
+            Self::RequestIdMismatch => "request_id_mismatch",
+            Self::ModelUnavailable => "model_unavailable",
+        }
+    }
+}
+
+impl GateOutcome {
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Refused { .. } => "refused",
+            Self::Undecided => "undecided",
+            Self::ContractViolation(_) => "contract_violation",
+            Self::GateError(_) => "gate_error",
+        }
+    }
+
+    /// Process status for `ion-verify`, matching `handlers::guard`: 0 pass,
+    /// 1 a verdict or contract failure, 2 a gate error.
+    pub fn process_exit_code(&self) -> i32 {
+        match self {
+            Self::Pass => 0,
+            Self::Refused { .. } | Self::Undecided | Self::ContractViolation(_) => 1,
+            Self::GateError(_) => 2,
+        }
+    }
+
+    /// Map a launcher failure onto a gate error.
+    ///
+    /// `Serialize` is a local request-encoding failure, not a gate result, so
+    /// it stays `None`. `ModelUnavailable` is not produced here.
+    pub fn from_adapter_error(err: &pi_adapter::AdapterError) -> Option<Self> {
+        let kind = match err {
+            pi_adapter::AdapterError::Spawn(_) => GateErrorKind::Spawn,
+            pi_adapter::AdapterError::Serialize(_) => return None,
+            pi_adapter::AdapterError::UnparseableResponse(_) => GateErrorKind::Unparseable,
+            pi_adapter::AdapterError::NonZeroExit { .. } => GateErrorKind::NonZeroExit,
+            pi_adapter::AdapterError::TimedOut { .. } => GateErrorKind::TimedOut,
+            pi_adapter::AdapterError::RequestIdMismatch { .. } => GateErrorKind::RequestIdMismatch,
+        };
+        Some(Self::GateError(kind))
+    }
+}
+
+/// Classify a response whose `request_id` already matched the request.
+///
+/// A spec-a violation wins over the verdict, so an `Approve` that breaks the
+/// contract is [`GateOutcome::ContractViolation`] and not [`GateOutcome::Pass`].
+/// [`Verdict::NeedsDiscussion`] is [`GateOutcome::Undecided`], never a refusal.
+pub fn classify_verify_response(response: &HarnessResponse) -> GateOutcome {
+    if let Err(violation) = response.validate() {
+        return GateOutcome::ContractViolation(violation);
+    }
+    match response.verdict {
+        Verdict::Approve => GateOutcome::Pass,
+        Verdict::ChangesRequested => GateOutcome::Refused {
+            verdict: response.verdict.clone(),
+        },
+        Verdict::NeedsDiscussion => GateOutcome::Undecided,
     }
 }
 
@@ -396,5 +522,88 @@ mod tests {
         let a = HarnessRequest::verify("/repo", "HEAD~1..HEAD", "Verify the diff.");
         let b = HarnessRequest::verify("/repo", "HEAD~1..HEAD", "Verify the diff.");
         assert_ne!(a.request_id, b.request_id);
+    }
+
+    #[test]
+    fn test_needs_discussion_maps_to_undecided_not_refused() {
+        let mut response = worked_example_response();
+        response.verdict = Verdict::NeedsDiscussion;
+        response.commands_run.clear();
+        let outcome = classify_verify_response(&response);
+        assert_eq!(outcome, GateOutcome::Undecided);
+        assert!(!matches!(outcome, GateOutcome::Refused { .. }));
+        assert_eq!(outcome.tag(), "undecided");
+        assert_eq!(outcome.process_exit_code(), 1);
+
+        let mut refused = worked_example_response();
+        refused.verdict = Verdict::ChangesRequested;
+        let refused_outcome = classify_verify_response(&refused);
+        assert_eq!(
+            refused_outcome,
+            GateOutcome::Refused {
+                verdict: Verdict::ChangesRequested,
+            }
+        );
+        assert_ne!(refused_outcome, GateOutcome::Undecided);
+    }
+
+    #[test]
+    fn test_timeout_maps_to_gate_error_and_exit_2() {
+        let err = pi_adapter::AdapterError::TimedOut {
+            timeout_secs: 3,
+            stderr: "gate appears wedged".to_string(),
+        };
+        let outcome = GateOutcome::from_adapter_error(&err)
+            .expect("a timeout is a gate error, not a local serialize failure");
+        assert_eq!(outcome, GateOutcome::GateError(GateErrorKind::TimedOut));
+        assert_eq!(outcome.tag(), "gate_error");
+        assert_eq!(outcome.process_exit_code(), 2);
+        assert!(!matches!(
+            outcome,
+            GateOutcome::Pass | GateOutcome::Undecided | GateOutcome::Refused { .. }
+        ));
+        assert!(format!("{outcome}").contains("timed out"));
+    }
+
+    #[test]
+    fn test_contract_violation_on_approve_is_not_pass() {
+        // Approve with no CRITICAL finding makes `passed()` true, but an empty
+        // `commands_run` is still a spec-a violation. That must not classify
+        // as Pass.
+        let mut response = worked_example_response();
+        response.commands_run.clear();
+        assert!(response.passed());
+        let outcome = classify_verify_response(&response);
+        assert_eq!(
+            outcome,
+            GateOutcome::ContractViolation(ContractViolation::MissingCommandsRun(Verdict::Approve))
+        );
+        assert!(!matches!(outcome, GateOutcome::Pass));
+        assert_eq!(outcome.tag(), "contract_violation");
+        assert_eq!(outcome.process_exit_code(), 1);
+    }
+
+    #[test]
+    fn test_gate_error_kind_display_names_the_failure() {
+        let err = GateErrorKind::RequestIdMismatch;
+        assert!(format!("{err}").contains("request_id"));
+        assert_eq!(err.tag(), "request_id_mismatch");
+        let unavailable = GateErrorKind::ModelUnavailable;
+        assert!(format!("{unavailable}").contains("unavailable"));
+        assert_eq!(unavailable.tag(), "model_unavailable");
+    }
+
+    #[test]
+    fn test_non_zero_exit_is_not_model_unavailable() {
+        let err = pi_adapter::AdapterError::NonZeroExit {
+            code: 7,
+            stderr: "model unavailable: no MiniMax key".to_string(),
+        };
+        let outcome = GateOutcome::from_adapter_error(&err).unwrap();
+        assert_eq!(outcome, GateOutcome::GateError(GateErrorKind::NonZeroExit));
+        assert_ne!(
+            outcome,
+            GateOutcome::GateError(GateErrorKind::ModelUnavailable)
+        );
     }
 }

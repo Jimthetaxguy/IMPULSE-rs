@@ -2982,6 +2982,7 @@ mod governed_producer_handler_tests {
                                 id: "desktop-runtime".to_string(),
                             },
                             reason: Some("fixture exited".to_string()),
+                            exit_kind: Default::default(),
                         },
                     },
                 },
