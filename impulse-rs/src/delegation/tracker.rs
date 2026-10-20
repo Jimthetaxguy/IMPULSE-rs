@@ -8,7 +8,11 @@ use std::collections::HashMap;
 use chrono::Utc;
 use impulse_ops::{AgentRole, DelegationSummary, DiffSummary, ToolInvocationRecord};
 
-use super::types::{DelegationSpec, DelegationState, TrackedDelegation, MAX_DELEGATION_DEPTH};
+use super::types::{
+    DelegationError, DelegationSpec, DelegationState, TrackedDelegation, DELEGATION_ITEM_BYTES,
+    DELEGATION_TRACE_RECORD_BYTES, MAX_CONTEXT_SNAPSHOT_BYTES, MAX_DELEGATION_DEPTH,
+    MAX_DELEGATION_TEXT_BYTES, MAX_TRACKED_DELEGATIONS, STALE_DELEGATION_SECS,
+};
 
 /// Tracks all active and recent delegations.
 #[derive(Debug, Default)]
@@ -25,17 +29,44 @@ impl DelegationTracker {
         }
     }
 
-    /// Register a new delegation. Returns the delegation ID.
-    /// Returns None if max depth would be exceeded.
+    /// Register a new delegation and return its ID.
+    ///
+    /// Refused past the depth limit, for a spec over
+    /// [`MAX_DELEGATION_TEXT_BYTES`], or when all [`MAX_TRACKED_DELEGATIONS`]
+    /// held delegations are still active and none is older than
+    /// [`STALE_DELEGATION_SECS`]. Otherwise a full tracker drops its oldest
+    /// finished delegation to make room, or failing that its oldest stale one.
+    /// The context snapshot is cut to [`MAX_CONTEXT_SNAPSHOT_BYTES`].
     pub fn register(
         &mut self,
-        spec: DelegationSpec,
+        mut spec: DelegationSpec,
         coordinator_pane_id: usize,
-        context_snapshot: String,
+        mut context_snapshot: String,
         current_depth: u8,
-    ) -> Option<String> {
+    ) -> Result<String, DelegationError> {
         if current_depth >= MAX_DELEGATION_DEPTH {
-            return None;
+            return Err(DelegationError::DepthExceeded {
+                max: MAX_DELEGATION_DEPTH,
+            });
+        }
+        check_size("spec", spec_bytes(&spec))?;
+        // Parsing grows lists by doubling; the weight counts entries.
+        spec.target_files.shrink_to_fit();
+        spec.restricted_tools.shrink_to_fit();
+        if self.delegations.len() >= MAX_TRACKED_DELEGATIONS
+            && !self.drop_oldest_finished()
+            && !self.drop_oldest_stale()
+        {
+            return Err(DelegationError::TrackerFull {
+                limit: MAX_TRACKED_DELEGATIONS,
+            });
+        }
+        if context_snapshot.len() > MAX_CONTEXT_SNAPSHOT_BYTES {
+            let cut = context_snapshot.floor_char_boundary(MAX_CONTEXT_SNAPSHOT_BYTES);
+            context_snapshot.truncate(cut);
+            // `truncate` keeps the whole allocation, which is what the cut is
+            // meant to release.
+            context_snapshot.shrink_to_fit();
         }
 
         let id = format!("del-{}", self.next_id);
@@ -55,50 +86,108 @@ impl DelegationTracker {
         };
 
         self.delegations.insert(id.clone(), delegation);
-        Some(id)
+        Ok(id)
     }
 
-    /// Assign a worker pane to a delegation.
-    pub fn assign_worker(&mut self, id: &str, worker_pane_id: usize) -> bool {
-        if let Some(d) = self.delegations.get_mut(id) {
-            d.worker_pane_id = Some(worker_pane_id);
-            d.state = DelegationState::InProgress;
-            true
-        } else {
-            false
+    /// Removes the finished delegation that finished first. Returns whether
+    /// there was one.
+    fn drop_oldest_finished(&mut self) -> bool {
+        let oldest = self
+            .delegations
+            .values()
+            .filter(|d| d.is_completed())
+            .min_by_key(|d| (d.completed_at, d.created_at))
+            .map(|d| d.id.clone());
+        match oldest {
+            Some(id) => self.delegations.remove(&id).is_some(),
+            None => false,
         }
     }
 
-    /// Mark a delegation as completed with results.
+    /// Removes the oldest delegation that has been pending or in progress for
+    /// [`STALE_DELEGATION_SECS`] or more. Returns whether there was one.
+    fn drop_oldest_stale(&mut self) -> bool {
+        let oldest = self
+            .stale_active(STALE_DELEGATION_SECS)
+            .first()
+            .map(|d| d.id.clone());
+        match oldest {
+            Some(id) => self.delegations.remove(&id).is_some(),
+            None => false,
+        }
+    }
+
+    /// The delegation `id`, if it exists and has not finished. A finished
+    /// delegation's result is final: a second completion, failure or worker
+    /// assignment would overwrite what the coordinator was already handed.
+    fn active_mut(&mut self, id: &str) -> Result<&mut TrackedDelegation, DelegationError> {
+        let delegation = self
+            .delegations
+            .get_mut(id)
+            .ok_or_else(|| DelegationError::NotFound { id: id.to_string() })?;
+        if delegation.is_completed() {
+            return Err(DelegationError::AlreadyFinished {
+                id: id.to_string(),
+                state: delegation.state.as_str(),
+            });
+        }
+        Ok(delegation)
+    }
+
+    /// Assign a worker pane to an unfinished delegation.
+    pub fn assign_worker(
+        &mut self,
+        id: &str,
+        worker_pane_id: usize,
+    ) -> Result<(), DelegationError> {
+        let d = self.active_mut(id)?;
+        d.worker_pane_id = Some(worker_pane_id);
+        d.state = DelegationState::InProgress;
+        Ok(())
+    }
+
+    /// Mark an unfinished delegation as completed with results.
     pub fn complete(
         &mut self,
         id: &str,
         summary: String,
         tool_trace: Vec<ToolInvocationRecord>,
         diff_summary: Option<DiffSummary>,
-    ) -> bool {
-        if let Some(d) = self.delegations.get_mut(id) {
-            d.state = DelegationState::Completed {
-                summary,
-                tool_trace,
-                diff_summary,
-            };
-            d.completed_at = Some(Utc::now());
-            true
-        } else {
-            false
-        }
+    ) -> Result<(), DelegationError> {
+        let completion_bytes = tool_trace
+            .iter()
+            .map(|tool| {
+                [
+                    DELEGATION_TRACE_RECORD_BYTES,
+                    tool.kind.len(),
+                    tool.target.len(),
+                    tool.timestamp.as_ref().map_or(0, String::len),
+                ]
+                .into_iter()
+                .fold(0, usize::saturating_add)
+            })
+            .fold(summary.len(), usize::saturating_add);
+        let d = self.active_mut(id)?;
+        check_size("completion", completion_bytes)?;
+        let mut tool_trace = tool_trace;
+        // Parsing grows the list by doubling; the weight counts entries.
+        tool_trace.shrink_to_fit();
+        d.state = DelegationState::Completed {
+            summary,
+            tool_trace,
+            diff_summary,
+        };
+        d.completed_at = Some(Utc::now());
+        Ok(())
     }
 
-    /// Mark a delegation as failed.
-    pub fn fail(&mut self, id: &str, error: String) -> bool {
-        if let Some(d) = self.delegations.get_mut(id) {
-            d.state = DelegationState::Failed { error };
-            d.completed_at = Some(Utc::now());
-            true
-        } else {
-            false
-        }
+    /// Mark an unfinished delegation as failed.
+    pub fn fail(&mut self, id: &str, error: String) -> Result<(), DelegationError> {
+        let d = self.active_mut(id)?;
+        check_size("failure message", error.len())?;
+        d.state = DelegationState::Failed { error };
+        d.completed_at = Some(Utc::now());
+        Ok(())
     }
 
     /// Build a handoff prompt for a completed delegation.
@@ -227,6 +316,35 @@ impl DelegationTracker {
     }
 }
 
+/// What a spec weighs: its text, plus [`DELEGATION_ITEM_BYTES`] for each
+/// list entry.
+fn spec_bytes(spec: &DelegationSpec) -> usize {
+    let list_bytes = |list: &[String]| {
+        list.iter()
+            .map(|item| item.len().saturating_add(DELEGATION_ITEM_BYTES))
+            .fold(0, usize::saturating_add)
+    };
+    [
+        spec.task.len(),
+        spec.constraints.as_ref().map_or(0, String::len),
+        list_bytes(&spec.target_files),
+        list_bytes(&spec.restricted_tools),
+    ]
+    .into_iter()
+    .fold(0, usize::saturating_add)
+}
+
+fn check_size(part: &'static str, bytes: usize) -> Result<(), DelegationError> {
+    if bytes > MAX_DELEGATION_TEXT_BYTES {
+        return Err(DelegationError::TooLarge {
+            part,
+            bytes,
+            limit: MAX_DELEGATION_TEXT_BYTES,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,25 +367,27 @@ mod tests {
             .unwrap();
         assert_eq!(tracker.pending().len(), 1);
 
-        tracker.assign_worker(&id, 1);
+        tracker.assign_worker(&id, 1).unwrap();
         assert!(tracker.pending().is_empty());
         assert_eq!(tracker.active_for_pane(0).len(), 1);
         assert_eq!(tracker.active_for_pane(1).len(), 1);
 
-        tracker.complete(
-            &id,
-            "Done refactoring".into(),
-            vec![ToolInvocationRecord {
-                kind: "edit".into(),
-                target: "src/auth.rs".into(),
-                timestamp: None,
-            }],
-            Some(DiffSummary {
-                files_changed: 1,
-                lines_added: 20,
-                lines_removed: 5,
-            }),
-        );
+        tracker
+            .complete(
+                &id,
+                "Done refactoring".into(),
+                vec![ToolInvocationRecord {
+                    kind: "edit".into(),
+                    target: "src/auth.rs".into(),
+                    timestamp: None,
+                }],
+                Some(DiffSummary {
+                    files_changed: 1,
+                    lines_added: 20,
+                    lines_removed: 5,
+                }),
+            )
+            .unwrap();
         assert_eq!(tracker.completed().len(), 1);
         assert!(tracker.active_for_pane(0).is_empty());
     }
@@ -276,31 +396,36 @@ mod tests {
     fn test_depth_limit() {
         let mut tracker = DelegationTracker::new();
         // Depth 0 → OK
-        assert!(tracker.register(sample_spec(), 0, "".into(), 0).is_some());
+        assert!(tracker.register(sample_spec(), 0, "".into(), 0).is_ok());
         // Depth 1 → OK
-        assert!(tracker.register(sample_spec(), 0, "".into(), 1).is_some());
+        assert!(tracker.register(sample_spec(), 0, "".into(), 1).is_ok());
         // Depth 2 → REJECTED (MAX_DELEGATION_DEPTH = 2)
-        assert!(tracker.register(sample_spec(), 0, "".into(), 2).is_none());
+        assert_eq!(
+            tracker.register(sample_spec(), 0, "".into(), 2),
+            Err(DelegationError::DepthExceeded { max: 2 })
+        );
     }
 
     #[test]
     fn test_build_handoff_prompt_completed() {
         let mut tracker = DelegationTracker::new();
         let id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
-        tracker.complete(
-            &id,
-            "Auth module refactored with zero-trust".into(),
-            vec![ToolInvocationRecord {
-                kind: "edit".into(),
-                target: "src/auth.rs".into(),
-                timestamp: None,
-            }],
-            Some(DiffSummary {
-                files_changed: 1,
-                lines_added: 30,
-                lines_removed: 10,
-            }),
-        );
+        tracker
+            .complete(
+                &id,
+                "Auth module refactored with zero-trust".into(),
+                vec![ToolInvocationRecord {
+                    kind: "edit".into(),
+                    target: "src/auth.rs".into(),
+                    timestamp: None,
+                }],
+                Some(DiffSummary {
+                    files_changed: 1,
+                    lines_added: 30,
+                    lines_removed: 10,
+                }),
+            )
+            .unwrap();
 
         let prompt = tracker.build_handoff_prompt(&id).unwrap();
         assert!(prompt.contains("Delegation Complete"));
@@ -314,7 +439,7 @@ mod tests {
     fn test_build_handoff_prompt_failed() {
         let mut tracker = DelegationTracker::new();
         let id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
-        tracker.fail(&id, "compilation failed".into());
+        tracker.fail(&id, "compilation failed".into()).unwrap();
 
         let prompt = tracker.build_handoff_prompt(&id).unwrap();
         assert!(prompt.contains("Delegation Failed"));
@@ -331,8 +456,8 @@ mod tests {
     #[test]
     fn test_to_summaries() {
         let mut tracker = DelegationTracker::new();
-        tracker.register(sample_spec(), 0, "".into(), 0);
-        tracker.register(sample_spec(), 1, "".into(), 0);
+        tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        tracker.register(sample_spec(), 1, "".into(), 0).unwrap();
 
         let summaries = tracker.to_summaries();
         assert_eq!(summaries.len(), 2);
@@ -343,9 +468,11 @@ mod tests {
         let mut tracker = DelegationTracker::new();
         let pending_id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
         let inprogress_id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
-        tracker.assign_worker(&inprogress_id, 2);
+        tracker.assign_worker(&inprogress_id, 2).unwrap();
         let done_id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
-        tracker.complete(&done_id, "done".into(), vec![], None);
+        tracker
+            .complete(&done_id, "done".into(), vec![], None)
+            .unwrap();
 
         // max_age 0: every active (pending + in-progress) delegation is stale;
         // the completed one is excluded by is_active().
@@ -363,11 +490,237 @@ mod tests {
     fn test_prune_completed() {
         let mut tracker = DelegationTracker::new();
         let id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
-        tracker.complete(&id, "done".into(), vec![], None);
+        tracker.complete(&id, "done".into(), vec![], None).unwrap();
 
         // With a very short max age, should prune
         // But since it just completed, won't be pruned with a long max age
         tracker.prune_completed(3600);
         assert_eq!(tracker.delegations.len(), 1);
+    }
+
+    /// Review finding: a second CompleteDelegation was accepted and replaced
+    /// the first worker's result after the coordinator had been handed it.
+    #[test]
+    fn test_a_finished_delegation_cannot_be_completed_failed_or_reassigned() {
+        let mut tracker = DelegationTracker::new();
+        let id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        tracker
+            .complete(&id, "worker A: refactored src/auth.rs".into(), vec![], None)
+            .unwrap();
+
+        let already = DelegationError::AlreadyFinished {
+            id: id.clone(),
+            state: "completed",
+        };
+        assert_eq!(
+            tracker.complete(&id, "worker B: nothing to do".into(), vec![], None),
+            Err(already.clone())
+        );
+        assert_eq!(
+            tracker.fail(&id, "late failure".into()),
+            Err(already.clone())
+        );
+        assert_eq!(tracker.assign_worker(&id, 7), Err(already));
+
+        let prompt = tracker.build_handoff_prompt(&id).unwrap();
+        assert!(prompt.contains("worker A"), "{prompt}");
+        assert!(!prompt.contains("worker B"), "{prompt}");
+        assert!(tracker.delegations[&id].worker_pane_id.is_none());
+    }
+
+    #[test]
+    fn test_unknown_delegation_ids_are_not_found() {
+        let mut tracker = DelegationTracker::new();
+        let missing = DelegationError::NotFound { id: "del-9".into() };
+        assert_eq!(
+            tracker.complete("del-9", "x".into(), vec![], None),
+            Err(missing.clone())
+        );
+        assert_eq!(tracker.fail("del-9", "x".into()), Err(missing.clone()));
+        assert_eq!(tracker.assign_worker("del-9", 1), Err(missing));
+    }
+
+    /// Review finding: nothing ever removed a delegation, so the daemon's
+    /// tracker grew with every one registered.
+    #[test]
+    fn test_register_at_capacity_drops_the_oldest_finished_delegation() {
+        let mut tracker = DelegationTracker::new();
+        let first = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        let second = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        tracker
+            .complete(&second, "done".into(), vec![], None)
+            .unwrap();
+        tracker.fail(&first, "broke".into()).unwrap();
+        // `second` finished first.
+        let earlier = Utc::now() - chrono::Duration::seconds(60);
+        tracker.delegations.get_mut(&second).unwrap().completed_at = Some(earlier);
+        while tracker.delegations.len() < MAX_TRACKED_DELEGATIONS {
+            tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        }
+
+        let newest = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        assert_eq!(tracker.delegations.len(), MAX_TRACKED_DELEGATIONS);
+        assert!(!tracker.delegations.contains_key(&second));
+        assert!(tracker.delegations.contains_key(&first));
+        assert!(tracker.delegations.contains_key(&newest));
+
+        tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        assert!(!tracker.delegations.contains_key(&first));
+        assert_eq!(tracker.delegations.len(), MAX_TRACKED_DELEGATIONS);
+    }
+
+    #[test]
+    fn test_register_refuses_when_every_tracked_delegation_is_active() {
+        let mut tracker = DelegationTracker::new();
+        for _ in 0..MAX_TRACKED_DELEGATIONS {
+            tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        }
+        assert_eq!(
+            tracker.register(sample_spec(), 0, "".into(), 0),
+            Err(DelegationError::TrackerFull {
+                limit: MAX_TRACKED_DELEGATIONS
+            })
+        );
+        assert_eq!(tracker.pending().len(), MAX_TRACKED_DELEGATIONS);
+    }
+
+    /// Review finding: each registration kept its whole context snapshot
+    /// (up to the daemon's 10 MiB request size), though nothing reads it.
+    #[test]
+    fn test_register_cuts_the_context_snapshot_at_a_char_boundary() {
+        let mut tracker = DelegationTracker::new();
+        // One ASCII byte, then two-byte characters: the cap lands mid-character.
+        let snapshot = format!("a{}", "é".repeat(MAX_CONTEXT_SNAPSHOT_BYTES / 2));
+        let id = tracker.register(sample_spec(), 0, snapshot, 0).unwrap();
+        let kept = &tracker.delegations[&id].context_snapshot;
+        assert_eq!(kept.len(), MAX_CONTEXT_SNAPSHOT_BYTES - 1);
+        assert!(kept.ends_with('é'));
+        // Verification finding: `truncate` alone kept the whole allocation.
+        assert!(
+            kept.capacity() <= MAX_CONTEXT_SNAPSHOT_BYTES,
+            "kept {} bytes of capacity",
+            kept.capacity()
+        );
+
+        let small = tracker.register(sample_spec(), 0, "ctx".into(), 0).unwrap();
+        assert_eq!(tracker.delegations[&small].context_snapshot, "ctx");
+    }
+
+    #[test]
+    fn test_oversized_spec_and_completion_are_refused() {
+        let mut tracker = DelegationTracker::new();
+        let mut spec = sample_spec();
+        spec.task = "x".repeat(MAX_DELEGATION_TEXT_BYTES);
+        assert!(matches!(
+            tracker.register(spec, 0, "".into(), 0),
+            Err(DelegationError::TooLarge { part: "spec", .. })
+        ));
+        assert!(tracker.delegations.is_empty());
+
+        let id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        let summary = "x".repeat(MAX_DELEGATION_TEXT_BYTES - 3);
+        let trace = vec![ToolInvocationRecord {
+            kind: "edit".into(),
+            target: "a.rs".into(),
+            timestamp: None,
+        }];
+        assert!(matches!(
+            tracker.complete(&id, summary.clone(), trace, None),
+            Err(DelegationError::TooLarge {
+                part: "completion",
+                ..
+            })
+        ));
+        assert!(tracker.delegations[&id].is_active());
+        tracker.complete(&id, summary, vec![], None).unwrap();
+    }
+
+    /// Verification finding: the limits counted text only, so a request of
+    /// millions of empty list entries passed as a few bytes and held
+    /// hundreds of megabytes.
+    #[test]
+    fn test_floods_of_empty_entries_are_refused() {
+        let mut tracker = DelegationTracker::new();
+        let mut spec = sample_spec();
+        spec.target_files = vec![String::new(); MAX_DELEGATION_TEXT_BYTES / DELEGATION_ITEM_BYTES];
+        assert!(matches!(
+            tracker.register(spec, 0, "".into(), 0),
+            Err(DelegationError::TooLarge { part: "spec", .. })
+        ));
+
+        let id = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        let empty_record = ToolInvocationRecord {
+            kind: String::new(),
+            target: String::new(),
+            timestamp: None,
+        };
+        let trace =
+            vec![empty_record; MAX_DELEGATION_TEXT_BYTES / DELEGATION_TRACE_RECORD_BYTES + 1];
+        assert!(matches!(
+            tracker.complete(&id, String::new(), trace, None),
+            Err(DelegationError::TooLarge {
+                part: "completion",
+                ..
+            })
+        ));
+        assert!(tracker.delegations[&id].is_active());
+    }
+
+    /// Verification finding: nothing in the protocol fails or cancels a
+    /// delegation, so a tracker full of abandoned ones refused every new one
+    /// until the daemon restarted.
+    #[test]
+    fn test_a_full_tracker_drops_its_oldest_stale_delegation() {
+        let mut tracker = DelegationTracker::new();
+        let ids: Vec<String> = (0..MAX_TRACKED_DELEGATIONS)
+            .map(|_| tracker.register(sample_spec(), 0, "".into(), 0).unwrap())
+            .collect();
+        let long_ago = Utc::now() - chrono::Duration::seconds(STALE_DELEGATION_SECS + 60);
+        let older = long_ago - chrono::Duration::seconds(60);
+        tracker.delegations.get_mut(&ids[7]).unwrap().created_at = long_ago;
+        tracker.delegations.get_mut(&ids[3]).unwrap().created_at = older;
+
+        let newest = tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        assert_eq!(tracker.delegations.len(), MAX_TRACKED_DELEGATIONS);
+        assert!(!tracker.delegations.contains_key(&ids[3]));
+        assert!(tracker.delegations.contains_key(&ids[7]));
+        assert!(tracker.delegations.contains_key(&newest));
+
+        tracker.register(sample_spec(), 0, "".into(), 0).unwrap();
+        assert!(!tracker.delegations.contains_key(&ids[7]));
+        assert_eq!(
+            tracker.register(sample_spec(), 0, "".into(), 0),
+            Err(DelegationError::TrackerFull {
+                limit: MAX_TRACKED_DELEGATIONS
+            })
+        );
+    }
+
+    /// Verification finding: the weight counts entries, but parsing leaves
+    /// lists with up to twice the room, which the tracker then kept.
+    #[test]
+    fn test_stored_lists_hold_no_spare_room() {
+        let mut tracker = DelegationTracker::new();
+        let mut spec = sample_spec();
+        spec.target_files = Vec::with_capacity(100);
+        spec.target_files.push("src/a.rs".into());
+        spec.restricted_tools = Vec::with_capacity(100);
+        spec.restricted_tools.push("bash_exec".into());
+        let id = tracker.register(spec, 0, "".into(), 0).unwrap();
+        let stored = &tracker.delegations[&id].spec;
+        assert_eq!(stored.target_files.capacity(), 1);
+        assert_eq!(stored.restricted_tools.capacity(), 1);
+
+        let mut trace = Vec::with_capacity(100);
+        trace.push(ToolInvocationRecord {
+            kind: "edit".into(),
+            target: "src/a.rs".into(),
+            timestamp: None,
+        });
+        tracker.complete(&id, "done".into(), trace, None).unwrap();
+        let DelegationState::Completed { tool_trace, .. } = &tracker.delegations[&id].state else {
+            panic!("completed");
+        };
+        assert_eq!(tool_trace.capacity(), 1);
     }
 }

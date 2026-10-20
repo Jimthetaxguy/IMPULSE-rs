@@ -28,10 +28,9 @@ pub fn handle_sem_diff(
     }
 
     let repo_path = std::env::current_dir()?;
-    let changes = semantic_diff::run_semantic_diff(&repo_path, &base, &head)?;
 
     if let Some(sid) = &session_id {
-        // Store the report
+        // Computes and stores the report with a single `sem diff` run.
         let report = semantic_diff::capture_semantic_diff(
             state.storage().base_path(),
             &repo_path,
@@ -46,7 +45,11 @@ pub fn handle_sem_diff(
             println!();
             println!("Stored: .impulse/semantic_diffs/{}.json", sid);
         }
-    } else if json {
+        return Ok(());
+    }
+
+    let changes = semantic_diff::run_semantic_diff(&repo_path, &base, &head)?;
+    if json {
         let report = semantic_diff::SemanticDiffReport::new(String::new(), base, head, changes);
         print_json(&report)?;
     } else {
@@ -93,7 +96,11 @@ pub fn handle_sem_blame(file: String, json: bool) -> Result<()> {
                 .unwrap_or("");
             println!(
                 "  {} ({}) — {} by {} [{}]",
-                entry.entity.name, entry.entity.entity_type, entry.commit, entry.author, msg
+                entry.entity.name,
+                entry.entity.entity_type,
+                entry.commit.as_deref().unwrap_or("uncommitted"),
+                entry.author,
+                msg
             );
         }
     }
@@ -118,7 +125,11 @@ pub fn handle_sem_impact(entity: String, json: bool) -> Result<()> {
             "Impact analysis for {} ({})",
             result.target.name, result.target.entity_type
         );
-        println!("Blast radius: {} dependents", result.blast_radius);
+        println!(
+            "Blast radius: {} entities within two levels, {} direct dependents",
+            result.blast_radius,
+            result.dependents.len()
+        );
         println!();
         if result.dependents.is_empty() {
             println!("  No dependents found.");
@@ -145,13 +156,8 @@ pub fn handle_sem_status(json: bool) -> Result<()> {
         print_json(&status)?;
     } else if available {
         println!("sem CLI: available");
-        // Try to get version
-        let output = std::process::Command::new("sem").arg("--version").output();
-        if let Ok(out) = output {
-            if out.status.success() {
-                let version = String::from_utf8_lossy(&out.stdout);
-                println!("Version: {}", version.trim());
-            }
+        if let Ok(version) = semantic_diff::sem_version() {
+            println!("Version: {}", version);
         }
         println!("Ready for semantic diffs.");
     } else {
@@ -164,4 +170,62 @@ pub fn handle_sem_status(json: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::semantic_diff::fake_sem::{fake_sem, logged_runs};
+    use std::time::{Duration, Instant};
+    use tempfile::TempDir;
+
+    fn test_state() -> (TempDir, Arc<state::State>) {
+        let tmp = TempDir::new().unwrap();
+        let st = state::State::new(tmp.path().to_path_buf()).unwrap();
+        (tmp, Arc::new(st))
+    }
+
+    /// Review finding: with a session id, `sem-diff` ran `sem diff` once,
+    /// threw the result away, then ran it again to store the report.
+    #[test]
+    fn test_handle_sem_diff_with_a_session_runs_sem_once() {
+        let (_state_dir, state) = test_state();
+        let (_dir, sem, log) = fake_sem("echo '{\"changes\": []}'");
+        semantic_diff::with_test_sem(&sem, Duration::from_secs(10), || {
+            handle_sem_diff(
+                &state,
+                "abc".to_string(),
+                "HEAD".to_string(),
+                true,
+                Some("sess-once".to_string()),
+            )
+        })
+        .unwrap();
+        let runs = logged_runs(&log);
+        assert_eq!(runs.len(), 1, "sem ran: {runs:?}");
+        assert!(state
+            .storage()
+            .base_path()
+            .join("semantic_diffs/sess-once.json")
+            .exists());
+    }
+
+    /// Review finding: `sem-status` waited on `sem --version` with no
+    /// timeout.
+    #[test]
+    fn test_handle_sem_status_returns_by_the_timeout_when_the_version_hangs() {
+        let marker = crate::process_util::test_sleep::unique_duration(5);
+        let (_dir, sem, log) = fake_sem(&format!("sleep {marker}"));
+        let start = Instant::now();
+        let result = semantic_diff::with_test_sem(&sem, Duration::from_millis(300), || {
+            handle_sem_status(false)
+        });
+        let elapsed = start.elapsed();
+        crate::process_util::test_sleep::stop(&marker);
+        result.unwrap();
+        // The fake sem really ran: an unbounded `sem --version` that never
+        // used it would also return at once, finding no `sem` on PATH.
+        assert_eq!(logged_runs(&log), [["--version"]]);
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
 }
