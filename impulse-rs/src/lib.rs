@@ -27,6 +27,7 @@ pub mod error;
 pub mod governed_producers;
 pub mod guardrail;
 pub mod handlers;
+pub mod handoff;
 pub mod injection;
 pub mod integration_tests;
 pub mod ion_repl;
