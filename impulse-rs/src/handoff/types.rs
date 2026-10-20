@@ -22,6 +22,12 @@ pub const COMMIT_SUBJECT_TRAILER: &str = "Impulse-Subject:";
 /// Ledger file under the impulse directory.
 pub const HANDOFF_GATE_FILE: &str = "HANDOFF_GATE.json";
 
+/// Default maximum age of a recorded URL fetch that may count as evidence.
+///
+/// An age equal to this limit is still evidence. One second past it is not.
+/// Callers may pass a different positive duration; this is the default.
+pub const DEFAULT_FETCH_MAX_AGE_SECS: i64 = 24 * 60 * 60;
+
 const MAX_SUBJECT_LEN: usize = 253;
 const MAX_ID_LEN: usize = 128;
 const MAX_STATEMENT_BYTES: usize = 8 * 1024;
@@ -40,6 +46,10 @@ pub enum CheckKind {
     ClaimsPresent,
     /// File missing, commit missing, or URL fetch not recorded by the sender.
     SourceResolves,
+    /// A fetch row exists and is not usable evidence: status is not 2xx,
+    /// `fetched_at` is in the future or older than the max age, or the
+    /// recording session is not this submit's session.
+    FetchUnusable,
     /// The source's recorded subject or host is not the claim's subject.
     SubjectMatches,
     /// A shared-artifact write was based on a generation the writer had not
@@ -59,6 +69,7 @@ impl CheckKind {
             Self::Request => "request",
             Self::ClaimsPresent => "claims_present",
             Self::SourceResolves => "source_resolves",
+            Self::FetchUnusable => "fetch_unusable",
             Self::SubjectMatches => "subject_matches",
             Self::StaleRead => "stale_read",
             Self::HandoffExists => "handoff_exists",
@@ -75,18 +86,105 @@ impl fmt::Display for CheckKind {
 }
 
 /// One reason a handoff or shared write was refused. `fix` names the change
-/// that would make the same call pass.
+/// that would make the same call pass. `field` is the payload field to
+/// change on the next attempt, when one field is at fault.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateFailure {
     pub target: String,
     pub check: CheckKind,
+    /// JSON field the caller should correct. Older ledger rows omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
     pub fix: String,
 }
 
 impl fmt::Display for GateFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} [{}]: {}", self.target, self.check, self.fix)
+        match &self.field {
+            Some(field) => write!(
+                f,
+                "{} [{}] field `{field}`: {}",
+                self.target, self.check, self.fix
+            ),
+            None => write!(f, "{} [{}]: {}", self.target, self.check, self.fix),
+        }
     }
+}
+
+/// Who is calling the gate, stamped by the caller from tool or session
+/// context. The gate does not read these values from the JSON payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionContext {
+    pub execution_origin: String,
+    pub session_id: Option<String>,
+    pub fetch_max_age: chrono::Duration,
+}
+
+impl AdmissionContext {
+    /// Library entry with no session. URL fetches recorded this way resolve
+    /// only for another call that also has no session.
+    pub fn direct() -> Self {
+        Self {
+            execution_origin: "direct".to_string(),
+            session_id: None,
+            fetch_max_age: default_fetch_max_age(),
+        }
+    }
+
+    /// Build a stamp from the tool context's origin and session.
+    ///
+    /// Empty strings become "direct" and `None`. This function has no
+    /// payload argument: a caller cannot pass a JSON field here.
+    pub fn from_tool(execution_origin: &str, session_id: Option<&str>) -> Self {
+        let origin = execution_origin.trim();
+        Self {
+            execution_origin: if origin.is_empty() {
+                "direct".to_string()
+            } else {
+                origin.to_string()
+            },
+            session_id: blank_to_none(session_id),
+            fetch_max_age: default_fetch_max_age(),
+        }
+    }
+
+    pub fn with_fetch_max_age(mut self, fetch_max_age: chrono::Duration) -> Self {
+        self.fetch_max_age = fetch_max_age;
+        self
+    }
+
+    pub fn with_session(mut self, session_id: &str) -> Self {
+        self.session_id = blank_to_none(Some(session_id));
+        self
+    }
+}
+
+pub fn default_fetch_max_age() -> chrono::Duration {
+    chrono::Duration::seconds(DEFAULT_FETCH_MAX_AGE_SECS)
+}
+
+/// Parse a caller-supplied max age in seconds.
+///
+/// Blank, non-numeric, zero, negative, and overflowing values keep
+/// [`default_fetch_max_age`]. The gate receives the resulting duration; it
+/// does not read the environment itself.
+pub fn parse_fetch_max_age_secs(raw: Option<&str>) -> chrono::Duration {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return default_fetch_max_age();
+    };
+    match raw.parse::<i64>() {
+        Ok(seconds) if seconds > 0 => {
+            chrono::Duration::try_seconds(seconds).unwrap_or_else(default_fetch_max_age)
+        }
+        _ => default_fetch_max_age(),
+    }
+}
+
+fn blank_to_none(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|trimmed| !trimmed.is_empty())
+        .map(str::to_string)
 }
 
 /// Lowercase subject key. For a URL source the gate compares this to the
@@ -315,6 +413,10 @@ pub struct NextStep {
 pub enum HandoffError {
     #[error("invalid handoff input: {0}")]
     Invalid(String),
+    /// A payload field is missing or unusable. `message` is the refusal text.
+    /// Dispatch turns this into a [`GateFailure`] whose `field` is `field`.
+    #[error("{message}")]
+    Request { field: String, message: String },
     #[error("failed to {action} the handoff store: {source}")]
     Store {
         action: &'static str,
@@ -333,9 +435,12 @@ pub(crate) fn validate_id(field: &str, raw: &str) -> Result<String, HandoffError
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
     if !ok {
-        return Err(HandoffError::Invalid(format!(
-            "{field} `{raw}` must be 1..={MAX_ID_LEN} characters of letters, digits, '.', '_', or '-'"
-        )));
+        return Err(HandoffError::Request {
+            field: field.to_string(),
+            message: format!(
+                "{field} `{raw}` must be 1..={MAX_ID_LEN} characters of letters, digits, '.', '_', or '-'"
+            ),
+        });
     }
     Ok(value.to_string())
 }
@@ -631,6 +736,11 @@ mod tests {
     fn test_handoff_error_display_names_the_problem() {
         let invalid = HandoffError::Invalid("claim is missing source".into());
         assert!(format!("{invalid}").contains("missing source"));
+        let request = HandoffError::Request {
+            field: "from_agent".into(),
+            message: "payload.from_agent missing".into(),
+        };
+        assert!(format!("{request}").contains("payload.from_agent missing"));
         let corrupt = HandoffError::Corrupt("schema 9".into());
         assert!(format!("{corrupt}").contains("unreadable"));
         assert!(format!("{corrupt}").contains("schema 9"));
@@ -641,6 +751,7 @@ mod tests {
         let failure = GateFailure {
             target: "refund-cap".into(),
             check: CheckKind::SubjectMatches,
+            field: None,
             fix: "cite billing.example.com".into(),
         };
         let text = failure.to_string();
@@ -700,5 +811,77 @@ mod tests {
         assert_eq!(original, recovered);
         assert!(recovered.accepted);
         assert!(recovered.failures.is_empty());
+    }
+
+    #[test]
+    fn test_gate_failure_round_trip_keeps_the_field() {
+        let original = GateFailure {
+            target: "refund-report".into(),
+            check: CheckKind::Request,
+            field: Some("from_agent".into()),
+            fix: "payload.from_agent missing".into(),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let recovered: GateFailure = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, recovered);
+        assert_eq!(recovered.field.as_deref(), Some("from_agent"));
+        assert!(recovered.to_string().contains("from_agent"));
+        assert!(recovered.to_string().contains("payload.from_agent missing"));
+
+        let legacy =
+            r#"{"target":"refund-cap","check":"subject_matches","fix":"cite billing.example.com"}"#;
+        let without_field: GateFailure = serde_json::from_str(legacy).unwrap();
+        assert_eq!(without_field.field, None);
+        assert!(without_field.to_string().contains("subject_matches"));
+    }
+
+    #[test]
+    fn test_fetch_unusable_check_serializes_snake_case() {
+        let kind = CheckKind::FetchUnusable;
+        let json = serde_json::to_string(&kind).unwrap();
+        assert_eq!(json, "\"fetch_unusable\"");
+        let recovered: CheckKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, kind);
+        assert_eq!(kind.to_string(), "fetch_unusable");
+    }
+
+    #[test]
+    fn test_parse_fetch_max_age_secs_defaults_and_accepts_a_positive_window() {
+        assert_eq!(parse_fetch_max_age_secs(None), default_fetch_max_age());
+        assert_eq!(
+            parse_fetch_max_age_secs(Some("  ")),
+            default_fetch_max_age()
+        );
+        assert_eq!(parse_fetch_max_age_secs(Some("0")), default_fetch_max_age());
+        assert_eq!(
+            parse_fetch_max_age_secs(Some("-5")),
+            default_fetch_max_age()
+        );
+        assert_eq!(
+            parse_fetch_max_age_secs(Some("nope")),
+            default_fetch_max_age()
+        );
+        assert_eq!(
+            parse_fetch_max_age_secs(Some("3600")),
+            chrono::Duration::seconds(3600)
+        );
+        assert_eq!(
+            default_fetch_max_age(),
+            chrono::Duration::seconds(DEFAULT_FETCH_MAX_AGE_SECS)
+        );
+        assert_eq!(DEFAULT_FETCH_MAX_AGE_SECS, 24 * 60 * 60);
+    }
+
+    #[test]
+    fn test_admission_context_from_tool_ignores_blank_session() {
+        let stamped = AdmissionContext::from_tool(" daemon ", Some("  "));
+        assert_eq!(stamped.execution_origin, "daemon");
+        assert_eq!(stamped.session_id, None);
+        let with_session = stamped.with_session(" sess-9 ");
+        assert_eq!(with_session.session_id.as_deref(), Some("sess-9"));
+        let direct = AdmissionContext::direct();
+        assert_eq!(direct.execution_origin, "direct");
+        assert_eq!(direct.session_id, None);
+        assert_eq!(direct.fetch_max_age, default_fetch_max_age());
     }
 }

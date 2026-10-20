@@ -13,11 +13,15 @@
 //!
 //! - a file's `impulse-subject:` line in the first 64 KiB
 //! - a commit message's `Impulse-Subject:` trailer
-//! - a URL's host
+//! - a URL's host, when the recorded fetch is a 2xx response, not in the
+//!   future, within the max age, and from the same session (or both calls
+//!   have no session)
 //!
 //! A claim about `billing.example.com` whose only source is
 //! `https://auth.example.com/...` is refused, even when the sender recorded
-//! a real fetch of that URL.
+//! a real fetch of that URL. The gate does not open a network connection.
+//! Live PR state counts only after the caller records a fetch of it. The
+//! gate does not rewrite the caller's arguments.
 //!
 //! # Stale shared writes
 //!
@@ -37,18 +41,19 @@ mod tests;
 
 pub(crate) use types::normalize_workspace;
 pub use types::{
-    CheckKind, Claim, ClaimSource, GateFailure, HandoffError, NextStep, SubjectKey, WorkflowResult,
-    WorkflowState, COMMIT_SUBJECT_TRAILER, FILE_SUBJECT_PREFIX, HANDOFF_GATE_FILE,
+    default_fetch_max_age, parse_fetch_max_age_secs, AdmissionContext, CheckKind, Claim,
+    ClaimSource, GateFailure, HandoffError, NextStep, SubjectKey, WorkflowResult, WorkflowState,
+    COMMIT_SUBJECT_TRAILER, DEFAULT_FETCH_MAX_AGE_SECS, FILE_SUBJECT_PREFIX, HANDOFF_GATE_FILE,
 };
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
-use gate::{evaluate_claims, RecordedFetch};
+use gate::{evaluate_claims, FetchAdmission, RecordedFetch};
 use store::{
     artifact_snapshot, handoff_snapshot, read_next_step, refuse_missing_artifact,
-    stale_write_failure, with_store, FetchRecord, GateStore, HandoffPhase, SharedArtifact,
-    StoredHandoff,
+    stale_write_failure, with_store, FetchRecord, GateStore, HandoffPhase, RecordedVia,
+    SharedArtifact, StoredHandoff,
 };
 use types::{
     normalize_url, parse_digest, parse_rfc3339, validate_id, validate_relative_path,
@@ -66,34 +71,48 @@ pub fn dispatch(
     impulse_dir: &std::path::Path,
     now: DateTime<Utc>,
 ) -> Result<WorkflowResult, HandoffError> {
-    dispatch_at(action, payload, impulse_dir, now, None)
+    dispatch_for(
+        action,
+        payload,
+        impulse_dir,
+        now,
+        None,
+        &AdmissionContext::direct(),
+    )
 }
 
-/// Same as [`dispatch`], with a workspace root that was already normalized.
+/// [`dispatch`] with a normalized workspace and the caller's admission stamp.
 ///
-/// The tool sandbox checks this exact `PathBuf` and then passes it here so
-/// `submit` does not trim or canonicalize the raw JSON string a second time.
-pub(crate) fn dispatch_at(
+/// `workspace`, when set, is the path the tool sandbox already checked. Submit
+/// uses that `PathBuf` and does not trim the raw JSON string a second time.
+/// `admission` carries the execution origin, session, and fetch max age from
+/// the tool or session context. Fields of the same names inside `payload` are
+/// ignored.
+pub(crate) fn dispatch_for(
     action: &str,
     payload: &Value,
     impulse_dir: &std::path::Path,
     now: DateTime<Utc>,
     workspace: Option<&std::path::Path>,
+    admission: &AdmissionContext,
 ) -> Result<WorkflowResult, HandoffError> {
-    if !payload.is_object() {
-        return Err(HandoffError::Invalid(
-            "payload must be a JSON object".into(),
-        ));
-    }
-    match action {
-        "record_fetch" => record_fetch(payload, impulse_dir, now),
-        "submit" => submit(payload, impulse_dir, now, workspace),
-        "status" => load_handoff(payload, impulse_dir, HandoffView::Status),
-        "read" => load_handoff(payload, impulse_dir, HandoffView::Read),
-        "read_shared" => read_shared(payload, impulse_dir, now),
-        "write_shared" => write_shared(payload, impulse_dir, now),
-        other => unknown_action(other),
-    }
+    let result = if !payload.is_object() {
+        pending_request(
+            action,
+            vec![request_failure("payload", "payload must be a JSON object")],
+        )
+    } else {
+        match action {
+            "record_fetch" => record_fetch(payload, impulse_dir, now, admission),
+            "submit" => submit(payload, impulse_dir, now, workspace, admission),
+            "status" => load_handoff(payload, impulse_dir, HandoffView::Status),
+            "read" => load_handoff(payload, impulse_dir, HandoffView::Read),
+            "read_shared" => read_shared(payload, impulse_dir, now),
+            "write_shared" => write_shared(payload, impulse_dir, now),
+            other => unknown_action(other),
+        }
+    };
+    promote_request(action, result)
 }
 
 fn unknown_action(action: &str) -> Result<WorkflowResult, HandoffError> {
@@ -107,8 +126,9 @@ fn unknown_action(action: &str) -> Result<WorkflowResult, HandoffError> {
         vec![GateFailure {
             target: name.clone(),
             check: CheckKind::Request,
+            field: Some("action".to_string()),
             fix: format!(
-                "unknown action `{name}`. Use one of: record_fetch, submit, status, read, read_shared, write_shared."
+                "payload.action `{name}` is unknown. Use one of: record_fetch, submit, status, read, read_shared, write_shared."
             ),
         }],
         NextStep {
@@ -122,14 +142,27 @@ fn record_fetch(
     payload: &Value,
     impulse_dir: &std::path::Path,
     now: DateTime<Utc>,
+    admission: &AdmissionContext,
 ) -> Result<WorkflowResult, HandoffError> {
+    // `session_id`, `execution_origin`, and `recorded_via` in the payload are
+    // ignored. The stamp below is the only one stored.
     let sender = validate_id("sender", require_str(payload, "sender")?)?;
-    let (url, host) = normalize_url(require_str(payload, "url")?)?;
+    let (url, host) =
+        normalize_url(require_str(payload, "url")?).map_err(|error| tag_field("url", error))?;
     let status = require_status(payload)?;
-    let body_digest = parse_digest(require_str(payload, "body_digest")?)?;
-    let fetched_at = match payload.get("fetched_at").and_then(Value::as_str) {
-        Some(raw) => parse_rfc3339(raw)?,
-        None => now,
+    let body_digest = parse_digest(require_str(payload, "body_digest")?)
+        .map_err(|error| tag_field("body_digest", error))?;
+    let fetched_at = match payload.get("fetched_at") {
+        None | Some(Value::Null) => now,
+        Some(Value::String(raw)) => {
+            parse_rfc3339(raw).map_err(|error| tag_field("fetched_at", error))?
+        }
+        Some(_) => {
+            return Err(HandoffError::Request {
+                field: "fetched_at".to_string(),
+                message: "payload.fetched_at must be an RFC 3339 timestamp".into(),
+            });
+        }
     };
     let record = FetchRecord {
         url: url.clone(),
@@ -138,6 +171,7 @@ fn record_fetch(
         body_digest,
         fetched_at,
         sender: sender.clone(),
+        recorded_via: recorded_via_from(admission),
     };
     with_store(impulse_dir, |store| {
         store.insert_fetch(record.clone())?;
@@ -150,6 +184,7 @@ fn record_fetch(
                 "body_digest": record.body_digest,
                 "sender": record.sender,
                 "fetched_at": record.fetched_at,
+                "recorded_via": record.recorded_via,
             }),
             NextStep {
                 action: "submit".into(),
@@ -167,13 +202,17 @@ fn submit(
     impulse_dir: &std::path::Path,
     now: DateTime<Utc>,
     workspace: Option<&std::path::Path>,
+    admission: &AdmissionContext,
 ) -> Result<WorkflowResult, HandoffError> {
-    let id = validate_id("handoff id", require_str(payload, "id")?)?;
+    // A drifted name such as `from` is not read. `session_id` in the payload
+    // is not the submit's session; `admission` is.
+    let id = validate_id("id", require_str(payload, "id")?)?;
     let from_agent = validate_id("from_agent", require_str(payload, "from_agent")?)?;
     let to_agent = validate_id("to_agent", require_str(payload, "to_agent")?)?;
     let workspace_path = match workspace {
         Some(path) => path.to_path_buf(),
-        None => normalize_workspace(require_str(payload, "workspace")?)?,
+        None => normalize_workspace(require_str(payload, "workspace")?)
+            .map_err(|error| tag_field("workspace", error))?,
     };
     let workspace = workspace_path.to_string_lossy().into_owned();
     let (claims, mut failures) = parse_claims(payload.get("claims"), &id)?;
@@ -185,12 +224,26 @@ fn submit(
             }
         }
         let sender = from_agent.clone();
-        let resolved = evaluate_claims(&claims, &workspace_path, &sender, &|url| {
-            store.fetch(&sender, url).map(|record| RecordedFetch {
-                sender: record.sender.clone(),
-                host: record.host.clone(),
-            })
-        });
+        let fetch_admission = FetchAdmission {
+            now,
+            fetch_max_age: admission.fetch_max_age,
+            session_id: admission.session_id.as_deref(),
+        };
+        let resolved = evaluate_claims(
+            &claims,
+            &workspace_path,
+            &sender,
+            &fetch_admission,
+            &|url| {
+                store.fetch(&sender, url).map(|record| RecordedFetch {
+                    sender: record.sender.clone(),
+                    host: record.host.clone(),
+                    status: record.status,
+                    fetched_at: record.fetched_at,
+                    session_id: record.recorded_via.session_id.clone(),
+                })
+            },
+        );
         failures.extend(resolved);
         let handoff = StoredHandoff {
             id: id.clone(),
@@ -206,6 +259,7 @@ fn submit(
                 }
             },
             updated_at: now,
+            recorded_via: recorded_via_from(admission),
         };
         let snapshot = handoff_snapshot(&handoff);
         if failures.is_empty() {
@@ -239,8 +293,9 @@ fn already_accepted(existing: &StoredHandoff) -> Result<WorkflowResult, HandoffE
         vec![GateFailure {
             target: existing.id.clone(),
             check: CheckKind::AlreadyAccepted,
+            field: Some("id".to_string()),
             fix: format!(
-                "handoff `{}` is already accepted and was not replaced. Read it with action `read`.",
+                "payload.id `{}` is already accepted and was not replaced. Read it with action `read`.",
                 existing.id
             ),
         }],
@@ -284,7 +339,8 @@ fn load_handoff(
             vec![GateFailure {
                 target: id.clone(),
                 check: CheckKind::HandoffExists,
-                fix: format!("no handoff `{id}` is stored. Submit it with action `submit`."),
+                field: Some("id".to_string()),
+                fix: format!("payload.id `{id}` is not stored. Submit it with action `submit`."),
             }],
             NextStep {
                 action: "submit".into(),
@@ -343,7 +399,8 @@ fn read_shared(
     impulse_dir: &std::path::Path,
     now: DateTime<Utc>,
 ) -> Result<WorkflowResult, HandoffError> {
-    let artifact_id = validate_relative_path("artifact_id", require_str(payload, "artifact_id")?)?;
+    let artifact_id = validate_relative_path("artifact_id", require_str(payload, "artifact_id")?)
+        .map_err(|error| tag_field("artifact_id", error))?;
     let reader = validate_id("reader", require_str(payload, "reader")?)?;
     with_store(impulse_dir, |store| {
         let Some(artifact) = store.artifact_mut(&artifact_id) else {
@@ -374,15 +431,17 @@ fn write_shared(
     impulse_dir: &std::path::Path,
     now: DateTime<Utc>,
 ) -> Result<WorkflowResult, HandoffError> {
-    let artifact_id = validate_relative_path("artifact_id", require_str(payload, "artifact_id")?)?;
+    let artifact_id = validate_relative_path("artifact_id", require_str(payload, "artifact_id")?)
+        .map_err(|error| tag_field("artifact_id", error))?;
     let writer = validate_id("writer", require_str(payload, "writer")?)?;
     let based_on = require_u64(payload, "based_on_generation")?;
     let content = match payload.get("content").and_then(Value::as_str) {
         Some(content) => content.to_string(),
         None => {
-            return Err(HandoffError::Invalid(
-                "write_shared requires string `content`".into(),
-            ));
+            return Err(HandoffError::Request {
+                field: "content".to_string(),
+                message: "payload.content missing".into(),
+            });
         }
     };
     if content.len() > MAX_ARTIFACT_BYTES {
@@ -395,8 +454,9 @@ fn write_shared(
             vec![GateFailure {
                 target: artifact_id,
                 check: CheckKind::Request,
+                field: Some("content".to_string()),
                 fix: format!(
-                    "content is {} bytes; the maximum is {MAX_ARTIFACT_BYTES}. Shorten the artifact and write again.",
+                    "payload.content is {} bytes; the maximum is {MAX_ARTIFACT_BYTES}. Shorten the artifact and write again.",
                     content.len()
                 ),
             }],
@@ -467,8 +527,9 @@ fn create_artifact(
             vec![GateFailure {
                 target: artifact_id.to_string(),
                 check: CheckKind::StaleRead,
+                field: Some("based_on_generation".to_string()),
                 fix: format!(
-                    "shared artifact `{artifact_id}` does not exist, so basing a write on generation {based_on} is stale. Create it with `based_on_generation` 0."
+                    "payload.based_on_generation {based_on} is stale because shared artifact `{artifact_id}` does not exist. Create it with `based_on_generation` 0."
                 ),
             }],
             NextStep {
@@ -504,13 +565,17 @@ fn parse_claims(
     handoff_id: &str,
 ) -> Result<(Vec<Claim>, Vec<GateFailure>), HandoffError> {
     let Some(value) = value else {
-        return Err(HandoffError::Invalid(
-            "submit requires a `claims` array. Each claim needs a subject and a file, commit, or URL source."
+        return Err(HandoffError::Request {
+            field: "claims".to_string(),
+            message: "payload.claims missing. Each claim needs a subject and a file, commit, or URL source."
                 .into(),
-        ));
+        });
     };
     let Some(items) = value.as_array() else {
-        return Err(HandoffError::Invalid("`claims` must be an array".into()));
+        return Err(HandoffError::Request {
+            field: "claims".to_string(),
+            message: "payload.claims must be an array".into(),
+        });
     };
     if items.is_empty() {
         return Ok((
@@ -518,14 +583,16 @@ fn parse_claims(
             vec![GateFailure {
                 target: handoff_id.to_string(),
                 check: CheckKind::ClaimsPresent,
-                fix: "handoff has no claims. Add at least one claim; each claim must name a subject and a file, commit, or URL source.".into(),
+                field: Some("claims".to_string()),
+                fix: "payload.claims is empty. Add at least one claim; each claim must name a subject and a file, commit, or URL source.".into(),
             }],
         ));
     }
     if items.len() > MAX_CLAIMS {
-        return Err(HandoffError::Invalid(format!(
-            "a handoff can carry at most {MAX_CLAIMS} claims"
-        )));
+        return Err(HandoffError::Request {
+            field: "claims".to_string(),
+            message: format!("payload.claims can carry at most {MAX_CLAIMS} claims"),
+        });
     }
     let mut claims = Vec::new();
     let mut failures = Vec::new();
@@ -549,6 +616,7 @@ fn parse_claim(value: &Value, index: usize) -> Result<Claim, GateFailure> {
         return Err(GateFailure {
             target: target.clone(),
             check: CheckKind::SourceResolves,
+            field: Some("source".to_string()),
             fix: format!(
                 "claim `{target}` is missing `source`. Add a source of kind `file` (path), `commit` (hash), or `url` (url). An unsourced claim cannot be handed off."
             ),
@@ -557,8 +625,9 @@ fn parse_claim(value: &Value, index: usize) -> Result<Claim, GateFailure> {
     serde_json::from_value(value.clone()).map_err(|error| GateFailure {
         target,
         check: CheckKind::Request,
+        field: Some("claims".to_string()),
         fix: format!(
-            "claim could not be read ({error}). Each claim needs id, statement, subject, and a file, commit, or URL source."
+            "payload.claims could not be read ({error}). Each claim needs id, statement, subject, and a file, commit, or URL source."
         ),
     })
 }
@@ -566,25 +635,30 @@ fn parse_claim(value: &Value, index: usize) -> Result<Claim, GateFailure> {
 fn require_str<'a>(payload: &'a Value, field: &str) -> Result<&'a str, HandoffError> {
     match payload.get(field) {
         Some(Value::String(value)) if !value.trim().is_empty() => Ok(value),
-        Some(_) => Err(HandoffError::Invalid(format!(
-            "`{field}` must be a non-empty string"
-        ))),
-        None => Err(HandoffError::Invalid(format!("missing `{field}`"))),
+        Some(_) => Err(HandoffError::Request {
+            field: field.to_string(),
+            message: format!("payload.{field} must be a non-empty string"),
+        }),
+        None => Err(HandoffError::Request {
+            field: field.to_string(),
+            message: format!("payload.{field} missing"),
+        }),
     }
 }
 
 fn require_status(payload: &Value) -> Result<u16, HandoffError> {
-    let status = payload
-        .get("status")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| HandoffError::Invalid("fetch `status` must be an integer".into()))?;
+    let Some(status) = payload.get("status").and_then(Value::as_u64) else {
+        return Err(HandoffError::Request {
+            field: "status".to_string(),
+            message: "payload.status missing or not an integer".into(),
+        });
+    };
     u16::try_from(status)
         .ok()
         .filter(|code| (100..=599).contains(code))
-        .ok_or_else(|| {
-            HandoffError::Invalid(format!(
-                "fetch status {status} must be an HTTP status from 100 to 599"
-            ))
+        .ok_or_else(|| HandoffError::Request {
+            field: "status".to_string(),
+            message: format!("payload.status {status} must be an HTTP status from 100 to 599"),
         })
 }
 
@@ -592,5 +666,184 @@ fn require_u64(payload: &Value, field: &str) -> Result<u64, HandoffError> {
     payload
         .get(field)
         .and_then(Value::as_u64)
-        .ok_or_else(|| HandoffError::Invalid(format!("`{field}` must be a non-negative integer")))
+        .ok_or_else(|| HandoffError::Request {
+            field: field.to_string(),
+            message: format!("payload.{field} must be a non-negative integer"),
+        })
+}
+
+fn recorded_via_from(admission: &AdmissionContext) -> RecordedVia {
+    RecordedVia {
+        execution_origin: admission.execution_origin.clone(),
+        session_id: admission.session_id.clone(),
+    }
+}
+
+fn tag_field(field: &str, error: HandoffError) -> HandoffError {
+    match error {
+        HandoffError::Invalid(message) | HandoffError::Request { message, .. } => {
+            HandoffError::Request {
+                field: field.to_string(),
+                message,
+            }
+        }
+        other => other,
+    }
+}
+
+fn request_failure(field: &str, message: impl Into<String>) -> GateFailure {
+    GateFailure {
+        target: field.to_string(),
+        check: CheckKind::Request,
+        field: Some(field.to_string()),
+        fix: message.into(),
+    }
+}
+
+fn pending_request(
+    action: &str,
+    failures: Vec<GateFailure>,
+) -> Result<WorkflowResult, HandoffError> {
+    let names: Vec<String> = failures
+        .iter()
+        .filter_map(|failure| failure.field.clone())
+        .collect();
+    let retry = if action.is_empty() { "submit" } else { action };
+    let named = names.join(", payload.");
+    WorkflowResult::pending(
+        json!({
+            "kind": "handoff_tool",
+            "phase": "pending",
+            "action": action,
+        }),
+        failures,
+        NextStep {
+            action: retry.to_string(),
+            detail: format!(
+                "Fix payload.{named} and call `{retry}` again. The gate does not rewrite arguments."
+            ),
+        },
+    )
+}
+
+fn promote_request(
+    action: &str,
+    result: Result<WorkflowResult, HandoffError>,
+) -> Result<WorkflowResult, HandoffError> {
+    match result {
+        Err(HandoffError::Request { field, message }) => {
+            pending_request(action, vec![request_failure(&field, message)])
+        }
+        other => other,
+    }
+}
+
+/// Canonical per-action JSON Schema for the `handoff` tool.
+///
+/// This is the card a caller sees before it predicts arguments. Repair still
+/// depends on [`GateFailure::field`], not on this document. Drifted names are
+/// absent: `from` is not a property and is not an alias of `from_agent`.
+pub fn action_schemas() -> Value {
+    let source = json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "path"],
+                "properties": {
+                    "kind": {"const": "file"},
+                    "path": {"type": "string"}
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "hash"],
+                "properties": {
+                    "kind": {"const": "commit"},
+                    "hash": {"type": "string"}
+                }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "url"],
+                "properties": {
+                    "kind": {"const": "url"},
+                    "url": {"type": "string"}
+                }
+            }
+        ]
+    });
+    let claim = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "statement", "subject", "source"],
+        "properties": {
+            "id": {"type": "string"},
+            "statement": {"type": "string"},
+            "subject": {"type": "string"},
+            "source": source
+        }
+    });
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action", "payload"],
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["record_fetch", "submit", "status", "read", "read_shared", "write_shared"]
+            }
+        },
+        "actions": {
+            "record_fetch": object_schema(
+                &["sender", "url", "status", "body_digest"],
+                json!({
+                    "sender": {"type": "string"},
+                    "url": {"type": "string"},
+                    "status": {"type": "integer", "minimum": 100, "maximum": 599},
+                    "body_digest": {"type": "string"},
+                    "fetched_at": {"type": "string", "format": "date-time"}
+                }),
+            ),
+            "submit": object_schema(
+                &["id", "from_agent", "to_agent", "workspace", "claims"],
+                json!({
+                    "id": {"type": "string"},
+                    "from_agent": {"type": "string"},
+                    "to_agent": {"type": "string"},
+                    "workspace": {"type": "string"},
+                    "claims": {"type": "array", "minItems": 1, "items": claim}
+                }),
+            ),
+            "status": object_schema(&["id"], json!({"id": {"type": "string"}})),
+            "read": object_schema(&["id"], json!({"id": {"type": "string"}})),
+            "read_shared": object_schema(
+                &["artifact_id", "reader"],
+                json!({
+                    "artifact_id": {"type": "string"},
+                    "reader": {"type": "string"}
+                }),
+            ),
+            "write_shared": object_schema(
+                &["artifact_id", "writer", "based_on_generation", "content"],
+                json!({
+                    "artifact_id": {"type": "string"},
+                    "writer": {"type": "string"},
+                    "based_on_generation": {"type": "integer", "minimum": 0},
+                    "content": {"type": "string"}
+                }),
+            )
+        }
+    })
+}
+
+fn object_schema(required: &[&str], properties: Value) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": required,
+        "properties": properties
+    })
 }
