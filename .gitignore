@@ -72,3 +72,6 @@ _archive-2026-07-16-L1-el-foreign-tools/
 
 # OpenWiki - local analysis state
 .openwiki/store.db
+
+# Cursor editor state (per-machine)
+.cursor/

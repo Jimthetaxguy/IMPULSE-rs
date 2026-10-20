@@ -17,12 +17,12 @@ impl DynamicTool for CalculatorTool {
         ToolDescriptor {
             id: "calculator".into(),
             name: "Calculator".into(),
-            description: "Evaluate mathematical expressions using Python".into(),
+            description: "Evaluate a mathematical expression (digits and + - * / % ( ) . e/E, whitespace; no names, sqrt, or abs) inside a Monty Python sandbox with no filesystem, network, or process access. Times out after 5s.".into(),
             version: "0.1.0".into(),
             category: ToolCategory::Utility,
             params: vec![ToolParam {
                 name: "expression".into(),
-                description: "Mathematical expression to evaluate (e.g., '2 + 2', '(10 * 5) / 3')"
+                description: "Mathematical formula only: digits, + - * / % ( ) . e/E, whitespace. Example: '2 + 2', '(10 * 5) / 3'. No identifiers."
                     .into(),
                 param_type: ParamType::String,
                 required: true,
@@ -33,8 +33,12 @@ impl DynamicTool for CalculatorTool {
 
     fn validate_params(&self, params: &serde_json::Value) -> Result<(), ToolError> {
         match params.get("expression").and_then(|v| v.as_str()) {
-            Some(expr) if !expr.trim().is_empty() => Ok(()),
-            _ => Err(ToolError::InvalidParams(
+            Some(expr) if crate::tools::python::is_restricted_math_expression(expr) => Ok(()),
+            Some(_) => Err(ToolError::InvalidParams(
+                "expression must be a mathematical formula (digits and + - * / % ( ) . e), not Python"
+                    .into(),
+            )),
+            None => Err(ToolError::InvalidParams(
                 "missing or empty 'expression' string".into(),
             )),
         }
@@ -50,7 +54,13 @@ impl DynamicTool for CalculatorTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| ToolError::InvalidParams("missing 'expression'".into()))?;
 
-        match crate::tools::python::calculate(expression) {
+        // The sandbox runs synchronously; see `PythonExecTool::execute`.
+        let owned = expression.to_string();
+        let calculated =
+            tokio::task::spawn_blocking(move || crate::tools::python::calculate(&owned))
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(format!("Calculation failed: {e}")))?;
+        match calculated {
             Ok(result) => Ok(ToolResult::json(serde_json::json!({
                 "expression": expression,
                 "result": result,
@@ -78,6 +88,11 @@ mod tests {
         assert_eq!(desc.id, "calculator");
         assert_eq!(desc.category, ToolCategory::Utility);
         assert_eq!(desc.params.len(), 1);
+        assert!(
+            desc.description.contains("digits") && desc.description.contains("no names"),
+            "descriptor must name the math grammar, got {}",
+            desc.description
+        );
     }
 
     #[test]
@@ -101,15 +116,26 @@ mod tests {
         assert!(tool.validate_params(&params).is_err());
     }
 
+    #[test]
+    fn test_validate_params_rejects_python_injection() {
+        let tool = CalculatorTool;
+        let params = serde_json::json!({"expression": "__import__('os').system('id')"});
+        let err = tool
+            .validate_params(&params)
+            .expect_err("calculator must not accept arbitrary Python");
+        let msg = err.to_string();
+        assert!(msg.contains("mathematical formula"), "got {msg}");
+    }
+
     #[tokio::test]
     async fn test_execute() {
         let tool = CalculatorTool;
         let ctx = ToolContext::with_all_capabilities();
         let params = serde_json::json!({"expression": "2 + 2"});
-        let result = tool.execute(params, &ctx).await;
-        // May fail if Python not available, but should not panic
-        if let Ok(r) = result {
-            assert!(r.output.get("result").is_some());
-        }
+        let r = tool
+            .execute(params, &ctx)
+            .await
+            .expect("the sandbox is in-process, so evaluation cannot depend on host Python");
+        assert_eq!(r.output["result"], "\"4\"");
     }
 }

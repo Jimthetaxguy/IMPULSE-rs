@@ -86,10 +86,20 @@ impl ToolExecutor {
 
     fn enforce_artifact_limit(mut result: ToolResult, ctx: &ToolContext) -> ToolResult {
         if result.artifacts.len() > ctx.max_artifacts {
+            let dropped: Vec<String> = result.artifacts[ctx.max_artifacts..]
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
             result.artifacts.truncate(ctx.max_artifacts);
+            let dropped_json = serde_json::Value::Array(
+                dropped.into_iter().map(serde_json::Value::String).collect(),
+            );
             result
                 .metadata
                 .insert("artifacts_truncated".into(), "true".to_string());
+            result
+                .metadata
+                .insert("artifacts_dropped".into(), dropped_json.to_string());
         }
         result
     }
@@ -104,20 +114,27 @@ impl ToolExecutor {
         }
 
         let preview = String::from_utf8_lossy(&serialized[..ctx.max_output_bytes]).to_string();
-        result.output = match result.output {
-            serde_json::Value::String(_) => serde_json::Value::String(preview),
-            _ => serde_json::json!({
-                "truncated": true,
-                "preview": preview,
-                "original_bytes": serialized.len(),
-            }),
-        };
+        let remainder_bytes = serialized.len() - ctx.max_output_bytes;
+        let remainder = format!("not included; {remainder_bytes} bytes");
+        let mut limited = serde_json::json!({
+            "truncated": true,
+            "preview": preview,
+            "original_bytes": serialized.len(),
+            "remainder": remainder.clone(),
+        });
+        if let Some(path) = result.artifacts.first() {
+            limited["path"] = serde_json::Value::String(path.display().to_string());
+        }
+        result.output = limited;
         result
             .metadata
             .insert("output_truncated".into(), "true".to_string());
         result
             .metadata
             .insert("original_output_bytes".into(), serialized.len().to_string());
+        result
+            .metadata
+            .insert("remainder".into(), remainder.clone());
 
         Ok(result)
     }
@@ -348,6 +365,108 @@ mod tests {
                 .metadata
                 .get("artifacts_truncated")
                 .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_artifact_limit_names_every_dropped_artifact() {
+        let ctx = ToolContext {
+            execution_origin: ExecutionOrigin::Test,
+            max_artifacts: 1,
+            ..ToolContext::with_all_capabilities()
+        };
+        let result = ToolExecutor::execute(&ArtifactTool, serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(result.artifacts.len(), 1);
+        assert_eq!(result.artifacts[0], std::path::PathBuf::from("one.txt"));
+        let dropped: Vec<String> = serde_json::from_str(
+            result
+                .metadata
+                .get("artifacts_dropped")
+                .expect("dropped artifacts must be named"),
+        )
+        .expect("artifacts_dropped is a JSON list");
+        assert_eq!(
+            dropped,
+            vec!["two.txt".to_string(), "three.txt".to_string()]
+        );
+        assert_eq!(
+            result
+                .metadata
+                .get("artifacts_truncated")
+                .map(String::as_str),
+            Some("true")
+        );
+    }
+
+    struct LargeFileTool;
+
+    #[async_trait]
+    impl DynamicTool for LargeFileTool {
+        fn id(&self) -> &str {
+            "large_file"
+        }
+
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                id: self.id().into(),
+                name: "Large File".into(),
+                description: "Returns a large string and a file path".into(),
+                version: "0.1.0".into(),
+                category: ToolCategory::Utility,
+                params: vec![],
+            }
+        }
+
+        fn validate_params(&self, _params: &serde_json::Value) -> Result<(), ToolError> {
+            Ok(())
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult {
+                output: serde_json::Value::String("x".repeat(2048)),
+                artifacts: vec![std::path::PathBuf::from("out/result.txt")],
+                metadata: std::collections::HashMap::new(),
+            })
+        }
+
+        fn required_capabilities(&self) -> Vec<Capability> {
+            vec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn test_output_limit_states_remainder_bytes() {
+        let ctx = ToolContext {
+            execution_origin: ExecutionOrigin::Test,
+            max_output_bytes: 128,
+            ..ToolContext::with_all_capabilities()
+        };
+        let result = ToolExecutor::execute(&LargeFileTool, serde_json::json!({}), &ctx)
+            .await
+            .unwrap();
+        let original = result.output["original_bytes"]
+            .as_u64()
+            .expect("original_bytes is recorded");
+        let remainder = result.output["remainder"]
+            .as_str()
+            .expect("remainder names the bytes left out");
+        let dropped = original - 128;
+        assert_eq!(remainder, format!("not included; {dropped} bytes"));
+        assert!(result.output["preview"].as_str().is_some());
+        assert_eq!(result.output["path"], "out/result.txt");
+        assert_eq!(
+            result.metadata.get("remainder").map(String::as_str),
+            Some(remainder)
+        );
+        assert_eq!(
+            result.metadata.get("output_truncated").map(String::as_str),
             Some("true")
         );
     }

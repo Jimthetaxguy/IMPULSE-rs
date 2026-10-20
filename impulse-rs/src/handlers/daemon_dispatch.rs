@@ -12,7 +12,7 @@ use crate::{envelope, plugin, semantic_diff, verify, Commands};
 
 use super::{
     capture_hook_evidence, default_session_name, get_session_id, parse_injection_mode, print_json,
-    print_verification_report, read_hook_stdin_payload, HookEvidenceInput,
+    print_verification_report, read_hook_stdin_payload, HookEvidenceInput, DAEMON_STOP_UNSUPPORTED,
 };
 
 /// Run a CLI command in daemon mode (forwarding over IPC).
@@ -31,9 +31,12 @@ pub async fn dispatch(
         Commands::SessionStart {
             name,
             platform,
-            inject_mode: _,
+            inject_mode,
             inject_explain: _,
         } => {
+            // Daemon mode does not inject, but a mistyped mode is still an
+            // error rather than silently accepted.
+            parse_injection_mode(inject_mode.as_deref())?;
             handle_session_start(client, impulse_dir, name, platform)
                 .await
                 .context("Failed to handle session-start daemon request")?;
@@ -181,6 +184,21 @@ pub async fn dispatch(
         } => {
             handle_governed_review(client, project_id, task_id, json).await?;
         }
+        Commands::GovernedPromote {
+            project_id,
+            task_id,
+            json,
+        } => {
+            handle_governed_promote(client, project_id, task_id, json).await?;
+        }
+        Commands::GovernedDiscard {
+            project_id,
+            task_id,
+            reason,
+            json,
+        } => {
+            handle_governed_discard(client, project_id, task_id, reason, json).await?;
+        }
         Commands::SearchHistory { .. }
         | Commands::SearchGenome { .. }
         | Commands::IndexMemory { .. }
@@ -270,7 +288,37 @@ async fn handle_governed_claim(
             artifact_ids,
         })
         .await?;
-    print_governed_ack(&acknowledged, json, "Claim acknowledged")
+    match acknowledged {
+        crate::client::GovernedProducerOutcome::Recorded(task) => {
+            print_governed_ack(&task, json, "Claim acknowledged")
+        }
+        crate::client::GovernedProducerOutcome::StagedConfigRefused(refusal) => {
+            print_staged_config_refusal(&refusal, json, "Claim refused")
+        }
+    }
+}
+
+/// Report a staged-configuration refusal (ADR-0019 rule 13).
+///
+/// The daemon completed its exchange, but the producer did not run or record
+/// anything. Preserve the reason/remedy on stdout, then return an error so
+/// shell automation receives a nonzero status in both text and JSON modes.
+fn print_staged_config_refusal(
+    refusal: &impulse_ops::governed_wiring::GovernedStagedConfigRefusalAck,
+    json: bool,
+    label: &str,
+) -> Result<()> {
+    if json {
+        print_json(refusal).context("Failed to serialize governed refusal")?;
+    } else {
+        println!(
+            "{label}: {} revision {} — {}",
+            refusal.task.id, refusal.task.revision, refusal.reason
+        );
+        println!("  remedy: {}", refusal.remedy);
+        println!("  nothing was recorded; the task is unchanged");
+    }
+    anyhow::bail!("{label}: the producer did not run; the task is unchanged")
 }
 
 async fn handle_governed_verify(
@@ -288,7 +336,14 @@ async fn handle_governed_verify(
             expected_revision: task.revision,
         })
         .await?;
-    print_governed_ack(&acknowledged, json, "Verification acknowledged")
+    match acknowledged {
+        crate::client::GovernedProducerOutcome::Recorded(ack) => {
+            print_producer_ack(&ack, json, "Verification acknowledged")
+        }
+        crate::client::GovernedProducerOutcome::StagedConfigRefused(refusal) => {
+            print_staged_config_refusal(&refusal, json, "Verification refused")
+        }
+    }
 }
 
 async fn handle_governed_review(
@@ -308,7 +363,213 @@ async fn handle_governed_review(
             },
         )
         .await?;
-    print_governed_ack(&acknowledged, json, "Supervisor review acknowledged")
+    print_producer_ack(&acknowledged, json, "Supervisor review acknowledged")
+}
+
+/// Report a producer acknowledgement, including the reservation journal's
+/// explanation when this request is rerunning work a crashed process left
+/// unreceipted (ADR-0012 amendment).
+fn print_producer_ack(
+    acknowledged: &impulse_ops::governed_wiring::GovernedProducerAck,
+    json: bool,
+    label: &str,
+) -> Result<()> {
+    if json {
+        return print_json(acknowledged)
+            .context("Failed to serialize governed producer acknowledgement");
+    }
+    print_governed_ack(&acknowledged.task, json, label)?;
+    if acknowledged.replayed {
+        println!("  replayed: the recorded receipt was returned; no side effect ran");
+    }
+    if let Some(reason) = &acknowledged.pending_rerun_reason {
+        println!("  rerun after an interrupted producer reservation: {reason}");
+    }
+    Ok(())
+}
+
+async fn handle_governed_promote(
+    client: &DaemonClient,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let (project_id, task_id, task) = current_governed_task(client, project_id, task_id).await?;
+    let acknowledged = match client
+        .promote_governed_outcome(impulse_ops::governed_wiring::GovernedPromotionRequest {
+            request_id: governed_request_id("promote"),
+            project_id,
+            task_id,
+            expected_revision: task.revision,
+        })
+        .await?
+    {
+        crate::client::GovernedProducerOutcome::Recorded(acknowledged) => acknowledged,
+        crate::client::GovernedProducerOutcome::StagedConfigRefused(refusal) => {
+            return print_staged_config_refusal(&refusal, json, "Promotion refused");
+        }
+    };
+    if json {
+        return print_json(&acknowledged)
+            .context("Failed to serialize governed promotion acknowledgement");
+    }
+    print_producer_ack(&acknowledged, json, "Promotion acknowledged")?;
+    match acknowledged.task.latest_promotion() {
+        Some(promotion) => match &promotion.outcome {
+            impulse_ops::governed_task::GovernedPromotionOutcome::Promoted {
+                promoted_revision,
+            } => {
+                println!("  promoted: the canonical branch now points at {promoted_revision}");
+            }
+            impulse_ops::governed_task::GovernedPromotionOutcome::PromotionBlocked {
+                canonical_head,
+                reason,
+            } => {
+                println!("{}", blocked_promotion_line(reason, canonical_head));
+            }
+        },
+        None => println!("  no promotion record was written"),
+    }
+    Ok(())
+}
+
+async fn handle_governed_discard(
+    client: &DaemonClient,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    reason: String,
+    json: bool,
+) -> Result<()> {
+    let (project_id, task_id, task) = current_governed_task(client, project_id, task_id).await?;
+    let acknowledged = client
+        .discard_governed_staged_worktree(
+            impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                request_id: governed_request_id("discard"),
+                project_id,
+                task_id,
+                expected_revision: task.revision,
+                reason,
+            },
+        )
+        .await?;
+    if json {
+        return print_json(&acknowledged)
+            .context("Failed to serialize governed discard acknowledgement");
+    }
+    print_governed_ack(&acknowledged.task, json, "Staged worktree discarded")?;
+    println!("  removed: {}", acknowledged.discarded_root);
+    if let Some(commit) = &acknowledged.unreferenced_accepted_commit {
+        println!("{}", unreferenced_commit_warning(commit));
+    }
+    Ok(())
+}
+
+/// What an operator is told when a promotion could not move the branch.
+///
+/// A free function rather than an inline `println!` so the wording is testable.
+/// It was previously a wrapped literal with no `\` continuations, which
+/// rustfmt joined into one string carrying a 22-space run in the middle of a
+/// sentence -- in the exact message ADR-0019 requires the surface to get right.
+fn blocked_promotion_line(
+    reason: &impulse_ops::governed_task::PromotionBlockedReason,
+    canonical_head: &str,
+) -> String {
+    format!(
+        "  blocked ({reason}): the canonical head is {canonical_head}. The run stays accepted and the staged worktree stays active; reconcile the canonical branch and retry."
+    )
+}
+
+/// What an operator is told when a discard drops an accepted commit's only ref.
+///
+/// Same reason as [`blocked_promotion_line`] for being a free function: this is
+/// the wording ADR-0019's Consequences require, and it had the same 14-space
+/// run from an unescaped line wrap.
+fn unreferenced_commit_warning(commit: &str) -> String {
+    format!(
+        "  WARNING: the accepted commit {commit} was never promoted onto the canonical branch, so this discard dropped its only ref. It is reachable through the reflog until that expires; `git cat-file -p {commit}` recovers it deliberately."
+    )
+}
+
+#[cfg(test)]
+mod governed_message_tests {
+    use super::{blocked_promotion_line, unreferenced_commit_warning};
+    use impulse_ops::governed_task::{PromotionBlockedReason, SharedConfigComponent};
+
+    /// Both messages were assembled from wrapped literals with no `\`
+    /// continuation, so rustfmt joined them into one string with a run of
+    /// interior spaces. A double space is the cheapest signal that the same
+    /// mistake has come back.
+    #[test]
+    fn test_operator_messages_contain_no_run_of_spaces() {
+        let messages = [
+            blocked_promotion_line(&PromotionBlockedReason::CanonicalHeadMoved, "abc123"),
+            blocked_promotion_line(&PromotionBlockedReason::DetachedHead, "abc123"),
+            blocked_promotion_line(
+                &PromotionBlockedReason::RepositoryConfigChanged {
+                    component: SharedConfigComponent::RepositoryConfig,
+                },
+                "abc123",
+            ),
+            unreferenced_commit_warning("abc123"),
+        ];
+        for message in messages {
+            // The two-space indent every line of this output uses is the only
+            // legitimate run, and it is a prefix.
+            let body = message
+                .strip_prefix("  ")
+                .expect("each operator line is indented by exactly two spaces");
+            assert!(
+                !body.contains("  "),
+                "operator message has a run of spaces: {message:?}"
+            );
+            assert!(!body.contains('\n'), "operator message must be one line");
+        }
+    }
+
+    #[test]
+    fn test_blocked_promotion_line_names_the_reason_and_the_head() {
+        let line = blocked_promotion_line(
+            &PromotionBlockedReason::RepositoryConfigChanged {
+                component: SharedConfigComponent::InfoAttributes,
+            },
+            "deadbeef",
+        );
+        assert!(line.contains("repository_config_changed"));
+        assert!(line.contains(".git/info/attributes"));
+        assert!(line.contains("deadbeef"));
+        assert!(
+            line.contains("stays accepted"),
+            "a blocked promotion must not read as a failed run: {line}"
+        );
+    }
+
+    /// The accepted/unpinned/zero-promotions case: an accepted run whose staged
+    /// worktree has no configuration pin is discardable with no promotion
+    /// attempt, so the warning must be reachable without a recorded promotion.
+    /// The CLI fills this line straight from
+    /// `GovernedStagedWorktreeDiscardAck.unreferenced_accepted_commit`, so the
+    /// only thing this side has to get right is that it renders whatever the
+    /// ack carries -- including a revision that came from the accepted claim
+    /// rather than from a promotion record.
+    #[test]
+    fn test_unreferenced_commit_warning_renders_a_claim_sourced_revision() {
+        let from_claim = unreferenced_commit_warning("c1a1mc0mm1t");
+        assert!(from_claim.contains("c1a1mc0mm1t"));
+        assert!(from_claim.contains("never promoted onto the canonical branch"));
+        assert!(from_claim.contains("git cat-file -p c1a1mc0mm1t"));
+        assert!(
+            !from_claim.contains("blocked"),
+            "the wording must not assume a promotion was attempted: {from_claim}"
+        );
+    }
+
+    #[test]
+    fn test_unreferenced_commit_warning_shows_the_oid_and_how_to_recover_it() {
+        let warning = unreferenced_commit_warning("deadbeef");
+        assert!(warning.contains("deadbeef"));
+        assert!(warning.contains("reflog"));
+        assert!(warning.contains("git cat-file -p deadbeef"));
+    }
 }
 
 // ============================================================================
@@ -317,9 +578,7 @@ async fn handle_governed_review(
 
 async fn handle_daemon(client: &DaemonClient, stop: bool) -> Result<()> {
     if stop {
-        println!("Stopping daemon...");
-        let _ = client.ping().await;
-        println!("Daemon stopped");
+        anyhow::bail!(DAEMON_STOP_UNSUPPORTED);
     } else {
         println!("Daemon running");
         let status = client
@@ -399,7 +658,7 @@ async fn handle_session_end(
                         eprintln!("Semantic diff: {}", report.summary);
                     }
                 }
-                Err(e) => eprintln!("Warning: semantic diff failed: {}", e),
+                Err(e) => eprintln!("Warning: semantic diff failed: {e:#}"),
             }
         }
     }
@@ -423,7 +682,13 @@ async fn handle_session_end(
             .context("Failed to capture hook evidence for session-end")?;
             println!("Session {} ended", session_id)
         }
-        Err(e) => eprintln!("Error: {}", e),
+        // An unknown session fails open, as in direct mode (hooks must not
+        // break the agent); the daemon reports it as exactly this. Any other
+        // failure, such as the daemon's history write, is a real error.
+        Err(e) if format!("{e:#}").contains("Session not found") => {
+            println!("Session not found: {}", session_id)
+        }
+        Err(e) => return Err(e).context("Failed to end session"),
     }
     Ok(())
 }
@@ -486,13 +751,7 @@ async fn handle_chat(
     inject_mode: Option<String>,
     inject_explain: bool,
 ) -> Result<()> {
-    let inject_mode = match parse_injection_mode(inject_mode.as_deref()) {
-        Ok(mode) => mode.map(|m| m.as_str().to_string()),
-        Err(e) => {
-            eprintln!("Error: {}", e);
-            return Ok(());
-        }
-    };
+    let inject_mode = parse_injection_mode(inject_mode.as_deref())?.map(|m| m.as_str().to_string());
     match client
         .chat(session_id.clone(), message, inject_mode, inject_explain)
         .await
@@ -656,6 +915,37 @@ fn format_session_line(session: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review P3-5: `--stop` printed "Daemon stopped" after a ping and left
+    /// the daemon running. It fails before touching the socket now.
+    #[tokio::test]
+    async fn test_daemon_stop_fails_instead_of_claiming_success() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let client = DaemonClient::new(tmp.path().join("no-daemon.sock"));
+        let err = handle_daemon(&client, true).await.unwrap_err();
+        assert!(err.to_string().contains("no stop request"), "{err}");
+    }
+
+    /// Refutation review of c19a1dd: daemon mode dropped `--inject-mode`,
+    /// so a mistyped mode was accepted. It fails before the daemon is asked.
+    #[tokio::test]
+    async fn test_daemon_session_start_refuses_an_invalid_inject_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let client = DaemonClient::new(tmp.path().join("no-daemon.sock"));
+        let command = Commands::SessionStart {
+            name: Some("s".to_string()),
+            platform: None,
+            inject_mode: Some("of".to_string()),
+            inject_explain: false,
+        };
+        let err = dispatch(command, tmp.path(), &client, None)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").to_lowercase().contains("inject"),
+            "{err:#}"
+        );
+    }
 
     /// Parse plugin options string: valid JSON passes through, invalid wraps as `{"raw": ...}`.
     /// Delegates to the shared `parse_json_or_raw` helper.

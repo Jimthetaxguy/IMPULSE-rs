@@ -29,14 +29,7 @@ use crate::state::{Config, HistoryEntry};
 use crate::storage::Storage;
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp_path = path.with_extension(format!(
-        "tmp.{}.{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
+    let temp_path = path.with_extension(format!("tmp.{}", crate::storage::unique_temp_token()));
     let mut file = File::create(&temp_path)?;
     file.write_all(bytes)?;
     file.sync_all()?;
@@ -65,6 +58,23 @@ pub fn index_from_storage(
     index_memory_from_storage(storage, config, scope, rebuild)
 }
 
+/// Index the promoted memory records behind the GENOME projection (ADR-0020).
+pub fn index_promoted_memory(
+    base_path: &Path,
+    records: &[impulse_ops::memory_candidate::MemoryRecord],
+) -> Result<usize> {
+    indexer::index_promoted_memory_records(base_path, records)
+}
+
+/// Keyword search restricted to promoted memory records.
+pub fn search_promoted_memory(
+    base_path: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<types::SearchResult>> {
+    indexer::search_promoted_memory(base_path, query, limit)
+}
+
 pub fn search_history(
     base_path: &Path,
     config: &Config,
@@ -72,9 +82,8 @@ pub fn search_history(
     mode: Option<RetrievalMode>,
     backend: Option<SearchBackend>,
     limit: Option<usize>,
-    offset: Option<usize>,
 ) -> Result<SearchResponse> {
-    query::search_history(base_path, config, query, mode, backend, limit, offset)
+    query::search_history(base_path, config, query, mode, backend, limit)
 }
 
 pub fn search_genome(
@@ -84,9 +93,8 @@ pub fn search_genome(
     mode: Option<RetrievalMode>,
     backend: Option<SearchBackend>,
     limit: Option<usize>,
-    offset: Option<usize>,
 ) -> Result<SearchResponse> {
-    query::search_genome(base_path, config, query, mode, backend, limit, offset)
+    query::search_genome(base_path, config, query, mode, backend, limit)
 }
 
 pub fn status(base_path: &Path, config: &Config, check: bool) -> Result<RetrievalStatus> {
@@ -327,8 +335,7 @@ mod tests {
         .unwrap();
 
         // Search for the entry
-        let result =
-            search_history(tmp.path(), &config, "search", None, None, Some(5), None).unwrap();
+        let result = search_history(tmp.path(), &config, "search", None, None, Some(5)).unwrap();
         assert!(result.candidate_count > 0);
         assert!(!result.results.is_empty());
     }
@@ -355,8 +362,7 @@ mod tests {
         let _idx = index(tmp.path(), &[], &genome, &config, IndexScope::Genome, true).unwrap();
 
         // Search for the entry
-        let result =
-            search_genome(tmp.path(), &config, "sqlite", None, None, Some(5), None).unwrap();
+        let result = search_genome(tmp.path(), &config, "sqlite", None, None, Some(5)).unwrap();
         assert!(result.candidate_count > 0);
         assert!(!result.results.is_empty());
         // Verify we found the SQLite decision

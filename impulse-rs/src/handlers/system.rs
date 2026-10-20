@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -37,11 +37,6 @@ pub fn handle_system() -> Result<()> {
 pub fn handle_calc(expression: String) -> Result<()> {
     use crate::tools::python;
 
-    if !python::is_python_available() {
-        eprintln!("Error: Python is not available. Please install Python 3.");
-        return Err(anyhow::anyhow!("Python not available"));
-    }
-
     match python::calculate(&expression) {
         Ok(result) => {
             println!("{}", result);
@@ -57,24 +52,37 @@ pub fn handle_calc(expression: String) -> Result<()> {
 pub fn handle_exec(code: String) -> Result<()> {
     use crate::tools::python;
 
-    if !python::is_python_available() {
-        eprintln!("Error: Python is not available. Please install Python 3.");
-        return Err(anyhow::anyhow!("Python not available"));
-    }
-
     match python::execute_python(&code) {
         Ok(result) => {
-            if let Some(error) = result.error {
+            if let Some(error) = &result.error {
                 eprintln!("Error:\n{}", error);
             }
             if !result.output.is_empty() {
                 print!("{}", result.output);
             }
+            exec_outcome(&result)
         }
         Err(e) => {
             eprintln!("Execution error: {}", e);
-            return Err(anyhow::anyhow!("Execution failed"));
+            Err(anyhow::anyhow!("Execution failed"))
         }
+    }
+}
+
+/// Whether a sandbox run counts as a successful `exec` command.
+///
+/// The sandbox reports every program failure as a result carrying a fault
+/// class, not as an `Err`, so a caller can tell a timeout from a syntax error.
+/// On the command line that still has to end in a non-zero exit. A script or
+/// an agent that checks only the exit status would otherwise accept a program
+/// that timed out, raised, or never parsed. Output printed before the failure
+/// has already been written by the caller.
+fn exec_outcome(result: &crate::tools::python::PythonResult) -> Result<()> {
+    if let Some(fault) = result.fault {
+        anyhow::bail!("Execution failed ({fault})");
+    }
+    if result.exit_code != 0 {
+        anyhow::bail!("Execution failed (exit code {})", result.exit_code);
     }
     Ok(())
 }
@@ -144,54 +152,58 @@ pub fn handle_swarm(agent_a: String, agent_b: String, threshold: f64, json: bool
 }
 
 pub fn handle_hooks(state: &Arc<state::State>, platform: String) -> Result<()> {
-    let impulse_path = state.storage().base_path().display().to_string();
+    install_hook_templates(Path::new("."), &platform)?;
+    println!("\nImpulse path: {}", state.storage().base_path().display());
+    Ok(())
+}
 
-    if platform == "claude-code" || platform == "all" {
+/// Writes the hook templates under `project_root` (`.claude/hooks/hooks.json`,
+/// `.opencode/impulse.json`) for `platform`. Taking the root explicitly keeps
+/// tests out of the source tree they run in.
+pub(crate) fn install_hook_templates(project_root: &Path, platform: &str) -> Result<()> {
+    let claude = platform == "claude-code" || platform == "all";
+    let opencode = platform == "opencode" || platform == "all";
+    if !claude && !opencode {
+        anyhow::bail!("unknown hooks platform '{platform}' (use claude-code, opencode, or all)");
+    }
+
+    if claude {
         println!("Setting up Claude Code hooks...");
-        let hooks_dir = std::path::Path::new(".claude/hooks");
-        if let Err(e) = std::fs::create_dir_all(hooks_dir) {
-            eprintln!("Error creating .claude/hooks: {}", e);
-        } else {
-            let hook_config = build_claude_hook_config();
-            let hook_json = serde_json::to_string_pretty(&hook_config).unwrap_or_else(|e| {
-                eprintln!("Error serializing hook config: {}", e);
-                String::from("{}")
-            });
-            let hook_path = std::path::Path::new(".claude/hooks/hooks.json");
-            if let Err(e) = stewardship::atomic_write_file(hook_path, hook_json.as_bytes()) {
-                eprintln!("Error writing hooks: {}", e);
-            } else {
-                println!("  \u{2713} Created .claude/hooks/hooks.json");
-            }
-        }
+        let hooks_dir = project_root.join(".claude").join("hooks");
+        std::fs::create_dir_all(&hooks_dir).context("Failed to create .claude/hooks")?;
+        let hook_config = build_claude_hook_config();
+        let hook_json = serde_json::to_string_pretty(&hook_config)
+            .context("Failed to serialize the Claude hook template")?;
+        let hook_path = hooks_dir.join("hooks.json");
+        stewardship::atomic_write_file(&hook_path, hook_json.as_bytes())
+            .context("Failed to write .claude/hooks/hooks.json")?;
+        println!("  \u{2713} Wrote the hook template to .claude/hooks/hooks.json");
+        // Claude Code reads hooks from its settings files, not this path, so
+        // say exactly what makes the guard enforce anything.
+        let guard_entry =
+            serde_json::json!({ "hooks": { "PreToolUse": hook_config["hooks"]["PreToolUse"] } });
+        println!(
+            "\nClaude Code does not load .claude/hooks/hooks.json; it is a template. To enforce \
+             the Impulse guard, add this to .claude/settings.local.json (merge with any hooks \
+             already there):\n{}\nThe template's session-tracking entries need your session wiring; \
+             see `impulse-rs validate-hooks claude-code`.",
+            serde_json::to_string_pretty(&guard_entry)
+                .context("Failed to serialize the guard hook entry")?
+        );
     }
 
-    if platform == "opencode" || platform == "all" {
+    if opencode {
         println!("\nSetting up OpenCode integration...");
-        let opencode_dir = std::path::Path::new(".opencode");
-        if let Err(e) = std::fs::create_dir_all(opencode_dir) {
-            eprintln!("Error creating .opencode: {}", e);
-        } else {
-            let opencode_config = build_opencode_hook_config();
-            let opencode_json =
-                serde_json::to_string_pretty(&opencode_config).unwrap_or_else(|e| {
-                    eprintln!("Error serializing OpenCode config: {}", e);
-                    String::from("{}")
-                });
-            let opencode_path = std::path::Path::new(".opencode/impulse.json");
-            if let Err(e) = stewardship::atomic_write_file(opencode_path, opencode_json.as_bytes())
-            {
-                eprintln!("Error writing OpenCode config: {}", e);
-            } else {
-                println!("  \u{2713} Created .opencode/impulse.json");
-            }
-        }
+        let opencode_dir = project_root.join(".opencode");
+        std::fs::create_dir_all(&opencode_dir).context("Failed to create .opencode")?;
+        let opencode_config = build_opencode_hook_config();
+        let opencode_json = serde_json::to_string_pretty(&opencode_config)
+            .context("Failed to serialize the OpenCode config")?;
+        let opencode_path = opencode_dir.join("impulse.json");
+        stewardship::atomic_write_file(&opencode_path, opencode_json.as_bytes())
+            .context("Failed to write .opencode/impulse.json")?;
+        println!("  \u{2713} Created .opencode/impulse.json");
     }
-
-    println!(
-        "\nHooks setup complete!\nImpulse path: {}\nEdit .claude/hooks/hooks.json to customize.",
-        impulse_path
-    );
     Ok(())
 }
 
@@ -250,7 +262,10 @@ pub async fn handle_chat(
     }
 
     let provider = AnthropicProvider::new(api_key);
-    let model = std::env::var("IMPULSE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+    let configured =
+        std::env::var("IMPULSE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-6".to_string());
+    let step_ctx = crate::agent::step_model::HarnessStepContext::ion_api(configured.clone());
+    let model = crate::agent::step_model::resolve_step_model(&step_ctx, &configured, None);
     let request = ChatRequest {
         model,
         messages: vec![Message::text(Role::User, context_prompt)],
@@ -369,9 +384,11 @@ pub async fn handle_docs(
         }
         "status" => {
             let metadata = cache.load_metadata()?;
-            let age = cache.age_seconds().unwrap_or(0);
             println!("Cache Status:");
-            println!("  Last updated: {} seconds ago", age);
+            println!(
+                "  Last updated: {}",
+                cache::describe_age(metadata.last_updated, std::time::SystemTime::now())
+            );
             println!("  Models cached: {}", metadata.model_count);
             println!("  Providers cached: {}", metadata.provider_count);
             println!("  Source: {}", metadata.source);
@@ -383,7 +400,7 @@ pub async fn handle_docs(
             }
         }
         _ => {
-            eprintln!(
+            anyhow::bail!(
                 "Unknown docs subcommand: {}. Use: fetch, list, providers, status",
                 subcommand
             );
@@ -454,16 +471,13 @@ pub fn handle_tools(
             if tools.is_empty() {
                 println!("No tools installed");
             } else {
-                println!("{:<20} {:<15} Status", "Tool", "Version");
-                println!("{:-<20} {:-<-15} ", "", "");
-                for (id, version, up_to_date) in tools {
-                    let status = if up_to_date {
-                        "up to date"
-                    } else {
-                        "update available"
-                    };
-                    println!("{:<20} {:<15} {}", id, version, status);
+                println!("{:<20} Version", "Tool");
+                println!("{:-<20} {:-<15}", "", "");
+                for (id, version) in tools {
+                    println!("{:<20} {}", id, version);
                 }
+                println!();
+                println!("Newer versions are not checked; `tools update` updates each tool.");
             }
         }
         _ => {
@@ -500,22 +514,119 @@ mod chat_tests {
         );
     }
 
+    /// Review finding: an unknown `docs` subcommand printed a message and
+    /// exited 0.
     #[tokio::test]
-    async fn test_chat_valid_modes_accepted() {
-        // "off", "review", "apply" are valid inject modes — they won't fail on mode validation
-        // (they'll fail later at the API call stage, but mode parsing succeeds)
+    async fn test_an_unknown_docs_subcommand_is_an_error() {
         let (_dir, st) = test_state();
-        for mode in &["off", "review", "apply"] {
-            let result = handle_chat(&st, "hello", Some(mode), false).await;
-            // Should NOT fail with inject_mode error — may fail with API key or network
-            if let Err(e) = &result {
-                assert!(
-                    !e.to_string().contains("inject_mode"),
-                    "Valid mode '{}' rejected: {}",
-                    mode,
-                    e
-                );
-            }
+        let err = handle_docs(&st, false, "frobnicate".to_string(), None, false, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Unknown docs subcommand"), "{err}");
+    }
+
+    /// Checks the mode parser `handle_chat` validates with, not
+    /// `handle_chat` itself: with an API key in the environment, calling it
+    /// sent a real request to api.anthropic.com from the test suite.
+    #[test]
+    fn test_chat_valid_modes_accepted() {
+        use crate::injection::types::InjectionMode;
+        for mode in ["off", "review", "apply"] {
+            assert!(
+                InjectionMode::parse(mode).is_some(),
+                "valid mode '{mode}' rejected"
+            );
         }
+        assert!(InjectionMode::parse("invalid_mode").is_none());
+    }
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::*;
+
+    #[test]
+    fn test_handle_exec_completed_program_returns_ok() {
+        assert!(handle_exec("print('hello')".to_string()).is_ok());
+    }
+
+    #[test]
+    fn test_handle_exec_runtime_fault_returns_err_naming_the_fault() {
+        let error = handle_exec("1 / 0".to_string())
+            .expect_err("a program that raised did not run to completion");
+        assert!(
+            format!("{error}").contains("runtime"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_handle_exec_syntax_fault_returns_err_naming_the_fault() {
+        let error = handle_exec("def (".to_string())
+            .expect_err("a program that does not parse did not run to completion");
+        assert!(
+            format!("{error}").contains("syntax"),
+            "unexpected error: {error}"
+        );
+    }
+
+    fn sandbox_result(
+        fault: Option<&'static str>,
+        exit_code: i32,
+    ) -> crate::tools::python::PythonResult {
+        crate::tools::python::PythonResult {
+            output: String::new(),
+            error: fault.map(|class| format!("{class} happened")),
+            exit_code,
+            fault,
+        }
+    }
+
+    #[test]
+    fn test_exec_outcome_completed_run_returns_ok() {
+        assert!(exec_outcome(&sandbox_result(None, 0)).is_ok());
+    }
+
+    /// The case from the review: a program that never terminates comes back
+    /// as a timeout fault, which used to exit 0. Built by hand so the test does
+    /// not spend the five-second wall-clock budget.
+    #[test]
+    fn test_exec_outcome_timeout_fault_returns_err_naming_the_fault() {
+        let timed_out = sandbox_result(Some(crate::tools::python::fault::TIMEOUT), 1);
+        let error = exec_outcome(&timed_out).expect_err("a timeout is a failed run");
+        assert!(
+            format!("{error}").contains("timeout"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_exec_outcome_memory_fault_returns_err_naming_the_fault() {
+        let out_of_memory = sandbox_result(Some(crate::tools::python::fault::MEMORY), 1);
+        let error = exec_outcome(&out_of_memory).expect_err("a memory fault is a failed run");
+        assert!(
+            format!("{error}").contains("memory"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_exec_outcome_nonzero_exit_without_a_fault_returns_err() {
+        let error = exec_outcome(&sandbox_result(None, 3))
+            .expect_err("a non-zero exit code is a failed run");
+        assert!(
+            format!("{error}").contains("exit code 3"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_handle_exec_unsupported_fault_returns_err_naming_the_fault() {
+        let error = handle_exec("import subprocess".to_string())
+            .expect_err("a program the sandbox cannot run did not run to completion");
+        assert!(
+            format!("{error}").contains("unsupported"),
+            "unexpected error: {error}"
+        );
     }
 }

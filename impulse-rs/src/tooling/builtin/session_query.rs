@@ -61,16 +61,19 @@ impl DynamicTool for SessionQueryTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
+        // Without an explicit `impulse_dir`, the session's own directory: a
+        // relative `.impulse` named whatever directory the process ran from.
         let impulse_dir = params
             .get("impulse_dir")
             .and_then(|v| v.as_str())
-            .unwrap_or(".impulse");
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| ctx.impulse_dir.clone());
         let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
-        let history_path = std::path::PathBuf::from(impulse_dir).join("HISTORY.jsonl");
+        let history_path = impulse_dir.join("HISTORY.jsonl");
 
         if !history_path.exists() {
             return Ok(ToolResult::json(serde_json::json!({

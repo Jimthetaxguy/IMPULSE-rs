@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use parking_lot::{FairMutex, Mutex};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -30,6 +31,22 @@ const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
 /// PTY read buffer size (bytes).
 const PTY_READ_BUFFER_SIZE: usize = 4096;
 
+/// Smallest terminal, in rows and in columns. vt100 0.15 panics on ordinary
+/// escape sequences in a terminal narrower than 3 columns or shorter than 3
+/// rows, so the PTY and its parser are never made smaller.
+const MIN_TERMINAL_DIMENSION: u16 = 3;
+
+/// How long `kill()` waits for the child to be reaped after killing it.
+const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `rows` and `cols` raised to [`MIN_TERMINAL_DIMENSION`].
+fn clamp_size(rows: u16, cols: u16) -> (u16, u16) {
+    (
+        rows.max(MIN_TERMINAL_DIMENSION),
+        cols.max(MIN_TERMINAL_DIMENSION),
+    )
+}
+
 /// Remove every inherited Impulse control-plane variable before a PTY launch.
 ///
 /// `portable_pty::CommandBuilder` starts from the parent process environment.
@@ -37,6 +54,16 @@ const PTY_READ_BUFFER_SIZE: usize = 4096;
 /// ordinary pane could otherwise inherit a daemon socket, producer CLI, task,
 /// or role identity that belongs to the Desktop process. Explicit launch
 /// metadata is overlaid again after this scrub.
+/// Strip every inherited `IMPULSE_*` key from a command before the caller
+/// overlays the variables a governed pane is *meant* to receive.
+///
+/// The prefix rule is deliberately an allowlist-by-omission: a launched runtime
+/// gets exactly the keys the harness sets afterwards and nothing the harness
+/// process happens to be carrying. That is what keeps `IMPULSE_OPERATOR_CAPABILITY`
+/// (ADR-0018) out of governed panes — a runtime is never handed the capability
+/// that raises a socket connection to operator class, so it cannot approve its
+/// own governed task even though it holds `IMPULSE_SOCKET_PATH`. Callers that
+/// build the explicit overlay must never add that key back.
 fn remove_inherited_impulse_env<I>(command: &mut CommandBuilder, inherited_keys: I)
 where
     I: IntoIterator<Item = OsString>,
@@ -68,6 +95,8 @@ pub struct TerminalBackend {
     child: Arc<Mutex<Box<dyn Child + Send + Sync>>>,
     cols: AtomicU16,
     rows: AtomicU16,
+    /// Scrollback capacity, kept to rebuild the parser after a vt100 panic.
+    scrollback: usize,
     command: String,
     working_dir: Option<PathBuf>,
 }
@@ -108,7 +137,7 @@ impl TerminalBackend {
     /// * `args` — command-line arguments
     /// * `working_dir` — working directory for the child
     /// * `env_vars` — extra environment variables to set
-    /// * `rows`, `cols` — initial terminal dimensions
+    /// * `rows`, `cols` — initial terminal dimensions, raised to at least 3
     /// * `scrollback` — scrollback buffer lines (default: 10,000)
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
@@ -146,7 +175,21 @@ impl TerminalBackend {
         output_callback: Option<OutputCallback>,
         exit_callback: Option<ExitCallback>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let (rows, cols) = clamp_size(rows, cols);
         let scrollback = scrollback.unwrap_or(DEFAULT_SCROLLBACK_LINES);
+        // portable-pty starts the child in `$HOME` when the requested
+        // directory is not an existing directory, with no error, while this
+        // backend would keep reporting the requested path. An agent launched
+        // for a deleted or unmounted workspace must not run somewhere else.
+        if let Some(dir) = working_dir {
+            if !dir.is_dir() {
+                return Err(format!(
+                    "working directory {} does not exist or is not a directory",
+                    dir.display()
+                )
+                .into());
+            }
+        }
 
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -206,11 +249,14 @@ impl TerminalBackend {
                 .spawn(move || {
                     pty_reader_loop(
                         reader,
-                        parser,
-                        alive,
-                        output_bytes,
-                        output_lines,
-                        read_errors,
+                        ReaderState {
+                            parser,
+                            scrollback,
+                            alive,
+                            output_bytes,
+                            output_lines,
+                            read_errors,
+                        },
                         callbacks,
                     );
                 })?
@@ -233,6 +279,7 @@ impl TerminalBackend {
             child: Arc::new(Mutex::new(child)),
             cols: AtomicU16::new(cols),
             rows: AtomicU16::new(rows),
+            scrollback,
             command: command.to_string(),
             working_dir: working_dir.map(|p| p.to_path_buf()),
         })
@@ -253,10 +300,13 @@ impl TerminalBackend {
         parser.screen().contents().len()
     }
 
-    /// Get screen text including scrollback lines.
+    /// Get screen text including up to `lines` rows of scrollback, at most one
+    /// screen height: vt100 0.15 cannot show more, and a larger offset
+    /// underflows inside it (a panic in debug builds).
     pub fn scrollback_text(&self, lines: usize) -> String {
         let mut parser = self.parser.lock();
-        parser.set_scrollback(lines);
+        let rows = usize::from(parser.screen().size().0);
+        parser.set_scrollback(lines.min(rows));
         let text = parser.screen().contents();
         parser.set_scrollback(0);
         text
@@ -328,6 +378,7 @@ impl TerminalBackend {
     /// the reader could process output formatted for the new PTY size while the
     /// parser still has the old dimensions, causing text wrapping corruption.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), Box<dyn std::error::Error>> {
+        let (rows, cols) = clamp_size(rows, cols);
         // Lock parser first — blocks reader thread during the resize window.
         let mut parser = self.parser.lock();
 
@@ -342,8 +393,19 @@ impl TerminalBackend {
             })?;
         }
 
-        // Update parser dimensions while still holding the lock.
-        parser.set_size(rows, cols);
+        // Update parser dimensions while still holding the lock. vt100 0.15
+        // can panic here on some screen states; a fresh screen at the new
+        // size is better than a parser left half-resized.
+        let resized = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            parser.set_size(rows, cols);
+        }));
+        if resized.is_err() {
+            log::warn!(
+                "terminal parser for '{}' panicked while resizing; starting a fresh screen",
+                self.command
+            );
+            *parser = vt100::Parser::new(rows, cols, self.scrollback);
+        }
 
         self.cols.store(cols, Ordering::Relaxed);
         self.rows.store(rows, Ordering::Relaxed);
@@ -370,29 +432,54 @@ impl TerminalBackend {
 
     /// Terminate and reap the child process.
     ///
-    /// The backend is marked dead only after `try_wait` or `wait` confirms a
-    /// terminal process state. Kill failures for a still-running process are
-    /// returned to the caller so lifecycle truth cannot claim an exit that did
-    /// not happen.
+    /// The backend is marked dead only after `try_wait` confirms a terminal
+    /// process state. Kill failures for a still-running process are returned
+    /// to the caller so lifecycle truth cannot claim an exit that did not
+    /// happen. Reaping waits at most five seconds: a killed child can be stuck
+    /// exiting while its terminal output is not being drained, and waiting
+    /// without a limit used to block the caller forever.
     pub fn kill(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut child = self.child.lock();
-        if child.try_wait()?.is_some() {
-            self.alive.store(false, Ordering::Relaxed);
-            return Ok(());
-        }
-        if let Err(kill_error) = child.kill() {
-            // The child may have exited between `try_wait` and `kill`. Confirm
-            // that race before treating the kill error as a live orphan.
+        self.kill_within(KILL_REAP_TIMEOUT)
+    }
+
+    /// [`Self::kill`] with an explicit reaping deadline; the test seam. The
+    /// child lock is taken for each poll, not held while waiting, so
+    /// `is_alive()` from a UI thread does not stall for the whole deadline.
+    pub fn kill_within(&self, timeout: Duration) -> Result<(), Box<dyn std::error::Error>> {
+        {
+            let mut child = self.child.lock();
             if child.try_wait()?.is_some() {
                 self.alive.store(false, Ordering::Relaxed);
                 return Ok(());
             }
-            self.alive.store(true, Ordering::Relaxed);
-            return Err(Box::new(kill_error));
+            if let Err(kill_error) = child.kill() {
+                // The child may have exited between `try_wait` and `kill`.
+                // Confirm that race before treating the kill error as a live
+                // orphan.
+                if child.try_wait()?.is_some() {
+                    self.alive.store(false, Ordering::Relaxed);
+                    return Ok(());
+                }
+                self.alive.store(true, Ordering::Relaxed);
+                return Err(Box::new(kill_error));
+            }
         }
-        child.wait()?;
-        self.alive.store(false, Ordering::Relaxed);
-        Ok(())
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.child.lock().try_wait()?.is_some() {
+                self.alive.store(false, Ordering::Relaxed);
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "'{}' was killed but had not exited after {} ms",
+                    self.command,
+                    timeout.as_millis()
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// The command that was spawned.
@@ -405,10 +492,17 @@ impl TerminalBackend {
         self.working_dir.as_deref()
     }
 
-    /// Number of scrollback lines available above the visible screen.
+    /// How many rows the view can scroll back: the history above the screen,
+    /// but at most one screen height, which is as far as vt100 0.15 can show.
+    /// This used to return the current scroll offset, usually zero, so the
+    /// view could not scroll at all.
     pub fn scrollback_len(&self) -> usize {
-        let parser = self.parser.lock();
-        parser.screen().scrollback()
+        let mut parser = self.parser.lock();
+        let offset = parser.screen().scrollback();
+        parser.set_scrollback(usize::MAX);
+        let available = parser.screen().scrollback();
+        parser.set_scrollback(offset);
+        available.min(usize::from(parser.screen().size().0))
     }
 
     /// Number of visible rows in the terminal.
@@ -453,6 +547,10 @@ const INJECTION_QUIET_MS: u64 = 500;
 /// All code paths that write to the PTY must go through this queue.
 /// `write_user_input()` always succeeds and records a timestamp.
 /// `write_injection()` is skipped if user input occurred recently.
+///
+/// Cloning shares the same writer and timestamp, so a caller can take a
+/// handle out from under a lock and write after releasing it.
+#[derive(Clone)]
 pub struct WriteQueue {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     /// Epoch millis of the last user input write.
@@ -501,31 +599,78 @@ fn epoch_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// Background reader thread — reads PTY output and feeds it to the vt100 parser.
-fn pty_reader_loop(
-    mut reader: Box<dyn Read + Send>,
+/// Marks the terminal dead and runs the exit callback when the reader thread
+/// ends, however it ends: end of output, a read error, or a panic.
+struct ReaderExit {
+    alive: Arc<AtomicBool>,
+    exit: Option<ExitCallback>,
+}
+
+impl Drop for ReaderExit {
+    fn drop(&mut self) {
+        self.alive.store(false, Ordering::Relaxed);
+        if let Some(callback) = self.exit.take() {
+            // A panicking callback must not abort the process while this
+            // thread is already unwinding.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback())).is_err() {
+                log::error!("PTY exit callback panicked");
+            }
+        }
+    }
+}
+
+/// What the reader thread updates as output arrives.
+struct ReaderState {
     parser: Arc<FairMutex<vt100::Parser>>,
+    /// Scrollback capacity, to rebuild the parser after a vt100 panic.
+    scrollback: usize,
     alive: Arc<AtomicBool>,
     output_bytes: Arc<AtomicU64>,
     output_lines: Arc<AtomicU64>,
     read_errors: Arc<AtomicU64>,
+}
+
+/// Background reader thread — reads PTY output and feeds it to the vt100 parser.
+///
+/// The thread keeps draining the PTY whatever the output does: a panic in
+/// vt100 (it panics on some screen states, such as a wide character cut by a
+/// resize) gets a fresh screen at the same size, and a panicking output
+/// callback is logged. A reader that stopped left the child unable to finish
+/// exiting, so the exit callback never ran and `kill()` waited forever.
+fn pty_reader_loop(
+    mut reader: Box<dyn Read + Send>,
+    state: ReaderState,
     callbacks: TerminalCallbacks,
 ) {
+    let ReaderState {
+        parser,
+        scrollback,
+        alive,
+        output_bytes,
+        output_lines,
+        read_errors,
+    } = state;
+    let _exit = ReaderExit {
+        alive,
+        exit: callbacks.exit,
+    };
     let mut buf = [0u8; PTY_READ_BUFFER_SIZE];
     loop {
         match reader.read(&mut buf) {
-            Ok(0) => {
-                // EOF — child closed its end.
-                alive.store(false, Ordering::Relaxed);
-                if let Some(callback) = &callbacks.exit {
-                    callback();
-                }
-                break;
-            }
+            // EOF — child closed its end.
+            Ok(0) => break,
             Ok(n) => {
                 output_bytes.fetch_add(n as u64, Ordering::Relaxed);
                 if let Some(callback) = &callbacks.output {
-                    callback(&buf[..n]);
+                    let delivered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        callback(&buf[..n]);
+                    }));
+                    if delivered.is_err() {
+                        log::error!(
+                            "PTY output callback panicked on '{}'",
+                            std::thread::current().name().unwrap_or("?")
+                        );
+                    }
                 }
 
                 let newlines = buf[..n].iter().filter(|&&b| b == b'\n').count();
@@ -534,7 +679,17 @@ fn pty_reader_loop(
                 }
 
                 let mut parser = parser.lock();
-                parser.process(&buf[..n]);
+                let processed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    parser.process(&buf[..n]);
+                }));
+                if processed.is_err() {
+                    let (rows, cols) = parser.screen().size();
+                    log::warn!(
+                        "terminal parser panicked on output from '{}'; starting a fresh screen",
+                        std::thread::current().name().unwrap_or("?")
+                    );
+                    *parser = vt100::Parser::new(rows, cols, scrollback);
+                }
             }
             Err(e) => {
                 read_errors.fetch_add(1, Ordering::Relaxed);
@@ -543,10 +698,6 @@ fn pty_reader_loop(
                     std::thread::current().name().unwrap_or("?"),
                     e
                 );
-                alive.store(false, Ordering::Relaxed);
-                if let Some(callback) = &callbacks.exit {
-                    callback();
-                }
                 break;
             }
         }
@@ -710,5 +861,37 @@ mod tests {
             command.get_env("IMPULSE_SOCKET_PATH"),
             Some(std::ffi::OsStr::new("/tmp/profiled.sock"))
         );
+    }
+
+    #[test]
+    fn operator_capability_never_reaches_a_spawned_pane() {
+        // ADR-0018: a governed pane holds IMPULSE_SOCKET_PATH but must never
+        // hold the capability that would let it approve its own task.
+        let mut command = CommandBuilder::new("true");
+        command.env("IMPULSE_OPERATOR_CAPABILITY", "a".repeat(64));
+        command.env("impulse_operator_capability", "b".repeat(64));
+        command.env("IMPULSE_SOCKET_PATH", "/tmp/parent.sock");
+
+        remove_inherited_impulse_env(
+            &mut command,
+            [
+                OsString::from("IMPULSE_OPERATOR_CAPABILITY"),
+                OsString::from("impulse_operator_capability"),
+                OsString::from("IMPULSE_SOCKET_PATH"),
+            ],
+        );
+
+        assert!(
+            command.get_env("IMPULSE_OPERATOR_CAPABILITY").is_none(),
+            "the operator capability must not survive into a governed pane"
+        );
+
+        // The explicit governed overlay re-adds the socket path and nothing else.
+        command.env("IMPULSE_SOCKET_PATH", "/tmp/profiled.sock");
+        assert_eq!(
+            command.get_env("IMPULSE_SOCKET_PATH"),
+            Some(std::ffi::OsStr::new("/tmp/profiled.sock"))
+        );
+        assert!(command.get_env("IMPULSE_OPERATOR_CAPABILITY").is_none());
     }
 }

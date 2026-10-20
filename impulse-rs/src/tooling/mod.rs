@@ -19,6 +19,7 @@
 //! let tools = registry.list();
 //! ```
 
+pub(crate) mod capture;
 pub(crate) mod env_scrub;
 mod error;
 mod executor;

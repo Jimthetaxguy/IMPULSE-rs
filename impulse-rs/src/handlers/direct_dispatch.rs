@@ -33,12 +33,18 @@ where
     let impulse_dir = cli.impulse_dir.clone();
     let verbose = cli.verbose;
     let format = cli.format;
+    // Before `State::new`, whose failure would exit 1, which Claude Code
+    // treats as "allow" (see `handlers::guard::run_guard_hook`).
+    if let Commands::Guard { hook: true, .. } = &cli.command {
+        handlers::guard::run_guard_hook(&impulse_dir);
+    }
     let state = Arc::new(
         state::State::new(impulse_dir.clone()).context("Failed to initialize impulse state")?,
     );
 
     match cli.command {
-        Commands::Daemon { .. } => {
+        Commands::Daemon { stop: true } => anyhow::bail!(handlers::DAEMON_STOP_UNSUPPORTED),
+        Commands::Daemon { stop: false } => {
             daemon::Daemon::new(state.clone())
                 .start()
                 .await
@@ -545,6 +551,9 @@ where
             handlers::semantic_diff_handlers::handle_sem_status(json)
                 .context("Failed to handle sem-status command")?;
         }
+        Commands::Guard { hook: true, .. } => {
+            handlers::guard::run_guard_hook(&impulse_dir);
+        }
         Commands::Guard {
             action,
             target,
@@ -552,6 +561,7 @@ where
             enable,
             disable,
             json,
+            hook: false,
         } => {
             handlers::guard::handle_guard(&state, action, target, list, enable, disable, json)
                 .context("Failed to handle guard command")?;
@@ -600,10 +610,20 @@ where
         }
         Commands::GovernedClaim { .. }
         | Commands::GovernedVerify { .. }
-        | Commands::GovernedReview { .. } => {
+        | Commands::GovernedReview { .. }
+        | Commands::GovernedPromote { .. }
+        | Commands::GovernedDiscard { .. } => {
             anyhow::bail!(
                 "governed producer commands require --daemon so the project daemon remains authoritative"
             );
+        }
+        Commands::InternalPdfText {
+            path,
+            max_chars,
+            max_pages,
+            memory_limit_bytes,
+        } => {
+            handlers::internal_pdf_text::run(&path, max_chars, max_pages, memory_limit_bytes)?;
         }
     }
 
@@ -630,6 +650,24 @@ mod tests {
             socket: None,
             format: None,
         }
+    }
+
+    // ── Commands::Daemon --stop (review P3-5) ─────────────────────────────
+
+    /// `daemon --stop` used to ignore the flag and start a daemon, which
+    /// never returns; the timeout turns that into a failure here.
+    #[tokio::test]
+    async fn test_dispatch_daemon_stop_refuses_instead_of_starting_a_daemon() {
+        let tmp = TempDir::new().unwrap();
+        let cli = cli_with(&tmp, Commands::Daemon { stop: true });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), dispatch(cli))
+            .await
+            .expect("daemon --stop must return, not run a daemon");
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cannot stop a running daemon"),
+            "{err:#}"
+        );
     }
 
     // ── Commands::Run (launches the ratatui runner) ───────────────────────
@@ -932,6 +970,7 @@ mod tests {
                 enable: None,
                 disable: None,
                 json: false,
+                hook: false,
             },
         );
         let result = dispatch(cli).await;
@@ -950,6 +989,7 @@ mod tests {
                 enable: None,
                 disable: None,
                 json: true,
+                hook: false,
             },
         );
         let result = dispatch(cli).await;
@@ -974,7 +1014,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_analytics_unknown_subcommand_returns_ok() {
+    async fn test_dispatch_analytics_unknown_subcommand_is_an_error() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -984,10 +1024,10 @@ mod tests {
                 period: "all".to_string(),
             },
         );
-        let result = dispatch(cli).await;
+        let err = dispatch(cli).await.unwrap_err();
         assert!(
-            result.is_ok(),
-            "Analytics with unknown subcommand prints message but returns Ok"
+            format!("{err:#}").contains("Unknown analytics type"),
+            "{err:#}"
         );
     }
 
@@ -1207,17 +1247,24 @@ mod tests {
 
     // ── Commands::Hooks ───────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn test_dispatch_hooks_all_returns_ok() {
+    // These call the installer with an explicit root: going through
+    // `dispatch` wrote `.claude/hooks/hooks.json` and `.opencode/impulse.json`
+    // into the source tree the tests ran in.
+    #[test]
+    fn test_hooks_all_writes_both_templates_under_the_project_root() {
         let tmp = TempDir::new().unwrap();
-        let cli = cli_with(
-            &tmp,
-            Commands::Hooks {
-                platform: "all".to_string(),
-            },
-        );
-        let result = dispatch(cli).await;
-        assert!(result.is_ok(), "Hooks --platform all should return Ok");
+        handlers::system::install_hook_templates(tmp.path(), "all").unwrap();
+        let claude = std::fs::read_to_string(tmp.path().join(".claude/hooks/hooks.json")).unwrap();
+        assert!(claude.contains("guard --hook"), "{claude}");
+        assert!(tmp.path().join(".opencode/impulse.json").exists());
+    }
+
+    #[test]
+    fn test_hooks_unknown_platform_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        let err = handlers::system::install_hook_templates(tmp.path(), "vscode").unwrap_err();
+        assert!(err.to_string().contains("unknown hooks platform"), "{err}");
+        assert!(!tmp.path().join(".claude").exists());
     }
 
     // ── Commands::SessionConflicts ────────────────────────────────────────
@@ -1554,7 +1601,7 @@ mod tests {
     // ── Commands::SessionInfo with nonexistent ID ─────────────────────────
 
     #[tokio::test]
-    async fn test_dispatch_session_info_nonexistent_id() {
+    async fn test_dispatch_session_info_nonexistent_id_reports_not_found() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -1563,12 +1610,14 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        // SessionInfo for a nonexistent ID should either return Ok (with "not found" message)
-        // or return an error — either way the dispatch shouldn't panic
-        let _ = result; // Just verify no panic
+        // An unknown id is reported as "Session not found", not an error.
+        assert!(
+            result.is_ok(),
+            "session-info for an unknown id should report not-found and succeed: {result:?}"
+        );
     }
 
-    // ── Commands::Calc (requires Python on PATH) ─────────────────────────
+    // ── Commands::Calc (in-process Monty sandbox; no host Python needed) ──
 
     #[tokio::test]
     async fn test_dispatch_calc_simple_expression_returns_ok() {
@@ -1580,8 +1629,7 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        // Succeeds when Python is available, errors when it isn't — no panic either way
-        let _ = result;
+        assert!(result.is_ok(), "Calc should return Ok: {result:?}");
     }
 
     #[tokio::test]
@@ -1594,10 +1642,10 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        let _ = result;
+        assert!(result.is_ok(), "Calc should return Ok: {result:?}");
     }
 
-    // ── Commands::Exec (requires Python on PATH) ─────────────────────────
+    // ── Commands::Exec (in-process Monty sandbox; no host Python needed) ──
 
     #[tokio::test]
     async fn test_dispatch_exec_print_statement_returns_ok() {
@@ -1609,7 +1657,27 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        let _ = result;
+        assert!(result.is_ok(), "Exec should return Ok: {result:?}");
+    }
+
+    /// A program that raises did not run, so the command fails and the process
+    /// exits non-zero. It used to print the error and exit 0.
+    #[tokio::test]
+    async fn test_dispatch_exec_faulting_program_returns_err() {
+        let tmp = TempDir::new().unwrap();
+        let cli = cli_with(
+            &tmp,
+            Commands::Exec {
+                code: "1 / 0".to_string(),
+            },
+        );
+        let error = dispatch(cli)
+            .await
+            .expect_err("Exec of a program that raises should return Err");
+        // Dispatch adds its own context, so the fault class is one level down
+        // the chain; `{:#}` prints the whole chain.
+        let chain = format!("{error:#}");
+        assert!(chain.contains("runtime"), "unexpected error: {chain}");
     }
 
     // ── Commands::ValidateHooks ──────────────────────────────────────────
@@ -1719,6 +1787,29 @@ mod tests {
         assert!(result.is_ok(), "SessionStart should return Ok");
     }
 
+    /// Review P2: an unparseable mode used to become Apply (and an absent one
+    /// always was Apply, whatever `context_injection_mode` said).
+    #[tokio::test]
+    async fn test_dispatch_session_start_rejects_an_invalid_inject_mode() {
+        let tmp = TempDir::new().unwrap();
+        let cli = cli_with(
+            &tmp,
+            Commands::SessionStart {
+                name: Some("typo".to_string()),
+                platform: None,
+                inject_mode: Some("of".to_string()),
+                inject_explain: false,
+            },
+        );
+        let err = dispatch(cli).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Invalid inject mode"),
+            "{err:#}"
+        );
+        let state = state::State::new(tmp.path().to_path_buf()).unwrap();
+        assert!(state.list_sessions().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn test_dispatch_session_start_with_platform_returns_ok() {
         let tmp = TempDir::new().unwrap();
@@ -1760,7 +1851,7 @@ mod tests {
     // ── Commands::SessionEnd ─────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_dispatch_session_end_nonexistent_session_returns_err() {
+    async fn test_dispatch_session_end_nonexistent_session_fails_open_without_history() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -1772,14 +1863,17 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        // Ending a nonexistent session should error or handle gracefully
-        let _ = result;
+        // Hook handlers fail open: ending an unknown session reports
+        // "Session not found" and exits 0, and must not append history.
+        assert!(result.is_ok(), "session-end should fail open: {result:?}");
+        let state = state::State::new(tmp.path().to_path_buf()).unwrap();
+        assert!(state.get_history_sync().unwrap().is_empty());
     }
 
     // ── Commands::TrackWrite (without active session) ────────────────────
 
     #[tokio::test]
-    async fn test_dispatch_track_write_no_session_returns_err_or_ok() {
+    async fn test_dispatch_track_write_without_session_fails_open() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -1789,12 +1883,16 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        // Without a session ID or IMPULSE_SESSION_ID env, this may error
-        let _ = result;
+        // Hook handlers fail open: with no usable session (whether or not
+        // IMPULSE_SESSION_ID is set where the tests run) track-write prints an
+        // error, exits 0, and never creates a session.
+        assert!(result.is_ok(), "track-write should fail open: {result:?}");
+        let state = state::State::new(tmp.path().to_path_buf()).unwrap();
+        assert!(state.list_sessions().await.unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn test_dispatch_track_write_nonexistent_session_returns_err() {
+    async fn test_dispatch_track_write_unknown_session_fails_open() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -1804,13 +1902,15 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        let _ = result; // May error; no panic
+        assert!(result.is_ok(), "track-write should fail open: {result:?}");
+        let state = state::State::new(tmp.path().to_path_buf()).unwrap();
+        assert!(state.list_sessions().await.unwrap().is_empty());
     }
 
     // ── Commands::TrackTool (without active session) ─────────────────────
 
     #[tokio::test]
-    async fn test_dispatch_track_tool_no_session_returns_err_or_ok() {
+    async fn test_dispatch_track_tool_without_session_fails_open() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -1820,7 +1920,9 @@ mod tests {
             },
         );
         let result = dispatch(cli).await;
-        let _ = result;
+        assert!(result.is_ok(), "track-tool should fail open: {result:?}");
+        let state = state::State::new(tmp.path().to_path_buf()).unwrap();
+        assert!(state.list_sessions().await.unwrap().is_empty());
     }
 
     // ── Commands::SemBlame (sem CLI likely absent → returns Ok) ──────────
@@ -2110,18 +2212,6 @@ mod tests {
         );
     }
 
-    // ── Commands::Verify (runs build verification) ───────────────────────
-
-    #[tokio::test]
-    #[ignore = "verify dispatch re-enters cargo test from the repo root and is not safe in-process"]
-    async fn test_dispatch_verify_runs_without_panic() {
-        let tmp = TempDir::new().unwrap();
-        let cli = cli_with(&tmp, Commands::Verify);
-        let result = dispatch(cli).await;
-        // Verify may fail (no Cargo project at temp dir) but should not panic
-        let _ = result;
-    }
-
     // ── Commands::AgentConfigure with specific provider ──────────────────
 
     #[tokio::test]
@@ -2146,7 +2236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_agent_configure_invalid_provider_returns_ok() {
+    async fn test_dispatch_agent_configure_invalid_provider_is_an_error() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -2161,8 +2251,8 @@ mod tests {
         );
         let result = dispatch(cli).await;
         assert!(
-            result.is_ok(),
-            "AgentConfigure with invalid provider should return Ok (prints error, doesn't fail)"
+            result.is_err(),
+            "an invalid provider must exit non-zero, not print and succeed"
         );
     }
 
@@ -2222,6 +2312,7 @@ mod tests {
                 enable: None,
                 disable: None,
                 json: false,
+                hook: false,
             },
         );
         let result = dispatch(cli).await;
@@ -2312,36 +2403,20 @@ mod tests {
 
     // ── Commands::Hooks with specific platforms ──────────────────────────
 
-    #[tokio::test]
-    async fn test_dispatch_hooks_claude_code_returns_ok() {
+    #[test]
+    fn test_hooks_claude_code_writes_only_the_claude_template() {
         let tmp = TempDir::new().unwrap();
-        let cli = cli_with(
-            &tmp,
-            Commands::Hooks {
-                platform: "claude-code".to_string(),
-            },
-        );
-        let result = dispatch(cli).await;
-        assert!(
-            result.is_ok(),
-            "Hooks for claude-code platform should return Ok"
-        );
+        handlers::system::install_hook_templates(tmp.path(), "claude-code").unwrap();
+        assert!(tmp.path().join(".claude/hooks/hooks.json").exists());
+        assert!(!tmp.path().join(".opencode").exists());
     }
 
-    #[tokio::test]
-    async fn test_dispatch_hooks_opencode_returns_ok() {
+    #[test]
+    fn test_hooks_opencode_writes_only_the_opencode_template() {
         let tmp = TempDir::new().unwrap();
-        let cli = cli_with(
-            &tmp,
-            Commands::Hooks {
-                platform: "opencode".to_string(),
-            },
-        );
-        let result = dispatch(cli).await;
-        assert!(
-            result.is_ok(),
-            "Hooks for opencode platform should return Ok"
-        );
+        handlers::system::install_hook_templates(tmp.path(), "opencode").unwrap();
+        assert!(tmp.path().join(".opencode/impulse.json").exists());
+        assert!(!tmp.path().join(".claude").exists());
     }
 
     // ── Commands::Steward (list subcommand) ──────────────────────────────
@@ -2364,7 +2439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_dispatch_steward_unknown_subcommand_returns_ok() {
+    async fn test_dispatch_steward_unknown_subcommand_is_an_error() {
         let tmp = TempDir::new().unwrap();
         let cli = cli_with(
             &tmp,
@@ -2376,9 +2451,11 @@ mod tests {
                 json: false,
             },
         );
-        let result = dispatch(cli).await;
-        // Unknown subcommand prints message but may return Ok
-        let _ = result;
+        let err = dispatch(cli).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Unknown steward subcommand"),
+            "{err:#}"
+        );
     }
 
     // ── Commands::ToolingList with category filter ───────────────────────

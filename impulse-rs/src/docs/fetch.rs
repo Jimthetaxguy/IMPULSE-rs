@@ -2,24 +2,27 @@
 // Uses provider APIs to get current model lists
 
 use super::{known_providers, ModelInfo};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 
 /// Fetch models from OpenAI API
 pub async fn fetch_openai_models(api_key: &str) -> Result<Vec<ModelInfo>> {
     // Bounded timeouts so a slow/hung provider endpoint can't stall the fetch.
+    // A client that fails to build is an error: `Client::new()` would panic
+    // in that case, and has no timeouts.
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
-        .unwrap_or_else(|_| Client::new());
+        .context("Failed to build the HTTP client")?;
 
     let response = client
         .get("https://api.openai.com/v1/models")
         .header("Authorization", format!("Bearer {}", api_key))
         .send()
-        .await?;
+        .await
+        .context("Failed to reach the OpenAI models API")?;
 
     if !response.status().is_success() {
         return Err(anyhow::anyhow!("OpenAI API error: {}", response.status()));
@@ -41,7 +44,10 @@ pub async fn fetch_openai_models(api_key: &str) -> Result<Vec<ModelInfo>> {
         owned_by: String,
     }
 
-    let resp: OpenAiModelsResponse = response.json().await?;
+    let resp: OpenAiModelsResponse = response
+        .json()
+        .await
+        .context("Failed to read the OpenAI models list")?;
 
     let models: Vec<ModelInfo> = resp
         .data
@@ -251,6 +257,13 @@ pub fn fetch_mistral_models() -> Vec<ModelInfo> {
 }
 
 /// Fetch all known models (combines static lists + API calls where available)
+/// The OpenAI key to list models with, if there is one. A blank key (an
+/// exported but empty variable) is none: sending it could only fail, and
+/// the failure now stops the fetch.
+fn usable_openai_key(key: Option<&str>) -> Option<&str> {
+    key.map(str::trim).filter(|key| !key.is_empty())
+}
+
 pub async fn fetch_all_models(openai_api_key: Option<&str>) -> Result<Vec<ModelInfo>> {
     let mut all_models = Vec::new();
 
@@ -263,11 +276,14 @@ pub async fn fetch_all_models(openai_api_key: Option<&str>) -> Result<Vec<ModelI
     // Mistral models (static list)
     all_models.extend(fetch_mistral_models());
 
-    // OpenAI models (API call if key provided)
-    if let Some(key) = openai_api_key {
-        if let Ok(models) = fetch_openai_models(key).await {
-            all_models.extend(models);
-        }
+    // OpenAI models (API call if key provided). A failed call is an error:
+    // dropping it reported success, and the caller then cached a list with
+    // every OpenAI model gone, marked fresh from the API.
+    if let Some(key) = usable_openai_key(openai_api_key) {
+        let models = fetch_openai_models(key).await.context(
+            "Failed to list OpenAI models (unset OPENAI_API_KEY to use the built-in list)",
+        )?;
+        all_models.extend(models);
     } else {
         // Add known models without API key
         all_models.extend(vec![
@@ -340,6 +356,14 @@ pub fn fetch_docs_url(provider_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_blank_openai_key_is_no_key() {
+        assert_eq!(usable_openai_key(None), None);
+        assert_eq!(usable_openai_key(Some("")), None);
+        assert_eq!(usable_openai_key(Some("  \n")), None);
+        assert_eq!(usable_openai_key(Some(" test-key\n")), Some("test-key"));
+    }
 
     #[tokio::test]
     async fn test_fetch_all_models() {

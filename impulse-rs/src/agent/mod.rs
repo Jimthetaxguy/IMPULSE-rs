@@ -52,6 +52,12 @@ fn governed_api_actor_id(provider: ImpulseProvider, resolved_model: &str) -> Str
 /// shell command. 120s was chosen as a middle ground between `bash_exec`'s
 /// 30s and the REPL tool loop's 180s wall-clock budget.
 pub const DEFAULT_HARNESS_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The most of a harness CLI's stdout (its reply) and stderr that is kept.
+/// `wait_with_output` kept everything the CLI wrote, so a runaway harness
+/// grew this process's memory until the timeout.
+const MAX_HARNESS_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HARNESS_STDERR_BYTES: usize = 64 * 1024;
 use coordinator::Recommendation;
 
 /// The LLM provider to use for the Impulse Agent.
@@ -222,7 +228,9 @@ impl Default for ImpulseAgentConfig {
             auto_review: false,
             auto_coordinate: false,
             review_threshold: 5,
-            max_tokens: 2048,
+            // The API agent's requests used 4096 before they honoured this
+            // setting; harness and governed requests had used the setting.
+            max_tokens: 4096,
             temperature: 0.3,
             escalate_model: None,
         }
@@ -366,6 +374,8 @@ impl ImpulseAgent {
                     None, // System prompt set per-request
                 );
                 agent.step_context.escalate_model = config.escalate_model.clone();
+                agent.temperature = config.temperature;
+                agent.max_tokens = Some(config.max_tokens);
                 Some(agent)
             }
             AgentMode::Harness { .. } => None, // CLI harness doesn't use Agent
@@ -390,26 +400,31 @@ impl ImpulseAgent {
     #[cfg(test)]
     pub(crate) fn with_test_provider(provider: Box<dyn LlmProvider>) -> Self {
         let model = provider.default_model().to_string();
-        Self {
-            config: ImpulseAgentConfig {
-                mode: AgentMode::Api {
-                    provider: ImpulseProvider::Anthropic,
-                    // Keep the raw configuration unresolved so governed
-                    // provenance tests exercise the production `model=None`
-                    // path. `Agent::new` owns the resolved model actually sent
-                    // to the provider.
-                    model: None,
-                },
-                ..ImpulseAgentConfig::default()
+        let config = ImpulseAgentConfig {
+            mode: AgentMode::Api {
+                provider: ImpulseProvider::Anthropic,
+                // Keep the raw configuration unresolved so governed
+                // provenance tests exercise the production `model=None`
+                // path. `Agent::new` owns the resolved model actually sent
+                // to the provider.
+                model: None,
             },
+            ..ImpulseAgentConfig::default()
+        };
+        let mut inner = Agent::new(
+            "impulse-agent-test".to_string(),
+            "Impulse Agent Test".to_string(),
+            provider,
+            Some(model),
+            None,
+        );
+        // As `Self::new` does, so tests send what production sends.
+        inner.temperature = config.temperature;
+        inner.max_tokens = Some(config.max_tokens);
+        Self {
+            config,
             harness_command_override: None,
-            inner: Some(Agent::new(
-                "impulse-agent-test".to_string(),
-                "Impulse Agent Test".to_string(),
-                provider,
-                Some(model),
-                None,
-            )),
+            inner: Some(inner),
             recommendations: Vec::new(),
             pane_summaries: Vec::new(),
             session_history: Vec::new(),
@@ -706,6 +721,13 @@ impl ImpulseAgent {
         let harness_command_display = harness_command.display().to_string();
         let mut cmd = tokio::process::Command::new(&harness_command);
         cmd.args(harness_kind.invocation_args()).arg(&print_arg);
+        // The capture below only reads handles that were piped;
+        // inherited ones would send the reply to this process's own stdout
+        // and leave `output.stdout` empty. Stdin is closed so a harness can
+        // never sit waiting on it.
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
         // Set env var pointing to the structured request file
         cmd.env(
@@ -750,7 +772,7 @@ impl ImpulseAgent {
         // how long a wedged turn can retain that async guard before retries
         // may proceed. `tokio::time::timeout` returns a typed
         // `AgentError::HarnessTimedOut` instead of hanging indefinitely.
-        let child = cmd.spawn().map_err(|e| {
+        let mut child = cmd.spawn().map_err(|e| {
             AgentError::ApiRequest(format!("Failed to spawn {harness_command_display}: {e}"))
         })?;
         // Unlike `kill_on_drop`, this guard targets the whole isolated group
@@ -758,7 +780,16 @@ impl ImpulseAgent {
         // as well as the explicit timeout branch below.
         let mut process_group_guard = crate::process_group::ProcessGroupGuard::new(child.id());
 
-        let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        let output = match tokio::time::timeout(
+            timeout,
+            crate::tooling::capture::wait_with_capped_output(
+                &mut child,
+                MAX_HARNESS_STDOUT_BYTES,
+                MAX_HARNESS_STDERR_BYTES,
+            ),
+        )
+        .await
+        {
             Ok(result) => {
                 let output = result.map_err(|e| {
                     AgentError::ApiRequest(format!(
@@ -770,9 +801,9 @@ impl ImpulseAgent {
                 output
             }
             Err(_elapsed) => {
-                // Returning drops the still-armed process-group guard after
-                // `wait_with_output` drops its Child, killing wrapper
-                // grandchildren before the caller observes the timeout.
+                // Returning drops the still-armed process-group guard, then
+                // the Child (`kill_on_drop`), killing wrapper grandchildren
+                // before the caller observes the timeout.
                 return Err(AgentError::HarnessTimedOut {
                     command: harness_command_display,
                     seconds: timeout.as_secs(),
@@ -781,10 +812,17 @@ impl ImpulseAgent {
         };
 
         if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            if output.stdout.truncated() {
+                return Err(AgentError::ApiResponse(format!(
+                    "{harness_command_display} wrote {} bytes, more than the \
+                     {MAX_HARNESS_STDOUT_BYTES}-byte reply limit",
+                    output.stdout.total
+                )));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout.bytes).to_string();
             Ok(harness::HarnessResponse::parse_or_plain(&stdout))
         } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = String::from_utf8_lossy(&output.stderr.bytes);
             Err(AgentError::ApiResponse(format!(
                 "{} exited with {}: {}",
                 harness_command_display, output.status, stderr
@@ -806,6 +844,19 @@ impl ImpulseAgent {
         system_prompt: &str,
         user_prompt: &str,
         insights: &[ExtractedInsight],
+    ) -> AgentResult<String> {
+        self.query_with_context_remembering(system_prompt, user_prompt, insights, user_prompt)
+            .await
+    }
+
+    /// [`Self::query_with_context`], recording `remembered` as the turn's
+    /// question; see [`Self::query_remembering`].
+    pub async fn query_with_context_remembering(
+        &mut self,
+        system_prompt: &str,
+        user_prompt: &str,
+        insights: &[ExtractedInsight],
+        remembered: &str,
     ) -> AgentResult<String> {
         // Build text-enriched prompt (used for both API and --print fallback)
         let context_block = prompts::build_context_prompt(insights);
@@ -835,12 +886,14 @@ impl ImpulseAgent {
                     )
                     .await?;
 
-                self.record_turn(user_prompt, &resp.content);
+                self.record_turn(remembered, &resp.content);
                 Ok(resp.content)
             }
             _ => {
-                // API and Disabled modes: text-only enrichment via query()
-                self.query(system_prompt, &enriched_prompt).await
+                // API and Disabled modes: text-only enrichment, remembering
+                // the question as the harness path above does.
+                self.query_remembering(system_prompt, &enriched_prompt, remembered)
+                    .await
             }
         }
     }
@@ -854,6 +907,23 @@ impl ImpulseAgent {
     /// [`harness::HarnessRequest`] and as a combined `--print` argument for
     /// backward compatibility.
     pub async fn query(&mut self, system_prompt: &str, user_prompt: &str) -> AgentResult<String> {
+        self.query_remembering(system_prompt, user_prompt, user_prompt)
+            .await
+    }
+
+    /// [`Self::query`], recording `remembered` as the turn's question in the
+    /// session history instead of the whole prompt. Callers that wrap the
+    /// operator's question in context (a permission preamble, a workspace
+    /// snapshot, extracted insights) pass the bare question: the history
+    /// keeps only the first `MAX_HISTORY_PROMPT_LEN` bytes of what it
+    /// records, so recording the wrapped prompt kept the wrapping and lost
+    /// the question, and a follow-up turn never saw it.
+    pub async fn query_remembering(
+        &mut self,
+        system_prompt: &str,
+        user_prompt: &str,
+        remembered: &str,
+    ) -> AgentResult<String> {
         // Prepend session history so the LLM has conversational continuity
         let history_ctx = self.build_history_context();
         let enriched_prompt = if history_ctx.is_empty() {
@@ -868,6 +938,13 @@ impl ImpulseAgent {
                     AgentError::InvalidRequest("Agent not initialized".to_string())
                 })?;
                 agent.system_prompt = Some(system_prompt.to_string());
+                // Continuity comes from the bounded summary prepended above
+                // (`MAX_SESSION_HISTORY` turns). The inner agent's own history
+                // also re-sent every past turn in full: the daemon caches one
+                // agent for its whole life, so each request grew and the
+                // context was carried twice until requests hit the model's
+                // limit. Harness mode is already stateless per query.
+                agent.clear_history();
                 agent.chat(&enriched_prompt).await
             }
             AgentMode::Harness { .. } => {
@@ -885,9 +962,10 @@ impl ImpulseAgent {
             AgentMode::Disabled => Err(AgentError::InvalidRequest("Agent is disabled".to_string())),
         };
 
-        // On success, record the turn (using original user_prompt, not enriched)
+        // On success, record the turn: the caller's question, not the
+        // history-enriched prompt.
         if let Ok(ref response) = result {
-            self.record_turn(user_prompt, response);
+            self.record_turn(remembered, response);
         }
 
         result
@@ -1215,6 +1293,151 @@ mod tests {
 
     struct RecordingStatelessProvider {
         models: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    /// Records how many messages each request carried.
+    struct MessageCountProvider {
+        counts: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for MessageCountProvider {
+        fn name(&self) -> &str {
+            "message-count"
+        }
+        fn default_model(&self) -> &str {
+            "count-default"
+        }
+        async fn chat(
+            &self,
+            request: crate::llm_backends::ChatRequest,
+        ) -> AgentResult<crate::llm_backends::ChatResponse> {
+            self.counts.lock().unwrap().push(request.messages.len());
+            Ok(crate::llm_backends::ChatResponse {
+                content: "ok".to_string(),
+                model: request.model,
+                usage: crate::llm_backends::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: crate::llm_backends::StopReason::EndTurn,
+                tool_calls: Vec::new(),
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["count-default"]
+        }
+    }
+
+    /// Review P2: the cached API agent re-sent every past turn on each
+    /// query, so requests grew by two messages per turn without bound.
+    struct ContentRecordingProvider {
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ContentRecordingProvider {
+        fn name(&self) -> &str {
+            "content-recording"
+        }
+        fn default_model(&self) -> &str {
+            "content-default"
+        }
+        async fn chat(
+            &self,
+            request: crate::llm_backends::ChatRequest,
+        ) -> AgentResult<crate::llm_backends::ChatResponse> {
+            let text = request
+                .messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.requests.lock().unwrap().push(text);
+            Ok(crate::llm_backends::ChatResponse {
+                content: "answer".to_string(),
+                model: request.model,
+                usage: crate::llm_backends::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: crate::llm_backends::StopReason::EndTurn,
+                tool_calls: Vec::new(),
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["content-default"]
+        }
+    }
+
+    /// Refutation review of 3b8768e: the history kept the first 200 bytes
+    /// of a wrapped prompt (SupervisorChat's permission preamble), so the
+    /// next turn never saw the operator's previous question.
+    #[tokio::test]
+    async fn test_a_follow_up_turn_sees_the_previous_question_not_its_wrapping() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = ImpulseAgent::with_test_provider(Box::new(ContentRecordingProvider {
+            requests: std::sync::Arc::clone(&requests),
+        }));
+        let wrapped = format!(
+            "Supervisor permission state:\n{}\n\nOperator request:\nFIRST-QUESTION-MARKER",
+            "x".repeat(500)
+        );
+        agent
+            .query_remembering("system", &wrapped, "FIRST-QUESTION-MARKER")
+            .await
+            .expect("first turn");
+        agent
+            .query("system", "a follow-up")
+            .await
+            .expect("second turn");
+
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests[1].contains("FIRST-QUESTION-MARKER"),
+            "the follow-up must carry the previous question: {}",
+            requests[1]
+        );
+    }
+
+    /// Verification round on 88fef92: AgentAssist with a context string
+    /// still remembered the wrapper ("Context:"), not the request.
+    #[tokio::test]
+    async fn test_a_follow_up_after_query_with_context_sees_the_request() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = ImpulseAgent::with_test_provider(Box::new(ContentRecordingProvider {
+            requests: std::sync::Arc::clone(&requests),
+        }));
+        let wrapped = format!("Context:\n{}\n\nRequest:\nREQUEST-MARKER", "x".repeat(500));
+        agent
+            .query_with_context_remembering("system", &wrapped, &[], "REQUEST-MARKER")
+            .await
+            .expect("first turn");
+        agent
+            .query("system", "a follow-up")
+            .await
+            .expect("second turn");
+        assert!(requests.lock().unwrap()[1].contains("REQUEST-MARKER"));
+    }
+
+    #[tokio::test]
+    async fn test_api_query_request_size_stays_bounded() {
+        let counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = ImpulseAgent::with_test_provider(Box::new(MessageCountProvider {
+            counts: std::sync::Arc::clone(&counts),
+        }));
+        for turn in 0..12 {
+            agent
+                .query("system", &format!("question {turn}"))
+                .await
+                .expect("query");
+        }
+        let counts = counts.lock().unwrap();
+        assert_eq!(counts.len(), 12);
+        assert!(
+            counts.iter().all(|&count| count == counts[0]),
+            "every request must carry the same number of messages: {counts:?}"
+        );
     }
 
     #[async_trait::async_trait]
@@ -1700,6 +1923,41 @@ mod tests {
     //    (same-day Opus sweep: `harness_query_structured`'s `.output().await`
     //    previously had no timeout and no `kill_on_drop`) ──────────────────
 
+    /// Recorded review item: harness output was collected with
+    /// `wait_with_output`, which keeps everything the CLI writes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_harness_reply_over_the_cap_is_refused_not_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let harness = dir.path().join("claude");
+        std::fs::write(
+            &harness,
+            format!(
+                "#!/bin/sh\nhead -c {} /dev/zero\n",
+                MAX_HARNESS_STDOUT_BYTES + 1
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&harness).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&harness, permissions).unwrap();
+        let agent = ImpulseAgent::new(ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode))
+            .unwrap()
+            .with_test_harness_command(harness);
+        let error = agent
+            .harness_query_structured_with_timeout(
+                "system",
+                "hello",
+                &[],
+                None,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("a reply over the cap is refused");
+        assert!(error.to_string().contains("reply limit"), "{error}");
+    }
+
     /// Writes an executable shell script into a fresh temp directory that
     /// just sleeps, standing in for a hung harness CLI
     /// without depending on a real `claude`/`codex`/`gemini` binary being
@@ -1759,12 +2017,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    /// Writes an executable wrapper script that backgrounds a `sleep`
+    /// grandchild, publishes `"$$\n$child\n"` (wrapper pid, grandchild pid)
+    /// to `pid_file`, then blocks in `wait` like a hung harness CLI. The
+    /// pids let the proofs below observe only processes this test owns.
     #[cfg(unix)]
-    async fn test_harness_query_kills_hung_child_instead_of_orphaning() {
-        // Regression test for full process-group cleanup on the explicit
-        // timeout path. The fake wrapper publishes its own PID and its sleep
-        // child's PID so the proof observes only processes this test owns.
+    fn write_pid_publishing_fake_harness(
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         let script_path = dir.path().join("claude");
         let pid_file = dir.path().join("harness-pids");
@@ -1776,7 +2035,6 @@ mod tests {
             ),
         )
         .expect("write fake harness script");
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&script_path)
@@ -1785,78 +2043,85 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
         }
-        let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
-        let agent = ImpulseAgent::new(config)
-            .expect("harness agent should construct")
-            .with_test_harness_command(script_path.clone());
+        (dir, script_path, pid_file)
+    }
 
-        let result = agent
+    /// Writes an executable fake harness named `claude` running `body`.
+    #[cfg(unix)]
+    fn write_fake_harness(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let script_path = dir.path().join("claude");
+        std::fs::write(&script_path, format!("#!/bin/sh\n{body}\n"))
+            .expect("write fake harness script");
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat fake harness script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
+        (dir, script_path)
+    }
+
+    /// Regression: after `output()` became `spawn()` + `wait_with_output()`
+    /// the child's stdout was inherited instead of piped, so every successful
+    /// harness reply came back empty.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_harness_query_returns_the_harness_reply() {
+        let (_dir, script_path) =
+            write_fake_harness(r#"printf '{"content":"hello from harness"}'"#);
+        let agent = ImpulseAgent::new(ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode))
+            .expect("harness agent should construct")
+            .with_test_harness_command(script_path);
+        let response = agent
             .harness_query_structured_with_timeout(
                 "system",
                 "hello",
                 &[],
                 None,
-                Duration::from_secs(2),
+                Duration::from_secs(30),
             )
-            .await;
-        assert!(matches!(result, Err(AgentError::HarnessTimedOut { .. })));
-
-        let contents = std::fs::read_to_string(&pid_file)
-            .expect("fake harness must publish wrapper and child pids before timeout");
-        let pids = contents
-            .lines()
-            .map(|line| line.parse::<u32>().expect("pid file must contain integers"))
-            .collect::<Vec<_>>();
-        assert_eq!(pids.len(), 2, "pid file must identify wrapper and child");
-
-        if let Err(stray) =
-            crate::test_support::wait_for_pids_to_exit(&pids, Duration::from_secs(10)).await
-        {
-            panic!("expected no orphaned harness processes after timeout; survivors: {stray}");
-        }
+            .await
+            .expect("harness query should succeed");
+        assert_eq!(response.content, "hello from harness");
     }
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn test_aborting_harness_query_kills_the_whole_process_group() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let script_path = dir.path().join("claude");
-        let pid_file = dir.path().join("harness-pids");
-        std::fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nsleep 60 &\nchild=$!\nprintf '%s\\n%s\\n' \"$$\" \"$child\" > \"{}\"\nwait\n",
-                pid_file.display()
-            ),
-        )
-        .expect("write fake harness script");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&script_path)
-                .expect("stat fake harness script")
-                .permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&script_path, perms).expect("chmod fake harness script");
-        }
-        let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
-        let agent = ImpulseAgent::new(config)
+    async fn test_harness_query_failure_reports_the_harness_stderr() {
+        let (_dir, script_path) = write_fake_harness("echo 'boom: bad credentials' >&2\nexit 3");
+        let agent = ImpulseAgent::new(ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode))
             .expect("harness agent should construct")
-            .with_test_harness_command(script_path.clone());
-        let task = tokio::spawn(async move {
-            agent
-                .harness_query_structured_with_timeout(
-                    "system",
-                    "hello",
-                    &[],
-                    None,
-                    Duration::from_secs(30),
-                )
-                .await
-        });
+            .with_test_harness_command(script_path);
+        let error = agent
+            .harness_query_structured_with_timeout(
+                "system",
+                "hello",
+                &[],
+                None,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect_err("a failing harness must be an error");
+        assert!(
+            error.to_string().contains("boom: bad credentials"),
+            "{error}"
+        );
+    }
 
-        let pids = tokio::time::timeout(Duration::from_secs(10), async {
+    /// Polls until the fake harness has published both pids. The bound is a
+    /// liveness guard for a starved machine, not a timing assumption: the
+    /// callers below do nothing to the child until this has returned.
+    #[cfg(unix)]
+    async fn wait_for_published_pids(pid_file: &std::path::Path) -> Vec<u32> {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                if let Ok(contents) = std::fs::read_to_string(&pid_file) {
+                // The wrapper writes both lines in one `printf`; requiring the
+                // trailing newline rejects a torn read of the second pid.
+                if let Some(contents) = std::fs::read_to_string(pid_file)
+                    .ok()
+                    .filter(|contents| contents.ends_with('\n'))
+                {
                     let pids = contents
                         .lines()
                         .filter_map(|line| line.parse::<u32>().ok())
@@ -1869,7 +2134,95 @@ mod tests {
             }
         })
         .await
-        .expect("fake harness grandchild did not start");
+        .expect("fake harness did not publish its wrapper and grandchild pids")
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_harness_query_kills_hung_child_instead_of_orphaning() {
+        // Regression test for full process-group cleanup on the explicit
+        // timeout path.
+        //
+        // Ordering is controlled rather than bet on. The query runs with an
+        // effectively infinite timeout while the test waits (bounded) for the
+        // pid file, then pauses tokio's clock and advances it past the
+        // deadline explicitly, so the `HarnessTimedOut` branch fires on the
+        // next runtime turn -- and only after both pids are known. The
+        // explicit `advance` is deliberate: the paused clock's *auto*-advance
+        // is suppressed while any blocking task is alive on the runtime, which
+        // would turn a future `spawn_blocking`/`tokio::fs` call in this code
+        // path into a silent one-hour hang instead of a failure. The previous
+        // shape passed a fixed 2 s timeout and read the pid file afterwards;
+        // under load (six concurrent cargo gates on 10 cores) `sh` had not
+        // reached its `printf` when the group was killed, and the test failed
+        // on its own precondition ("fake harness must publish ... before
+        // timeout: NotFound") rather than on the property under test.
+        const HARNESS_BUDGET: Duration = Duration::from_secs(3600);
+        let (_dir, script_path, pid_file) = write_pid_publishing_fake_harness();
+        let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
+        let agent = ImpulseAgent::new(config)
+            .expect("harness agent should construct")
+            .with_test_harness_command(script_path);
+        let task = tokio::spawn(async move {
+            agent
+                .harness_query_structured_with_timeout("system", "hello", &[], None, HARNESS_BUDGET)
+                .await
+        });
+
+        let pids = wait_for_published_pids(&pid_file).await;
+
+        tokio::time::pause();
+        tokio::time::advance(HARNESS_BUDGET).await;
+        let result = task.await.expect("harness query task must not panic");
+        tokio::time::resume();
+        match result {
+            Err(AgentError::HarnessTimedOut { command, seconds }) => {
+                assert!(
+                    command.ends_with("claude"),
+                    "timeout must identify the injected harness executable: {command}"
+                );
+                assert_eq!(
+                    seconds,
+                    HARNESS_BUDGET.as_secs(),
+                    "timeout must report the configured budget"
+                );
+            }
+            other => panic!("expected HarnessTimedOut, got: {other:?}"),
+        }
+
+        if let Err(stray) =
+            crate::test_support::wait_for_pids_to_exit(&pids, Duration::from_secs(10)).await
+        {
+            let _ = tokio::process::Command::new("kill")
+                .arg("-KILL")
+                .args(pids.iter().map(u32::to_string))
+                .status()
+                .await;
+            panic!("expected no orphaned harness processes after timeout; survivors: {stray}");
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn test_aborting_harness_query_kills_the_whole_process_group() {
+        let (_dir, script_path, pid_file) = write_pid_publishing_fake_harness();
+        let config = ImpulseAgentConfig::harness(ImpulseHarness::ClaudeCode);
+        let agent = ImpulseAgent::new(config)
+            .expect("harness agent should construct")
+            .with_test_harness_command(script_path);
+        let task = tokio::spawn(async move {
+            agent
+                .harness_query_structured_with_timeout(
+                    "system",
+                    "hello",
+                    &[],
+                    None,
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+
+        let pids = wait_for_published_pids(&pid_file).await;
 
         task.abort();
         let _ = task.await;
@@ -1886,5 +2239,83 @@ mod tests {
                  survivors: {stray}"
             );
         }
+    }
+
+    /// Review finding: the API agent always sent temperature 0.7 and a
+    /// 4096-token cap, ignoring the configured values.
+    #[test]
+    fn test_api_agent_takes_its_sampling_from_the_config() {
+        let config = ImpulseAgentConfig {
+            mode: AgentMode::Api {
+                provider: ImpulseProvider::Anthropic,
+                model: None,
+            },
+            api_key: Some("test-key".to_string()),
+            temperature: 0.1,
+            max_tokens: 1234,
+            ..ImpulseAgentConfig::default()
+        };
+        let agent = ImpulseAgent::new(config).expect("API agent");
+        let inner = agent.inner.as_ref().expect("API mode has an inner agent");
+        assert_eq!(inner.temperature, 0.1);
+        assert_eq!(inner.max_tokens, Some(1234));
+    }
+
+    /// Each request's temperature and token cap, in order.
+    type SamplingLog = std::sync::Arc<std::sync::Mutex<Vec<(f32, Option<u32>)>>>;
+
+    /// Records the sampling of every request.
+    struct SamplingRecorder {
+        sampling: SamplingLog,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SamplingRecorder {
+        fn name(&self) -> &str {
+            "sampling-recorder"
+        }
+        fn default_model(&self) -> &str {
+            "sampling-recorder-model"
+        }
+        async fn chat(
+            &self,
+            request: crate::llm_backends::ChatRequest,
+        ) -> AgentResult<crate::llm_backends::ChatResponse> {
+            self.sampling
+                .lock()
+                .unwrap()
+                .push((request.temperature, request.max_tokens));
+            Ok(crate::llm_backends::ChatResponse {
+                content: "ok".to_string(),
+                model: request.model,
+                usage: crate::llm_backends::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: crate::llm_backends::StopReason::EndTurn,
+                tool_calls: Vec::new(),
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["sampling-recorder-model"]
+        }
+    }
+
+    /// Verification finding: the test seam kept sending 0.7 and 4096 after
+    /// `new` started honouring the config, and the config's 2048 default
+    /// halved the API agent's replies.
+    #[tokio::test]
+    async fn test_the_test_seam_sends_the_config_sampling() {
+        let sampling = SamplingLog::default();
+        let mut agent = ImpulseAgent::with_test_provider(Box::new(SamplingRecorder {
+            sampling: std::sync::Arc::clone(&sampling),
+        }));
+        agent.query("system", "question").await.unwrap();
+        let default = ImpulseAgentConfig::default();
+        assert_eq!(default.max_tokens, 4096);
+        assert_eq!(
+            *sampling.lock().unwrap(),
+            [(default.temperature, Some(default.max_tokens))]
+        );
     }
 }

@@ -7,11 +7,24 @@ use serde::{Deserialize, Serialize};
 
 pub mod agent_registry;
 pub mod governed_task;
+pub mod governed_wiring;
 pub mod memory_candidate;
+/// ADR-0020 promotion/dismissal wire contract (request types only).
+pub mod memory_wiring;
+pub mod operator_capability;
 pub mod role_assignment;
 
 /// Shared daemon protocol version for GUI/operator workbench compatibility.
-pub const DAEMON_PROTOCOL_VERSION: u32 = 6;
+///
+/// v7 (ADR-0018) adds the connection-scoped `PresentOperatorCapability`
+/// request and the operator-class requirement on `RecordOperatorDecision`.
+/// v8 (ADR-0019) adds the staged-worktree and promotion mutations plus the
+/// `world_scope` registration field.
+/// v9 (this lane) adds the `PromoteGovernedOutcome` and
+/// `DiscardGovernedStagedWorktree` requests, staged materialization inside
+/// `RegisterGovernedTask`, and the flattened producer acknowledgements that
+/// carry `replayed` plus a reservation's `pending_rerun_reason`.
+pub const DAEMON_PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
@@ -28,6 +41,12 @@ pub enum OpsError {
 pub enum WorkbenchDaemonRequest {
     Ping,
     Status,
+    /// Present this daemon run's operator capability (ADR-0018).
+    ///
+    /// Connection-scoped: an operator surface sends it once immediately after
+    /// connecting, before any request that mints acceptance. Governed panes
+    /// never receive the capability, so a launched runtime cannot send this.
+    PresentOperatorCapability(crate::operator_capability::OperatorCapabilityPresentation),
     ListSessions,
     CreateSession {
         name: String,
@@ -91,6 +110,15 @@ pub enum WorkbenchDaemonRequest {
     RunGovernedSupervisorReview {
         request: governed_task::GovernedSupervisorReviewRequest,
     },
+    /// Fast-forward the canonical branch onto an accepted staged outcome
+    /// (ADR-0019). Operator-class only.
+    PromoteGovernedOutcome {
+        request: governed_wiring::GovernedPromotionRequest,
+    },
+    /// Reclaim a finished staged worktree (ADR-0019). Operator-class only.
+    DiscardGovernedStagedWorktree {
+        request: governed_wiring::GovernedStagedWorktreeDiscardRequest,
+    },
     GuardList,
     GetConflictHistory,
     ClearResolvedConflicts,
@@ -143,18 +171,29 @@ pub fn sanitize_id(input: &str) -> String {
     }
 }
 
+static TEMP_FILE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn atomic_write_path(path: &Path, content: &[u8]) -> Result<(), OpsError> {
     let parent = path
         .parent()
         .ok_or_else(|| OpsError::MissingParent(path.to_path_buf()))?;
     std::fs::create_dir_all(parent)?;
+    // The target's name, the pid and a per-process sequence number make the
+    // temp name unique. It used to be the pid and the clock alone, shared by
+    // every file in the directory, and macOS clock nanoseconds are whole
+    // microseconds: two artifacts saved in one microsecond shared a temp
+    // file, so one could be renamed into place under the other's name.
     let tmp_path = parent.join(format!(
-        ".tmp.{}.{}",
+        ".{}.tmp.{}.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("write"),
         std::process::id(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos()
+            .subsec_nanos()
     ));
     let mut file = File::create(&tmp_path)?;
     file.write_all(content)?;
@@ -949,6 +988,45 @@ mod tests {
             sanitize_id(" Claude Code / Agent #1 "),
             "claude-code-agent-1"
         );
+    }
+
+    #[test]
+    fn test_atomic_write_path_keeps_concurrent_files_apart() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let handles: Vec<_> = (0..4)
+            .map(|thread| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    (0..200)
+                        .filter_map(|i| {
+                            let name = format!("{thread}-{i}.json");
+                            atomic_write_path(&dir.join(&name), name.as_bytes()).err()
+                        })
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let failures: Vec<String> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} failed: {:?}",
+            failures.len(),
+            failures.first()
+        );
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.starts_with('.'), "temp file left: {name}");
+            assert_eq!(std::fs::read_to_string(entry.path()).unwrap(), name);
+            seen += 1;
+        }
+        assert_eq!(seen, 800);
     }
 
     #[test]

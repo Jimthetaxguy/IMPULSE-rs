@@ -3,7 +3,10 @@ use reqwest::{Client, RequestBuilder};
 use serde::Deserialize;
 use std::sync::Arc;
 
-use super::{ChatRequest, ChatResponse, LlmProvider, Message, Role, StopReason, ToolCall, Usage};
+use super::{
+    ChatRequest, ChatResponse, LlmProvider, Message, Role, StopReason, ToolCall, ToolDefinition,
+    Usage,
+};
 use crate::error::{AgentError, AgentResult};
 
 /// Total request timeout for an LLM call. Long enough for slow completions,
@@ -12,20 +15,88 @@ const HTTP_REQUEST_TIMEOUT_SECS: u64 = 120;
 /// Connection-establishment timeout (fail fast when the endpoint is unreachable).
 const HTTP_CONNECT_TIMEOUT_SECS: u64 = 10;
 
-/// Build the shared HTTP client with bounded defaults. Every provider request
-/// also applies the same request-local timeout, so the fallback client cannot
-/// silently become unbounded if platform TLS/client initialization rejects the
-/// configured builder.
-fn build_http_client() -> Client {
+/// Most of a successful response body read. The largest completion any
+/// supported model returns is a small fraction of this.
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// Most of an error response body read.
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+/// Most of an error body quoted in the error, which reaches the REPL, logs
+/// and daemon clients.
+const MAX_ERROR_TEXT_CHARS: usize = 2_000;
+
+/// Build the shared HTTP client: bounded timeouts, and no redirects.
+///
+/// A redirect is never followed. reqwest drops `Authorization` on a hop to
+/// another host but not `x-api-key`, so following one sent the Anthropic key
+/// and the whole prompt to whatever host it named (an https-to-http hop would
+/// have sent them in cleartext). The configured origin is the destination; a
+/// 3xx answer is an error naming where it pointed.
+///
+/// A builder failure (TLS initialisation) is kept and returned by every
+/// request rather than replaced with `Client::new()`, which panics in exactly
+/// that case and would have followed redirects.
+fn build_http_client() -> Result<Client, String> {
     Client::builder()
         .timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
         .connect_timeout(std::time::Duration::from_secs(HTTP_CONNECT_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
-        .unwrap_or_else(|_| Client::new())
+        .map_err(|e| format!("could not build the HTTP client: {e}"))
 }
 
 fn bounded_request(request: RequestBuilder) -> RequestBuilder {
     request.timeout(std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS))
+}
+
+/// Reads `response`'s body: `Some` when it fits in `cap` bytes, `None` when
+/// it is longer. Never holds more than `cap` bytes plus one chunk.
+async fn read_capped_body(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Option<Vec<u8>>, reqwest::Error> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > cap as u64)
+    {
+        return Ok(None);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > cap {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
+}
+
+/// `text` cut to [`MAX_ERROR_TEXT_CHARS`], marked with `…` when cut (or when
+/// `already_cut`).
+fn quote(text: &str, already_cut: bool) -> String {
+    let mut chars = text.chars();
+    let mut quoted: String = chars.by_ref().take(MAX_ERROR_TEXT_CHARS).collect();
+    if already_cut || chars.next().is_some() {
+        quoted.push('…');
+    }
+    quoted
+}
+
+/// An error response's body as text: at most [`MAX_ERROR_BODY_BYTES`] read
+/// and [`MAX_ERROR_TEXT_CHARS`] kept, marked with `…` when cut. A failure
+/// while reading ends the text early rather than replacing it.
+async fn error_text(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    let mut cut = false;
+    while let Ok(Some(chunk)) = response.chunk().await {
+        let room = MAX_ERROR_BODY_BYTES - body.len();
+        if chunk.len() > room {
+            body.extend_from_slice(&chunk[..room]);
+            cut = true;
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    quote(&String::from_utf8_lossy(&body), cut)
 }
 
 /// Canonical API origins. Each provider appends its own request path, so these
@@ -34,26 +105,106 @@ const ANTHROPIC_DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const OPENAI_DEFAULT_BASE_URL: &str = "https://api.openai.com";
 const MINIMAX_DEFAULT_BASE_URL: &str = "https://api.minimax.chat";
 
-/// Env vars that redirect a provider at a different origin. The override exists
-/// so an eval harness or local proxy can intercept provider traffic without a
-/// rebuild; it is deliberately origin-only so a redirect cannot rewrite the
-/// request path.
+/// MiniMax's `chatcompletion_v2` endpoint expects `max_tokens` on every
+/// request, so a request that does not set one still sends this fallback.
+const MINIMAX_DEFAULT_MAX_TOKENS: u32 = 4096;
+
+/// Env vars that point a provider at another base URL, so an eval harness, a
+/// gateway or a local proxy can take its traffic without a rebuild. Each
+/// provider appends its own request path to the base.
 const ANTHROPIC_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 const OPENAI_BASE_URL_ENV: &str = "OPENAI_BASE_URL";
 const MINIMAX_BASE_URL_ENV: &str = "MINIMAX_BASE_URL";
 
+/// Where a base-URL override came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrideSource {
+    Configured,
+    Environment,
+}
+
 /// Resolve a base URL from, in precedence order: explicit config, environment
-/// override, canonical default. An override that is blank or carries no
-/// `http(s)` scheme is discarded rather than used, so a typo degrades to the
-/// real API instead of to an unresolvable endpoint.
-fn select_base_url(explicit: Option<&str>, from_env: Option<&str>, default: &str) -> String {
-    explicit
-        .or(from_env)
-        .map(str::trim)
-        .filter(|candidate| candidate.starts_with("http://") || candidate.starts_with("https://"))
-        .unwrap_or(default)
-        .trim_end_matches('/')
-        .to_string()
+/// override, canonical default. A blank override is unset.
+///
+/// An override that is set but can't be used is an error, never a fall back
+/// to the default: the default is a different service, so falling back would
+/// send the API key and the prompt to the public API when the user had
+/// pointed them at a gateway, a proxy or a local model.
+fn select_base_url(
+    explicit: Option<&str>,
+    from_env: Option<&str>,
+    default: &str,
+) -> Result<String, (OverrideSource, &'static str)> {
+    for (source, candidate) in [
+        (OverrideSource::Configured, explicit),
+        (OverrideSource::Environment, from_env),
+    ] {
+        let Some(candidate) = candidate.map(str::trim).filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        return parse_base_url(candidate).map_err(|reason| (source, reason));
+    }
+    Ok(default.trim_end_matches('/').to_string())
+}
+
+/// A usable base URL, or why `candidate` isn't one. Each provider appends its
+/// own path, so the base may carry a path prefix (a gateway's, such as
+/// OpenRouter's `https://openrouter.ai/api`) and credentials (sent as Basic
+/// auth; never logged), but not a query or fragment, which the provider's
+/// path would land after. Credentials must decode to UTF-8: reqwest leaves
+/// any that don't in the URL instead of sending them, where they would reach
+/// error messages.
+fn parse_base_url(candidate: &str) -> Result<String, &'static str> {
+    let url = reqwest::Url::parse(candidate).map_err(|_| "it is not an absolute URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("its scheme is not http or https");
+    }
+    if url.host_str().is_none() {
+        return Err("it names no host");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("it has a query or fragment");
+    }
+    let credentials = [url.username(), url.password().unwrap_or("")];
+    if !credentials.iter().all(|part| percent_decodes_to_utf8(part)) {
+        return Err("its credentials are not valid UTF-8");
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
+
+/// Whether `text`, with its `%XX` escapes decoded, is valid UTF-8.
+fn percent_decodes_to_utf8(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = (bytes[i] == b'%')
+            .then(|| bytes.get(i + 1..i + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
+            Some(byte) => {
+                decoded.push(byte);
+                i += 3;
+            }
+            None => {
+                decoded.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    std::str::from_utf8(&decoded).is_ok()
+}
+
+/// The Anthropic API origin Ion's own provider resolves when no explicit base
+/// URL is configured: `ANTHROPIC_BASE_URL` if it carries an `http(s)` scheme,
+/// otherwise the canonical default. Shared with the `photon` subagent so a
+/// local proxy or eval harness intercepts both the parent and its photons.
+#[cfg(feature = "photon-subagent")]
+pub(crate) fn anthropic_api_origin() -> String {
+    let from_env = std::env::var(ANTHROPIC_BASE_URL_ENV).ok();
+    select_base_url(None, from_env.as_deref(), ANTHROPIC_DEFAULT_BASE_URL)
 }
 
 /// How a resolved origin relates to the provider's canonical default.
@@ -69,16 +220,25 @@ enum BaseUrlKind {
     OverrideCleartextHttp,
 }
 
-fn origin_host(origin: &str) -> Option<&str> {
-    let rest = origin.split_once("://")?.1;
-    if let Some(rest) = rest.strip_prefix('[') {
-        return rest.split(']').next();
-    }
-    rest.split([':', '/']).next()
-}
-
+/// Whether a URL host (as `Url::host_str` gives it) is this machine. Only
+/// `localhost` and loopback addresses count (an IPv4 loopback address may be
+/// written IPv4-mapped): a name like `127.example.com` is a domain like any
+/// other.
 fn host_is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
+    let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
+    if unbracketed
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case("localhost")
+    {
+        return true;
+    }
+    match unbracketed.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 fn classify_base_url(resolved: &str, default: &str) -> BaseUrlKind {
@@ -86,19 +246,27 @@ fn classify_base_url(resolved: &str, default: &str) -> BaseUrlKind {
     if resolved == canonical {
         return BaseUrlKind::Canonical;
     }
-    if resolved.starts_with("https://") {
-        return BaseUrlKind::OverrideHttps;
-    }
-    if resolved.starts_with("http://") {
-        if origin_host(resolved).is_some_and(host_is_loopback) {
-            return BaseUrlKind::OverrideLoopbackHttp;
-        }
+    let Ok(url) = reqwest::Url::parse(resolved) else {
         return BaseUrlKind::OverrideCleartextHttp;
+    };
+    match url.scheme() {
+        "https" => BaseUrlKind::OverrideHttps,
+        _ if url.host_str().is_some_and(host_is_loopback) => BaseUrlKind::OverrideLoopbackHttp,
+        _ => BaseUrlKind::OverrideCleartextHttp,
     }
-    BaseUrlKind::Canonical
 }
 
-fn log_base_url_override(provider_name: &str, origin: &str, kind: BaseUrlKind) {
+/// What the override log line shows of a base: its origin, never the
+/// credentials a base can carry or a path that can name an account.
+fn override_log_origin(base: &str) -> String {
+    reqwest::Url::parse(base)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_default()
+}
+
+fn log_base_url_override(provider_name: &str, base: &str, kind: BaseUrlKind) {
+    let origin = override_log_origin(base);
+    let origin = origin.as_str();
     match kind {
         BaseUrlKind::Canonical => {}
         BaseUrlKind::OverrideHttps | BaseUrlKind::OverrideLoopbackHttp => {
@@ -121,7 +289,9 @@ fn log_base_url_override(provider_name: &str, origin: &str, kind: BaseUrlKind) {
 /// Common provider structure - shared by all LLM providers
 pub struct BaseProvider {
     api_key: String,
-    http_client: Arc<Client>,
+    /// The shared client, or why it could not be built; see
+    /// [`build_http_client`].
+    http_client: Arc<Result<Client, String>>,
     provider_name: &'static str,
     default_model: String,
     base_url: Option<String>,
@@ -163,21 +333,77 @@ impl BaseProvider {
         self
     }
 
-    /// Full request URL for one provider endpoint, honoring the configured or
-    /// env-supplied origin. `path` must start with `/`.
-    pub fn endpoint(&self, env_var: &str, default_base_url: &str, path: &str) -> String {
-        let from_env = std::env::var(env_var).ok();
-        let base = select_base_url(
-            self.base_url.as_deref(),
-            from_env.as_deref(),
-            default_base_url,
-        );
+    /// The request URL for one provider endpoint, from the configured or
+    /// environment base URL, else the canonical one. `path` must start with
+    /// `/`. A set override that can't be used (see [`select_base_url`])
+    /// fails the request.
+    ///
+    /// A base ending in `/v1` has it removed when `path` starts with `/v1/`:
+    /// the OpenAI SDK convention gives a base with `/v1`, which would
+    /// otherwise double into `/v1/v1/...`. `allow_url_credentials` is false
+    /// for providers whose key is the `Authorization` header, since reqwest
+    /// would send URL credentials as a second one.
+    pub fn endpoint(
+        &self,
+        env_var: &str,
+        default_base_url: &str,
+        path: &str,
+        allow_url_credentials: bool,
+    ) -> AgentResult<String> {
+        let unusable = |source: &str, reason: &str| {
+            AgentError::InvalidRequest(format!(
+                "{source} can't be used as the {} base URL: {reason}; fix or unset it",
+                self.provider_name
+            ))
+        };
+        let configured = self
+            .base_url
+            .as_deref()
+            .filter(|base| !base.trim().is_empty());
+        // The environment only matters when nothing is configured, so a
+        // value it can't use doesn't fail a configured URL it would lose to.
+        let from_env = if configured.is_some() {
+            None
+        } else {
+            match std::env::var(env_var) {
+                Ok(value) => Some(value),
+                Err(std::env::VarError::NotPresent) => None,
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    return Err(unusable(env_var, "it is not valid UTF-8"));
+                }
+            }
+        };
+        let source_name = |source| match source {
+            OverrideSource::Configured => "The configured base URL",
+            OverrideSource::Environment => env_var,
+        };
+        let base = select_base_url(configured, from_env.as_deref(), default_base_url)
+            .map_err(|(source, reason)| unusable(source_name(source), reason))?;
+        if !allow_url_credentials && base.contains('@') {
+            let has_credentials = reqwest::Url::parse(&base)
+                .is_ok_and(|url| !url.username().is_empty() || url.password().is_some());
+            if has_credentials {
+                let source = if configured.is_some() {
+                    OverrideSource::Configured
+                } else {
+                    OverrideSource::Environment
+                };
+                return Err(unusable(
+                    source_name(source),
+                    "it carries credentials, and this provider's key is the Authorization header",
+                ));
+            }
+        }
+        let base = match base.strip_suffix("/v1") {
+            Some(without_version) if path.starts_with("/v1/") => without_version.to_string(),
+            _ => base,
+        };
         log_base_url_override(
             self.provider_name,
             &base,
             classify_base_url(&base, default_base_url),
         );
-        format!("{base}{path}")
+        Ok(format!("{base}{path}"))
     }
 
     pub fn check_api_key(&self) -> AgentResult<()> {
@@ -189,25 +415,94 @@ impl BaseProvider {
         Ok(())
     }
 
-    /// Convert messages to provider format
-    pub fn format_messages(messages: &[Message]) -> Vec<serde_json::Value> {
-        messages
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "role": match m.role {
-                        Role::System => "system",
-                        Role::User => "user",
-                        Role::Assistant => "assistant",
-                    },
-                    "content": m.content
-                })
-            })
-            .collect()
+    pub fn http_client(&self) -> AgentResult<&Client> {
+        self.http_client
+            .as_ref()
+            .as_ref()
+            .map_err(|e| AgentError::ApiRequest(e.clone()))
     }
 
-    pub fn http_client(&self) -> &Client {
-        &self.http_client
+    /// Sends `request` and decodes a successful reply's JSON body as `T`.
+    ///
+    /// Bodies are read in chunks with a cap: a success past
+    /// [`MAX_RESPONSE_BYTES`] is an error, and an error body is cut to
+    /// [`MAX_ERROR_BODY_BYTES`] and quoted to [`MAX_ERROR_TEXT_CHARS`]. A
+    /// redirect is an error (the client follows none). Transport failures,
+    /// including a timeout while the body arrives, are `ApiRequest` errors
+    /// that name their cause rather than invalid responses.
+    async fn send_json<T: serde::de::DeserializeOwned>(
+        &self,
+        request: RequestBuilder,
+    ) -> AgentResult<T> {
+        let response = bounded_request(request)
+            .send()
+            .await
+            .map_err(|e| self.transport_error(&e))?;
+        let status = response.status();
+        if status.is_redirection() {
+            let target = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| response.url().join(location).ok())
+                .map(|url| url.origin().ascii_serialization())
+                .unwrap_or_else(|| "an unnamed location".to_string());
+            return Err(AgentError::ApiRequest(format!(
+                "{} answered {status}, redirecting to {target}; redirects are not followed, \
+                 so set the provider's base URL to the final origin",
+                self.provider_name
+            )));
+        }
+        if !status.is_success() {
+            let text = error_text(response).await;
+            return Err(match status.as_u16() {
+                429 => AgentError::RateLimited,
+                401 => AgentError::Authentication(text),
+                _ => AgentError::ApiRequest(format!("{} - {}", status, text)),
+            });
+        }
+        let body = read_capped_body(response, MAX_RESPONSE_BYTES)
+            .await
+            .map_err(|e| self.transport_error(&e))?
+            .ok_or_else(|| {
+                AgentError::ApiResponse(format!(
+                    "the {} response was longer than {MAX_RESPONSE_BYTES} bytes",
+                    self.provider_name
+                ))
+            })?;
+        // serde quotes an unexpected value in full, which for a string can be
+        // most of the body.
+        serde_json::from_slice(&body)
+            .map_err(|e| AgentError::ApiResponse(quote(&e.to_string(), false)))
+    }
+
+    /// An `ApiRequest` error for a failed send or body read, naming the cause.
+    fn transport_error(&self, error: &reqwest::Error) -> AgentError {
+        if error.is_timeout() {
+            let (what, seconds) = if error.is_connect() {
+                ("could not connect", HTTP_CONNECT_TIMEOUT_SECS)
+            } else {
+                ("request timed out", HTTP_REQUEST_TIMEOUT_SECS)
+            };
+            return AgentError::ApiRequest(format!(
+                "{} {what} within {seconds}s",
+                self.provider_name
+            ));
+        }
+        // reqwest's own message ("error sending request for url (...)")
+        // leaves out why; its source chain says. The URL it quotes is cut to
+        // its origin: a base can carry credentials and an account path.
+        let mut message = error.to_string();
+        if let Some(url) = error.url() {
+            message = message.replace(url.as_str(), &url.origin().ascii_serialization());
+        }
+        let mut source = std::error::Error::source(error);
+        while let Some(cause) = source {
+            message.push_str(": ");
+            message.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        AgentError::ApiRequest(message)
     }
 
     pub fn api_key(&self) -> &str {
@@ -251,13 +546,198 @@ struct AnthropicUsage {
     output_tokens: u32,
 }
 
+/// The wire shape one provider expects a chat request to take.
+///
+/// Every provider in this module renders messages through
+/// [`format_messages_for`] with its own variant. There is deliberately no
+/// shared "plain text only" formatter any more: the previous
+/// `BaseProvider::format_messages` silently dropped `tool_calls` and
+/// `tool_results` (it only ever read `Message::content`), so a tool-use turn
+/// sent through a non-Anthropic provider reached the model as an empty
+/// assistant message followed by an empty user message — an unpaired,
+/// meaningless exchange that the provider had no way to reject usefully.
+/// Making the format an explicit parameter means a new provider has to pick
+/// a wire shape that carries tool blocks, rather than inheriting one that
+/// discards them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireFormat {
+    /// Anthropic Messages API: `content` becomes a block array carrying
+    /// `tool_use` / `tool_result` blocks, and the system prompt is lifted to
+    /// a top-level request field.
+    Anthropic,
+    /// OpenAI chat-completions: the assistant message carries a `tool_calls`
+    /// array of `{id, type: "function", function: {name, arguments}}`, and
+    /// each result comes back as its own `{role: "tool", tool_call_id, ...}`
+    /// message. MiniMax's `chatcompletion_v2` endpoint speaks the same shape
+    /// (see [`MinimaxProvider`]).
+    OpenAi,
+}
+
+impl WireFormat {
+    /// Every wire shape, so a measurement that must not under-count can take
+    /// the widest. Adding a variant automatically joins this list.
+    pub const ALL: [WireFormat; 2] = [WireFormat::Anthropic, WireFormat::OpenAi];
+
+    /// Characters one tool call's `input` occupies in this wire shape.
+    ///
+    /// The two shapes differ by more than formatting. Anthropic sends the
+    /// input as a JSON **object**, so it costs its canonical serialization.
+    /// OpenAI sends it as `function.arguments`, a JSON **string** *holding*
+    /// that serialization — so every quote and backslash inside is escaped a
+    /// second time, and an escape-heavy input costs materially more on the
+    /// OpenAI wire than on Anthropic's.
+    ///
+    /// Canonical JSON is used as the inner form so the measurement never
+    /// drifts with map ordering.
+    pub fn tool_input_chars(self, input: &serde_json::Value) -> usize {
+        let canonical = crate::loop_contract::canonical_json(input);
+        match self {
+            WireFormat::Anthropic => canonical.chars().count(),
+            WireFormat::OpenAi => serde_json::Value::String(canonical)
+                .to_string()
+                .chars()
+                .count(),
+        }
+    }
+
+    /// The largest [`WireFormat::tool_input_chars`] across every wire shape.
+    ///
+    /// The context budget measures with this rather than with the running
+    /// provider's own shape (review round 1): reading the shape off the
+    /// provider would mean a `LlmProvider` trait method, and a trait method
+    /// with a default is exactly how the under-measurement it fixes would
+    /// come back — a future provider that forgets to override it silently
+    /// measures its own traffic short. Taking the widest can never
+    /// under-count for any provider, and over-counting only spends the
+    /// budget's deliberate headroom slightly sooner.
+    pub fn widest_tool_input_chars(input: &serde_json::Value) -> usize {
+        WireFormat::ALL
+            .into_iter()
+            .map(|format| format.tool_input_chars(input))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Renders `messages` in the wire shape `format` expects, preserving every
+/// tool block. One [`Message`] may expand into more than one wire message
+/// (OpenAI wants one `role: "tool"` message per result), which is why this
+/// returns a fresh `Vec` rather than mapping one-to-one.
+pub fn format_messages_for(format: WireFormat, messages: &[Message]) -> Vec<serde_json::Value> {
+    match format {
+        WireFormat::Anthropic => format_anthropic_messages(messages),
+        WireFormat::OpenAi => format_openai_messages(messages),
+    }
+}
+
+fn openai_role(role: Role) -> &'static str {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    }
+}
+
+/// Renders messages for OpenAI-style chat completions (OpenAI and MiniMax).
+///
+/// Three shapes:
+/// - a message carrying `tool_results` becomes one `{"role": "tool",
+///   "tool_call_id", "content"}` message per result, because OpenAI pairs a
+///   result to its call by id and accepts exactly one id per message;
+/// - a message carrying `tool_calls` becomes an assistant message with a
+///   `tool_calls` array, each call's `input` re-encoded as the JSON *string*
+///   the API expects in `function.arguments`;
+/// - anything else is the plain `{"role", "content"}` pair.
+///
+/// [`super::ToolResult::is_error`] has no OpenAI counterpart on the wire, so the
+/// error text is sent as the tool message's content verbatim rather than
+/// wrapped in a marker this module would have invented. The loop breaker
+/// still sees the flag (it reads the executor's result, not the wire form),
+/// so same-error detection is unaffected.
+fn format_openai_messages(messages: &[Message]) -> Vec<serde_json::Value> {
+    let mut wire = Vec::with_capacity(messages.len());
+    for message in messages {
+        if !message.tool_results.is_empty() {
+            for result in &message.tool_results {
+                wire.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": result.tool_use_id,
+                    "content": result.content,
+                }));
+            }
+            // A tool-result message normally carries no prose, but if it
+            // does, it must not be dropped along the way.
+            if !message.content.is_empty() {
+                wire.push(serde_json::json!({
+                    "role": openai_role(message.role),
+                    "content": message.content,
+                }));
+            }
+            continue;
+        }
+
+        if !message.tool_calls.is_empty() {
+            let calls: Vec<serde_json::Value> = message
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    serde_json::json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.input.to_string(),
+                        },
+                    })
+                })
+                .collect();
+            let mut assistant = serde_json::json!({
+                "role": "assistant",
+                "tool_calls": calls,
+            });
+            if !message.content.is_empty() {
+                assistant["content"] = serde_json::Value::String(message.content.clone());
+            }
+            wire.push(assistant);
+            continue;
+        }
+
+        wire.push(serde_json::json!({
+            "role": openai_role(message.role),
+            "content": message.content,
+        }));
+    }
+    wire
+}
+
+/// Renders [`ToolDefinition`]s as OpenAI function tools. The definition's
+/// `input_schema` is the JSON Schema both APIs want; only the envelope
+/// differs (`{type, function{name, description, parameters}}` here against
+/// Anthropic's flat `{name, description, input_schema}`).
+fn openai_tools_value(tools: &[ToolDefinition]) -> serde_json::Value {
+    serde_json::Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    },
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Renders messages for the Anthropic Messages API. Plain text messages use
-/// the simple `{"role", "content": "..."}` shape (matching
-/// `BaseProvider::format_messages`); messages carrying `tool_calls` or
-/// `tool_results` (TUI_SPEC.md T9) render `content` as a block array per
-/// Anthropic's tool-use protocol instead. Kept Anthropic-specific rather
-/// than folded into `BaseProvider::format_messages` because OpenAI/Minimax
-/// don't support tool-use blocks yet.
+/// the simple `{"role", "content": "..."}` shape; messages carrying
+/// `tool_calls` or `tool_results` (TUI_SPEC.md T9) render `content` as a
+/// block array per Anthropic's tool-use protocol instead. Reached through
+/// [`format_messages_for`] with [`WireFormat::Anthropic`]; the OpenAI and
+/// MiniMax shape is [`format_openai_messages`].
 fn format_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     messages
         .iter()
@@ -306,20 +786,202 @@ fn format_anthropic_messages(messages: &[Message]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-pub struct AnthropicProvider(BaseProvider);
+/// Whether a fresh [`AnthropicProvider`] marks its system-and-tools prefix
+/// cacheable. On by default: the prefix is identical on every round of a
+/// tool loop, so caching it is the single cheapest saving available, and a
+/// cache miss costs nothing but the write.
+const DEFAULT_CACHE_SYSTEM_AND_TOOLS: bool = true;
+
+pub struct AnthropicProvider {
+    base: BaseProvider,
+    cache_system_and_tools: bool,
+}
 
 impl AnthropicProvider {
     pub fn new(api_key: String) -> Self {
-        Self(BaseProvider::new("anthropic", api_key, "claude-sonnet-4-6"))
+        Self {
+            base: BaseProvider::new("anthropic", api_key, "claude-sonnet-4-6"),
+            cache_system_and_tools: DEFAULT_CACHE_SYSTEM_AND_TOOLS,
+        }
     }
 
-    fn endpoint(&self) -> String {
-        self.0.endpoint(
+    /// Turns the ephemeral `cache_control` breakpoint on the
+    /// system-and-tools prefix on or off. Defaults to on
+    /// ([`DEFAULT_CACHE_SYSTEM_AND_TOOLS`]).
+    pub fn with_prompt_cache(mut self, enabled: bool) -> Self {
+        self.cache_system_and_tools = enabled;
+        self
+    }
+
+    /// Whether this provider marks its system-and-tools prefix cacheable.
+    pub fn prompt_cache_enabled(&self) -> bool {
+        self.cache_system_and_tools
+    }
+
+    fn endpoint(&self) -> AgentResult<String> {
+        self.base.endpoint(
             ANTHROPIC_BASE_URL_ENV,
             ANTHROPIC_DEFAULT_BASE_URL,
             "/v1/messages",
+            true,
         )
     }
+}
+
+/// The ephemeral cache breakpoint Anthropic reads on the last element of the
+/// cacheable prefix.
+fn ephemeral_cache_control() -> serde_json::Value {
+    serde_json::json!({"type": "ephemeral"})
+}
+
+/// Builds the Anthropic Messages API request body for `request`.
+///
+/// Extracted from [`AnthropicProvider::chat`] so the exact wire JSON — in
+/// particular where the single `cache_control` breakpoint lands — is
+/// assertable without a network call.
+///
+/// **Prompt caching.** Anthropic's cacheable prefix is ordered `tools`, then
+/// `system`, then `messages`, and a breakpoint caches everything up to and
+/// including the element it sits on. So exactly one breakpoint, placed at the
+/// *end* of the system-and-tools prefix, caches the whole prefix:
+///
+/// - with a system prompt, `system` is rendered as a one-element block array
+///   and the breakpoint goes on that block, covering the tools before it;
+/// - with tools but no system prompt, the breakpoint goes on the last tool;
+/// - with neither, there is no prefix to cache and no breakpoint is emitted.
+///
+/// The breakpoint is never placed inside `messages`: the conversation grows
+/// (and, under a context budget, gets compacted) every round, so caching it
+/// would write a new entry per round for a prefix that rarely repeats.
+fn build_anthropic_body(
+    request: &ChatRequest,
+    cache_system_and_tools: bool,
+) -> AgentResult<serde_json::Value> {
+    let (system_msgs, non_system): (Vec<&Message>, Vec<&Message>) = request
+        .messages
+        .iter()
+        .partition(|m| m.role == Role::System);
+    let non_system: Vec<Message> = non_system.into_iter().cloned().collect();
+    let system = system_msgs.first().map(|m| m.content.clone());
+
+    let mut body = serde_json::json!({
+        "model": request.model,
+        "max_tokens": request.max_tokens.unwrap_or(4096),
+        "temperature": request.temperature,
+        "messages": format_messages_for(WireFormat::Anthropic, &non_system),
+    });
+
+    let mut tools = if request.tools.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_value(&request.tools)
+                .map_err(|e| AgentError::InvalidRequest(format!("failed to encode tools: {e}")))?,
+        )
+    };
+
+    match (system, cache_system_and_tools) {
+        (Some(sys), true) => {
+            body["system"] = serde_json::json!([{
+                "type": "text",
+                "text": sys,
+                "cache_control": ephemeral_cache_control(),
+            }]);
+        }
+        (Some(sys), false) => {
+            body["system"] = serde_json::Value::String(sys);
+        }
+        (None, true) => {
+            // No system prompt: the prefix ends at the last tool.
+            if let Some(serde_json::Value::Array(entries)) = tools.as_mut() {
+                if let Some(serde_json::Value::Object(last)) = entries.last_mut() {
+                    last.insert("cache_control".to_string(), ephemeral_cache_control());
+                }
+            }
+        }
+        (None, false) => {}
+    }
+
+    if let Some(tools) = tools {
+        body["tools"] = tools;
+    }
+
+    Ok(body)
+}
+
+/// Message used when a provider refuses without saying anything.
+const UNEXPLAINED_REFUSAL: &str = "the provider refused the request";
+
+/// Converts an Anthropic Messages API response into the provider-neutral
+/// [`ChatResponse`].
+///
+/// Extracted from [`AnthropicProvider::chat`] so the mapping — in particular
+/// the refusal arm — is assertable without a network call, mirroring
+/// [`openai_style_chat_response`].
+///
+/// **Refusals are errors, not empty replies (review round 3 follow-up).**
+/// Anthropic reports a declined completion as `stop_reason: "refusal"`, which
+/// previously fell into the catch-all `StopReason::Other` arm and was returned
+/// as an ordinary reply — typically with no text at all, so the loop committed
+/// an empty assistant message and reported success. This is the same defect
+/// fixed on the OpenAI path in review round 3, and it closes here on the same
+/// terms: [`AgentError::ProviderRefusal`], history untouched. `StopReason::
+/// Other` now means only what its name says — a stop reason this code does not
+/// recognize — and such a response still completes normally.
+fn anthropic_chat_response(resp: AnthropicResponse, provider: &str) -> AgentResult<ChatResponse> {
+    let content = resp
+        .content
+        .iter()
+        .filter(|c| c.block_type == "text")
+        .filter_map(|c| c.text.clone())
+        .collect::<Vec<_>>()
+        .join("");
+
+    if resp.stop_reason.as_deref() == Some("refusal") {
+        let message = if content.trim().is_empty() {
+            UNEXPLAINED_REFUSAL.to_string()
+        } else {
+            content
+        };
+        return Err(AgentError::ProviderRefusal {
+            provider: provider.to_string(),
+            message,
+        });
+    }
+
+    let tool_calls: Vec<ToolCall> = resp
+        .content
+        .iter()
+        .filter(|c| c.block_type == "tool_use")
+        .map(|c| ToolCall {
+            id: c.id.clone().unwrap_or_default(),
+            name: c.name.clone().unwrap_or_default(),
+            input: c.input.clone().unwrap_or(serde_json::Value::Null),
+        })
+        .collect();
+
+    // As on the OpenAI path, tool-use blocks make a tool-use turn whatever
+    // the stop reason says, except a token-limit stop, which may have cut
+    // them off.
+    let stop_reason = match resp.stop_reason.as_deref() {
+        // Both mean output was cut off, and tool blocks with it.
+        Some("max_tokens") | Some("model_context_window_exceeded") => StopReason::MaxTokens,
+        _ if !tool_calls.is_empty() => StopReason::ToolUse,
+        Some("tool_use") => StopReason::ToolUse,
+        Some("end_turn") | Some("stop_sequence") => StopReason::EndTurn,
+        _ => StopReason::Other,
+    };
+
+    Ok(ChatResponse {
+        content,
+        model: resp.model,
+        usage: Usage {
+            input_tokens: resp.usage.input_tokens,
+            output_tokens: resp.usage.output_tokens,
+        },
+        stop_reason,
+        tool_calls,
+    })
 }
 
 #[async_trait]
@@ -329,96 +991,25 @@ impl LlmProvider for AnthropicProvider {
     }
 
     fn default_model(&self) -> &str {
-        &self.0.default_model
+        &self.base.default_model
     }
 
     async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
-        self.0.check_api_key()?;
+        self.base.check_api_key()?;
 
-        let (system_msgs, non_system): (Vec<_>, Vec<_>) = request
-            .messages
-            .into_iter()
-            .partition(|m| m.role == Role::System);
+        let body = build_anthropic_body(&request, self.cache_system_and_tools)?;
 
-        let system = system_msgs.into_iter().next().map(|m| m.content);
-
-        let mut body = serde_json::json!({
-            "model": request.model,
-            "max_tokens": request.max_tokens.unwrap_or(4096),
-            "temperature": request.temperature,
-            "messages": format_anthropic_messages(&non_system),
-        });
-
-        if let Some(sys) = system {
-            body["system"] = serde_json::Value::String(sys);
-        }
-
-        if !request.tools.is_empty() {
-            body["tools"] = serde_json::to_value(&request.tools)
-                .map_err(|e| AgentError::InvalidRequest(format!("failed to encode tools: {e}")))?;
-        }
-
-        let response = bounded_request(self.0.http_client().post(self.endpoint()))
-            .header("x-api-key", self.0.api_key())
+        let http_request = self
+            .base
+            .http_client()?
+            .post(self.endpoint()?)
+            .header("x-api-key", self.base.api_key())
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
+            .json(&body);
+        let resp: AnthropicResponse = self.base.send_json(http_request).await?;
 
-        // Check status and get error details if failed
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                429 => AgentError::RateLimited,
-                401 => AgentError::Authentication(text),
-                _ => AgentError::ApiRequest(format!("{} - {}", status, text)),
-            });
-        }
-
-        let resp: AnthropicResponse = response
-            .json()
-            .await
-            .map_err(|e| AgentError::ApiResponse(e.to_string()))?;
-
-        let content = resp
-            .content
-            .iter()
-            .filter(|c| c.block_type == "text")
-            .filter_map(|c| c.text.clone())
-            .collect::<Vec<_>>()
-            .join("");
-
-        let tool_calls: Vec<ToolCall> = resp
-            .content
-            .iter()
-            .filter(|c| c.block_type == "tool_use")
-            .map(|c| ToolCall {
-                id: c.id.clone().unwrap_or_default(),
-                name: c.name.clone().unwrap_or_default(),
-                input: c.input.clone().unwrap_or(serde_json::Value::Null),
-            })
-            .collect();
-
-        let stop_reason = match resp.stop_reason.as_deref() {
-            Some("tool_use") => StopReason::ToolUse,
-            Some("max_tokens") => StopReason::MaxTokens,
-            Some("end_turn") | Some("stop_sequence") => StopReason::EndTurn,
-            _ => StopReason::Other,
-        };
-
-        Ok(ChatResponse {
-            content,
-            model: resp.model,
-            usage: Usage {
-                input_tokens: resp.usage.input_tokens,
-                output_tokens: resp.usage.output_tokens,
-            },
-            stop_reason,
-            tool_calls,
-        })
+        anthropic_chat_response(resp, self.name())
     }
 
     fn supported_models(&self) -> Vec<&str> {
@@ -437,30 +1028,284 @@ impl LlmProvider for AnthropicProvider {
 // OpenAI Provider
 // =============================================================================
 
+/// One OpenAI-style chat-completions response.
+///
+/// Shared by [`OpenAiProvider`] and [`MinimaxProvider`]: MiniMax's
+/// `chatcompletion_v2` endpoint returns the same envelope, minus a `model`
+/// field, which is why `model` is optional here and each provider supplies
+/// its own fallback.
 #[derive(Debug, Deserialize)]
-struct OpenAiResponse {
-    choices: Vec<OpenAiChoice>,
-    model: String,
-    usage: OpenAiUsage,
+struct OpenAiStyleResponse {
+    /// Absent or null on a failure (MiniMax sends `null` beside its
+    /// `base_resp`); a reply with no choice is an error, never an empty
+    /// answer.
+    #[serde(default)]
+    choices: Option<Vec<OpenAiStyleChoice>>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    usage: OpenAiStyleUsage,
+    /// MiniMax's status envelope. It reports failures (authentication,
+    /// rate limits, balance) here, often with HTTP 200; `status_code` 0 is
+    /// success. Read loosely (see [`minimax_status`]), since a success must
+    /// not fail on how a server spells it.
+    #[serde(default)]
+    base_resp: Option<serde_json::Value>,
+    /// An error some OpenAI-compatible servers put in a 200 reply. Read
+    /// loosely too (see [`reported_error`]).
+    #[serde(default)]
+    error: Option<serde_json::Value>,
+}
+
+/// The failure a MiniMax `base_resp` reports, if any: a nonzero
+/// `status_code`, given as a number or a numeric string. 1002 is its rate
+/// limit and 1004 an authentication failure; others keep their code.
+fn minimax_status(base: &serde_json::Value) -> Option<AgentError> {
+    let code = base.get("status_code").and_then(|code| {
+        code.as_i64()
+            .or_else(|| {
+                code.as_f64()
+                    .filter(|value| value.fract() == 0.0)
+                    .map(|value| value as i64)
+            })
+            .or_else(|| code.as_str().and_then(|text| text.trim().parse().ok()))
+    })?;
+    if code == 0 {
+        return None;
+    }
+    let message = quote(
+        base.get("status_msg")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no message"),
+        false,
+    );
+    Some(match code {
+        1002 => AgentError::RateLimited,
+        1004 => AgentError::Authentication(message),
+        code => AgentError::ApiRequest(format!("minimax status {code} - {message}")),
+    })
+}
+
+/// The message of an `error` a reply carries, if it carries one: a
+/// non-empty string, `true`, a non-empty list, or an object with a
+/// non-empty field (its `message` when that is a non-empty string). Null,
+/// `false`, `""`, `[]`, and objects whose fields are all null or empty are
+/// no error.
+fn reported_error(error: &serde_json::Value) -> Option<String> {
+    let is_empty = |value: &serde_json::Value| match value {
+        serde_json::Value::Null | serde_json::Value::Bool(false) => true,
+        serde_json::Value::String(text) => text.trim().is_empty(),
+        serde_json::Value::Array(items) => items.is_empty(),
+        serde_json::Value::Object(fields) => fields.is_empty(),
+        _ => false,
+    };
+    match error {
+        serde_json::Value::Object(fields) => {
+            if fields.values().all(is_empty) {
+                return None;
+            }
+            let message = fields
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .filter(|message| !message.trim().is_empty());
+            Some(quote(
+                &message.map_or_else(|| error.to_string(), str::to_string),
+                false,
+            ))
+        }
+        serde_json::Value::String(text) if !is_empty(error) => Some(quote(text, false)),
+        other if !is_empty(other) => Some(quote(&other.to_string(), false)),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
-struct OpenAiChoice {
-    message: OpenAiMessage,
+struct OpenAiStyleChoice {
+    message: OpenAiStyleMessage,
+    /// `"stop"`, `"tool_calls"`, `"length"`, ... Absent on some MiniMax
+    /// responses, hence `Option`.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct OpenAiMessage {
-    content: String,
+struct OpenAiStyleMessage {
+    /// Null on a pure tool-call turn, and on a refusal, hence `Option`.
+    #[serde(default)]
+    content: Option<String>,
+    /// The model's own refusal text. Present (with `content` null) when the
+    /// model declines to answer; see [`AgentError::ProviderRefusal`].
+    #[serde(default)]
+    refusal: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAiStyleToolCall>,
 }
 
 #[derive(Debug, Deserialize)]
-struct OpenAiUsage {
+struct OpenAiStyleToolCall {
+    #[serde(default)]
+    id: String,
+    function: OpenAiStyleFunction,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiStyleFunction {
+    #[serde(default)]
+    name: String,
+    /// A JSON *string* holding the call's arguments object, not an object.
+    #[serde(default)]
+    arguments: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAiStyleUsage {
+    #[serde(default)]
     prompt_tokens: u32,
+    #[serde(default)]
     completion_tokens: u32,
-    // dead_code: deserialized from OpenAI API response; kept for future cost-tracking and diagnostic use
-    #[allow(dead_code)]
-    total_tokens: u32,
+}
+
+/// Builds the request body for an OpenAI-style chat-completions endpoint.
+///
+/// `default_max_tokens` preserves the two providers' existing difference:
+/// OpenAI passes `None` and omits `max_tokens` unless the request set one,
+/// while MiniMax passes a fallback because its endpoint expects the field.
+///
+/// Extracted from the providers so the wire JSON — the `tools` envelope and
+/// the `role: "tool"` messages in particular — is assertable without a
+/// network call.
+fn build_openai_style_body(
+    request: &ChatRequest,
+    default_max_tokens: Option<u32>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": request.model,
+        "messages": format_messages_for(WireFormat::OpenAi, &request.messages),
+        "temperature": request.temperature,
+    });
+    if let Some(max_tokens) = request.max_tokens.or(default_max_tokens) {
+        body["max_tokens"] = serde_json::json!(max_tokens);
+    }
+    if !request.tools.is_empty() {
+        body["tools"] = openai_tools_value(&request.tools);
+    }
+    body
+}
+
+/// Converts an OpenAI-style response into the provider-neutral
+/// [`ChatResponse`], including any `tool_calls` the model requested.
+///
+/// `fallback_model` is used when the response omits `model` (MiniMax).
+/// A `function.arguments` payload that is not valid JSON is a malformed
+/// response, not an empty call: it fails with [`AgentError::ApiResponse`]
+/// rather than being silently turned into an empty input object that the
+/// tool would then execute with.
+///
+/// **Refusals are errors, not empty replies (review round 3).** A model that
+/// declines to answer sends `message.content: null` with the explanation in
+/// `message.refusal`; a filtered completion reports
+/// `finish_reason: "content_filter"`. Both used to fall through
+/// `unwrap_or_default()` into an empty-string reply that the loop committed as
+/// a successful turn, so the user saw a blank answer and nothing said the model
+/// had refused. Both now return [`AgentError::ProviderRefusal`], leaving
+/// history untouched like every other error path.
+fn openai_style_chat_response(
+    resp: OpenAiStyleResponse,
+    provider: &str,
+    fallback_model: &str,
+) -> AgentResult<ChatResponse> {
+    if let Some(failure) = resp.base_resp.as_ref().and_then(minimax_status) {
+        return Err(failure);
+    }
+    if let Some(message) = resp.error.as_ref().and_then(reported_error) {
+        return Err(AgentError::ApiResponse(format!(
+            "{provider} returned an error: {message}"
+        )));
+    }
+    let choices = resp.choices.unwrap_or_default();
+    let Some(choice) = choices.first() else {
+        return Err(AgentError::ApiResponse(format!(
+            "{provider} returned no choices"
+        )));
+    };
+    let choice = Some(choice);
+    let content = choice
+        .and_then(|c| c.message.content.clone())
+        .unwrap_or_default();
+
+    // A structured refusal is unambiguous: the model said why it will not
+    // answer, and that text is the outcome.
+    if let Some(refusal) = choice
+        .and_then(|c| c.message.refusal.as_deref())
+        .map(str::trim)
+        .filter(|refusal| !refusal.is_empty())
+    {
+        return Err(AgentError::ProviderRefusal {
+            provider: provider.to_string(),
+            message: refusal.to_string(),
+        });
+    }
+
+    // A filtered completion is also a refusal, whether or not any partial text
+    // survived it: returning that text as an ordinary reply would present a
+    // blocked completion as a finished answer.
+    if choice.and_then(|c| c.finish_reason.as_deref()) == Some("content_filter") {
+        let message = if content.trim().is_empty() {
+            "the provider filtered this completion".to_string()
+        } else {
+            content
+        };
+        debug_assert!(!message.is_empty(), "a refusal always carries a reason");
+        return Err(AgentError::ProviderRefusal {
+            provider: provider.to_string(),
+            message,
+        });
+    }
+
+    let mut tool_calls = Vec::new();
+    if let Some(choice) = choice {
+        for call in &choice.message.tool_calls {
+            let input = if call.function.arguments.trim().is_empty() {
+                serde_json::Value::Object(serde_json::Map::new())
+            } else {
+                serde_json::from_str(&call.function.arguments).map_err(|e| {
+                    AgentError::ApiResponse(format!(
+                        "tool call '{:.80}' carried arguments that are not valid JSON: {e}",
+                        call.function.name
+                    ))
+                })?
+            };
+            tool_calls.push(ToolCall {
+                id: call.id.clone(),
+                name: call.function.name.clone(),
+                input,
+            });
+        }
+    }
+
+    // A response that carries tool calls is a tool-use turn whatever
+    // `finish_reason` says (some servers send "stop" with calls): the calls
+    // themselves are the signal the loop acts on, and `StopReason::ToolUse`
+    // is what pairs with them. Only a token-limit stop outranks them, since
+    // its calls may be cut off; the loop refuses to run those.
+    let stop_reason = match choice.and_then(|c| c.finish_reason.as_deref()) {
+        Some("length") | Some("max_tokens") => StopReason::MaxTokens,
+        _ if !tool_calls.is_empty() => StopReason::ToolUse,
+        Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
+        Some("stop") | None => StopReason::EndTurn,
+        Some(_) => StopReason::Other,
+    };
+
+    Ok(ChatResponse {
+        content,
+        model: resp.model.unwrap_or_else(|| fallback_model.to_string()),
+        usage: Usage {
+            input_tokens: resp.usage.prompt_tokens,
+            output_tokens: resp.usage.completion_tokens,
+        },
+        stop_reason,
+        tool_calls,
+    })
 }
 
 pub struct OpenAiProvider(BaseProvider);
@@ -470,11 +1315,12 @@ impl OpenAiProvider {
         Self(BaseProvider::new("openai", api_key, "gpt-4o"))
     }
 
-    fn endpoint(&self) -> String {
+    fn endpoint(&self) -> AgentResult<String> {
         self.0.endpoint(
             OPENAI_BASE_URL_ENV,
             OPENAI_DEFAULT_BASE_URL,
             "/v1/chat/completions",
+            false,
         )
     }
 }
@@ -492,57 +1338,18 @@ impl LlmProvider for OpenAiProvider {
     async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
         self.0.check_api_key()?;
 
-        let messages = BaseProvider::format_messages(&request.messages);
-        let mut body = serde_json::json!({
-            "model": request.model,
-            "messages": messages,
-            "temperature": request.temperature,
-        });
+        let body = build_openai_style_body(&request, None);
 
-        if let Some(max_tokens) = request.max_tokens {
-            body["max_tokens"] = serde_json::json!(max_tokens);
-        }
-
-        let response = bounded_request(self.0.http_client().post(self.endpoint()))
+        let http_request = self
+            .0
+            .http_client()?
+            .post(self.endpoint()?)
             .header("Authorization", format!("Bearer {}", self.0.api_key()))
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
+            .json(&body);
+        let resp: OpenAiStyleResponse = self.0.send_json(http_request).await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                429 => AgentError::RateLimited,
-                401 => AgentError::Authentication(text),
-                _ => AgentError::ApiRequest(format!("{} - {}", status, text)),
-            });
-        }
-
-        let resp: OpenAiResponse = response
-            .json()
-            .await
-            .map_err(|e| AgentError::ApiResponse(e.to_string()))?;
-
-        let content = resp
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default();
-
-        Ok(ChatResponse {
-            content,
-            model: resp.model,
-            usage: Usage {
-                input_tokens: resp.usage.prompt_tokens,
-                output_tokens: resp.usage.completion_tokens,
-            },
-            // OpenAI tool-calling isn't wired up yet -- always a plain reply.
-            stop_reason: StopReason::EndTurn,
-            tool_calls: Vec::new(),
-        })
+        openai_style_chat_response(resp, self.name(), &request.model)
     }
 
     fn supported_models(&self) -> Vec<&str> {
@@ -560,30 +1367,12 @@ impl LlmProvider for OpenAiProvider {
 // Minimax Provider
 // =============================================================================
 
-#[derive(Debug, Deserialize)]
-struct MinimaxResponse {
-    choices: Vec<MinimaxChoice>,
-    usage: MinimaxUsage,
-}
-
-#[derive(Debug, Deserialize)]
-struct MinimaxChoice {
-    message: MinimaxMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct MinimaxMessage {
-    content: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct MinimaxUsage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    // dead_code: deserialized from Minimax API response; kept for future cost-tracking and diagnostic use
-    #[allow(dead_code)]
-    total_tokens: u32,
-}
+// MiniMax's `chatcompletion_v2` endpoint is OpenAI-shaped on both the
+// request and the response side, so it reuses `build_openai_style_body`,
+// `OpenAiStyleResponse`, and `openai_style_chat_response` rather than
+// carrying a second near-identical set of structs. The only two differences
+// are handled by parameters: MiniMax wants `max_tokens` always present, and
+// its response omits `model`.
 
 pub struct MinimaxProvider(BaseProvider);
 
@@ -592,11 +1381,12 @@ impl MinimaxProvider {
         Self(BaseProvider::new("minimax", api_key, "abab6.5s-chat"))
     }
 
-    fn endpoint(&self) -> String {
+    fn endpoint(&self) -> AgentResult<String> {
         self.0.endpoint(
             MINIMAX_BASE_URL_ENV,
             MINIMAX_DEFAULT_BASE_URL,
             "/v1/text/chatcompletion_v2",
+            false,
         )
     }
 }
@@ -614,54 +1404,18 @@ impl LlmProvider for MinimaxProvider {
     async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
         self.0.check_api_key()?;
 
-        let messages = BaseProvider::format_messages(&request.messages);
-        let body = serde_json::json!({
-            "model": request.model,
-            "messages": messages,
-            "temperature": request.temperature,
-            "max_tokens": request.max_tokens.unwrap_or(4096),
-        });
+        let body = build_openai_style_body(&request, Some(MINIMAX_DEFAULT_MAX_TOKENS));
 
-        let response = bounded_request(self.0.http_client().post(self.endpoint()))
+        let http_request = self
+            .0
+            .http_client()?
+            .post(self.endpoint()?)
             .header("Authorization", format!("Bearer {}", self.0.api_key()))
             .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| AgentError::ApiRequest(e.to_string()))?;
+            .json(&body);
+        let resp: OpenAiStyleResponse = self.0.send_json(http_request).await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(match status.as_u16() {
-                429 => AgentError::RateLimited,
-                401 => AgentError::Authentication(text),
-                _ => AgentError::ApiRequest(format!("{} - {}", status, text)),
-            });
-        }
-
-        let resp: MinimaxResponse = response
-            .json()
-            .await
-            .map_err(|e| AgentError::ApiResponse(e.to_string()))?;
-
-        let content = resp
-            .choices
-            .first()
-            .map(|c| c.message.content.clone())
-            .unwrap_or_default();
-
-        Ok(ChatResponse {
-            content,
-            model: request.model,
-            usage: Usage {
-                input_tokens: resp.usage.prompt_tokens,
-                output_tokens: resp.usage.completion_tokens,
-            },
-            // Minimax tool-calling isn't wired up yet -- always a plain reply.
-            stop_reason: StopReason::EndTurn,
-            tool_calls: Vec::new(),
-        })
+        openai_style_chat_response(resp, self.name(), &request.model)
     }
 
     fn supported_models(&self) -> Vec<&str> {
@@ -723,18 +1477,556 @@ mod tests {
     }
 
     #[test]
-    fn test_format_messages() {
+    fn test_format_messages_for_openai_keeps_plain_text_pairs() {
         let messages = vec![
             Message::text(Role::System, "You are helpful"),
             Message::text(Role::User, "Hello"),
         ];
 
-        let formatted = BaseProvider::format_messages(&messages);
+        let formatted = format_messages_for(WireFormat::OpenAi, &messages);
         assert_eq!(formatted.len(), 2);
         assert_eq!(formatted[0]["role"], "system");
         assert_eq!(formatted[0]["content"], "You are helpful");
         assert_eq!(formatted[1]["role"], "user");
         assert_eq!(formatted[1]["content"], "Hello");
+    }
+
+    // ---------------------------------------------------------------
+    // Provider-neutral tool calls (Stage 1b-A)
+    // ---------------------------------------------------------------
+
+    use super::super::{ToolDefinition, ToolResult};
+
+    /// One assistant `tool_use` message followed by its matching
+    /// `tool_result` -- the pair every provider formatter has to carry
+    /// through intact, since a call without its result (or the reverse) is
+    /// rejected or misread by both APIs.
+    fn tool_use_pair() -> Vec<Message> {
+        vec![
+            Message::text(Role::User, "read the file"),
+            Message::assistant_tool_use(
+                "let me look",
+                vec![ToolCall {
+                    id: "call_abc".to_string(),
+                    name: "file_read".to_string(),
+                    input: serde_json::json!({"path": "README.md"}),
+                }],
+            ),
+            Message::tool_results(vec![ToolResult {
+                tool_use_id: "call_abc".to_string(),
+                content: "# Title".to_string(),
+                is_error: false,
+            }]),
+        ]
+    }
+
+    fn sample_tools() -> Vec<ToolDefinition> {
+        vec![
+            ToolDefinition {
+                name: "file_read".to_string(),
+                description: "Read a file".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "bash_exec".to_string(),
+                description: "Run a command".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            },
+        ]
+    }
+
+    fn sample_request(messages: Vec<Message>, tools: Vec<ToolDefinition>) -> ChatRequest {
+        ChatRequest {
+            model: "test-model".to_string(),
+            messages,
+            temperature: 0.7,
+            max_tokens: Some(1024),
+            tools,
+        }
+    }
+
+    #[test]
+    fn test_anthropic_formatter_keeps_the_tool_use_result_pair() {
+        let wire = format_messages_for(WireFormat::Anthropic, &tool_use_pair());
+        let rendered = serde_json::to_string(&wire).unwrap();
+        assert!(rendered.contains("\"tool_use\""), "got: {rendered}");
+        assert!(rendered.contains("\"tool_result\""), "got: {rendered}");
+        assert_eq!(rendered.matches("call_abc").count(), 2, "got: {rendered}");
+        assert!(rendered.contains("file_read"), "got: {rendered}");
+    }
+
+    #[test]
+    fn test_openai_formatter_keeps_the_tool_use_result_pair() {
+        let wire = format_messages_for(WireFormat::OpenAi, &tool_use_pair());
+        let rendered = serde_json::to_string(&wire).unwrap();
+        // The call survives as an assistant `tool_calls` entry...
+        assert_eq!(wire[1]["role"], "assistant");
+        assert_eq!(wire[1]["tool_calls"][0]["id"], "call_abc");
+        assert_eq!(wire[1]["tool_calls"][0]["type"], "function");
+        assert_eq!(wire[1]["tool_calls"][0]["function"]["name"], "file_read");
+        // ...with its input re-encoded as the JSON string OpenAI expects.
+        let args = wire[1]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments must be a JSON string");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(args).unwrap(),
+            serde_json::json!({"path": "README.md"})
+        );
+        // ...and the result survives as its own `role: "tool"` message.
+        assert_eq!(wire[2]["role"], "tool");
+        assert_eq!(wire[2]["tool_call_id"], "call_abc");
+        assert_eq!(wire[2]["content"], "# Title");
+        assert_eq!(rendered.matches("call_abc").count(), 2, "got: {rendered}");
+    }
+
+    #[test]
+    fn test_openai_formatter_emits_one_tool_message_per_result() {
+        let messages = vec![Message::tool_results(vec![
+            ToolResult {
+                tool_use_id: "a".to_string(),
+                content: "first".to_string(),
+                is_error: false,
+            },
+            ToolResult {
+                tool_use_id: "b".to_string(),
+                content: "second".to_string(),
+                is_error: true,
+            },
+        ])];
+        let wire = format_messages_for(WireFormat::OpenAi, &messages);
+        assert_eq!(wire.len(), 2, "one wire message per result");
+        assert_eq!(wire[0]["tool_call_id"], "a");
+        assert_eq!(wire[1]["tool_call_id"], "b");
+        // `is_error` has no OpenAI counterpart: the text is sent verbatim.
+        assert_eq!(wire[1]["content"], "second");
+    }
+
+    #[test]
+    fn test_openai_formatter_keeps_prose_that_rides_with_tool_results() {
+        let mut message = Message::tool_results(vec![ToolResult {
+            tool_use_id: "a".to_string(),
+            content: "done".to_string(),
+            is_error: false,
+        }]);
+        message.content = "also, note this".to_string();
+        let wire = format_messages_for(WireFormat::OpenAi, &[message]);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[1]["content"], "also, note this");
+    }
+
+    #[test]
+    fn test_openai_body_renders_tools_as_function_schemas() {
+        let body = build_openai_style_body(&sample_request(tool_use_pair(), sample_tools()), None);
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["function"]["name"], "file_read");
+        assert_eq!(tools[0]["function"]["description"], "Read a file");
+        assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn test_openai_body_omits_tools_when_none_are_offered() {
+        let body = build_openai_style_body(&sample_request(tool_use_pair(), Vec::new()), None);
+        assert!(body.get("tools").is_none(), "got: {body}");
+    }
+
+    #[test]
+    fn test_openai_body_omits_max_tokens_but_minimax_supplies_a_default() {
+        let mut request = sample_request(tool_use_pair(), Vec::new());
+        request.max_tokens = None;
+        assert!(build_openai_style_body(&request, None)
+            .get("max_tokens")
+            .is_none());
+        assert_eq!(
+            build_openai_style_body(&request, Some(MINIMAX_DEFAULT_MAX_TOKENS))["max_tokens"],
+            MINIMAX_DEFAULT_MAX_TOKENS
+        );
+    }
+
+    #[test]
+    fn test_openai_style_response_parses_tool_calls_and_stop_reason() {
+        let raw = serde_json::json!({
+            "model": "gpt-4o",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "file_read", "arguments": "{\"path\":\"a.txt\"}"}
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 3}
+        });
+        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+        let parsed = openai_style_chat_response(resp, "openai", "fallback-model").unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::ToolUse);
+        assert_eq!(parsed.model, "gpt-4o");
+        assert_eq!(parsed.content, "");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "call_1");
+        assert_eq!(parsed.tool_calls[0].name, "file_read");
+        assert_eq!(
+            parsed.tool_calls[0].input,
+            serde_json::json!({"path": "a.txt"})
+        );
+        assert_eq!(parsed.usage.input_tokens, 11);
+        assert_eq!(parsed.usage.output_tokens, 3);
+    }
+
+    #[test]
+    fn test_openai_style_response_falls_back_to_the_request_model() {
+        // MiniMax omits `model` from its response envelope.
+        let raw = serde_json::json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "hi"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        });
+        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+        let parsed = openai_style_chat_response(resp, "openai", "abab6.5s-chat").unwrap();
+        assert_eq!(parsed.model, "abab6.5s-chat");
+        assert_eq!(parsed.content, "hi");
+        assert_eq!(parsed.stop_reason, StopReason::EndTurn);
+        assert!(parsed.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_openai_style_response_infers_tool_use_without_a_finish_reason() {
+        let raw = serde_json::json!({
+            "choices": [{"message": {"tool_calls": [{
+                "id": "c", "function": {"name": "t", "arguments": ""}
+            }]}}],
+            "usage": {}
+        });
+        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+        let parsed = openai_style_chat_response(resp, "openai", "m").unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::ToolUse);
+        // Empty arguments mean "no input", not malformed input.
+        assert_eq!(parsed.tool_calls[0].input, serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_openai_style_response_maps_length_to_max_tokens() {
+        let raw = serde_json::json!({
+            "choices": [{"finish_reason": "length", "message": {"content": "cut"}}],
+            "usage": {}
+        });
+        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+        assert_eq!(
+            openai_style_chat_response(resp, "openai", "m")
+                .unwrap()
+                .stop_reason,
+            StopReason::MaxTokens
+        );
+    }
+
+    #[test]
+    fn test_openai_style_response_maps_an_unknown_reason_to_other() {
+        // A reason this code does not know is `Other` -- not an error. Only
+        // the refusal shapes below are errors.
+        let raw = serde_json::json!({
+            "choices": [{"finish_reason": "some_future_reason", "message": {"content": "partial"}}],
+            "usage": {}
+        });
+        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+        let parsed = openai_style_chat_response(resp, "openai", "m").unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::Other);
+        assert_eq!(parsed.content, "partial");
+    }
+
+    #[test]
+    fn test_openai_style_response_surfaces_a_structured_refusal_as_an_error() {
+        // Review round 3: `content` is null and the explanation lives in
+        // `refusal`. This used to become an empty-string reply that the loop
+        // committed as a successful turn -- a blank answer with nothing
+        // saying the model had refused.
+        let raw = serde_json::json!({
+            "model": "gpt-4o",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": null, "refusal": "I can't help with that request."}
+            }],
+            "usage": {"prompt_tokens": 9, "completion_tokens": 0}
+        });
+        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+        let err = openai_style_chat_response(resp, "openai", "m")
+            .expect_err("a refusal must not be a successful empty reply");
+        match err {
+            AgentError::ProviderRefusal {
+                ref provider,
+                ref message,
+            } => {
+                assert_eq!(provider, "openai");
+                assert_eq!(message, "I can't help with that request.");
+            }
+            other => panic!("expected ProviderRefusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_openai_style_response_surfaces_a_content_filter_as_an_error() {
+        let raw = serde_json::json!({
+            "choices": [{"finish_reason": "content_filter", "message": {"content": null}}],
+            "usage": {}
+        });
+        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+        let err = openai_style_chat_response(resp, "minimax", "m")
+            .expect_err("a filtered completion must not be a successful empty reply");
+        match err {
+            AgentError::ProviderRefusal {
+                ref provider,
+                ref message,
+            } => {
+                assert_eq!(provider, "minimax");
+                assert!(message.contains("filtered"), "got: {message}");
+            }
+            other => panic!("expected ProviderRefusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_openai_style_response_content_filter_keeps_any_partial_text_in_the_error() {
+        // A filtered completion is a refusal whether or not partial text
+        // survived it: returning that text as an ordinary reply would present
+        // a blocked completion as a finished answer.
+        let raw = serde_json::json!({
+            "choices": [{
+                "finish_reason": "content_filter",
+                "message": {"content": "here is how to"}
+            }],
+            "usage": {}
+        });
+        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+        let err = openai_style_chat_response(resp, "openai", "m")
+            .expect_err("a filtered completion is never a success");
+        assert!(format!("{err}").contains("here is how to"), "got: {err}");
+    }
+
+    #[test]
+    fn test_openai_style_response_ignores_an_empty_refusal_field() {
+        // Many ordinary replies carry `refusal: null`, and some carry an
+        // empty string; neither is a refusal.
+        for refusal in [serde_json::Value::Null, serde_json::json!("   ")] {
+            let raw = serde_json::json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": "a real answer", "refusal": refusal}
+                }],
+                "usage": {}
+            });
+            let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+            let parsed = openai_style_chat_response(resp, "openai", "m")
+                .expect("an ordinary reply must not be mistaken for a refusal");
+            assert_eq!(parsed.content, "a real answer");
+        }
+    }
+
+    #[test]
+    fn test_openai_style_response_rejects_unparseable_tool_arguments() {
+        let raw = serde_json::json!({
+            "choices": [{"finish_reason": "tool_calls", "message": {"tool_calls": [{
+                "id": "c", "function": {"name": "bash_exec", "arguments": "{not json"}
+            }]}}],
+            "usage": {}
+        });
+        let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+        let err = openai_style_chat_response(resp, "openai", "m").unwrap_err();
+        assert!(
+            matches!(err, AgentError::ApiResponse(_)),
+            "expected ApiResponse, got: {err:?}"
+        );
+        assert!(format!("{err}").contains("bash_exec"), "got: {err}");
+    }
+
+    /// Review finding: a reply with no choice (an empty, missing or null
+    /// list) came back as a successful empty answer.
+    #[test]
+    fn test_openai_style_response_with_no_choices_is_an_error() {
+        for raw in [
+            serde_json::json!({"choices": [], "usage": {}}),
+            serde_json::json!({"usage": {}}),
+            serde_json::json!({"choices": null}),
+        ] {
+            let resp: OpenAiStyleResponse = serde_json::from_value(raw.clone()).unwrap();
+            let err = openai_style_chat_response(resp, "openai", "m").unwrap_err();
+            assert!(
+                format!("{err}").contains("no choices"),
+                "{raw}: got {err:?}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Anthropic refusals (review round 3 follow-up)
+    // ---------------------------------------------------------------
+
+    fn anthropic_response(stop_reason: &str, text: &str) -> AnthropicResponse {
+        let content = if text.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{"type": "text", "text": text}])
+        };
+        serde_json::from_value(serde_json::json!({
+            "id": "msg_1",
+            "model": "claude-sonnet-4-6",
+            "stop_reason": stop_reason,
+            "content": content,
+            "usage": {"input_tokens": 3, "output_tokens": 0}
+        }))
+        .expect("the fixture is a valid Anthropic response")
+    }
+
+    #[test]
+    fn test_anthropic_refusal_with_text_surfaces_the_models_words() {
+        let resp = anthropic_response("refusal", "I won't help with that.");
+        let err = anthropic_chat_response(resp, "anthropic")
+            .expect_err("a refusal must not be a successful reply");
+        match err {
+            AgentError::ProviderRefusal {
+                ref provider,
+                ref message,
+            } => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(message, "I won't help with that.");
+            }
+            other => panic!("expected ProviderRefusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_refusal_without_text_falls_back_to_a_fixed_reason() {
+        // The empty-content case is the one that used to commit an empty
+        // assistant message and report success.
+        let resp = anthropic_response("refusal", "");
+        let err = anthropic_chat_response(resp, "anthropic")
+            .expect_err("a refusal must not be a successful empty reply");
+        match err {
+            AgentError::ProviderRefusal {
+                ref provider,
+                ref message,
+            } => {
+                assert_eq!(provider, "anthropic");
+                assert_eq!(message, UNEXPLAINED_REFUSAL);
+                assert!(!message.is_empty());
+            }
+            other => panic!("expected ProviderRefusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_anthropic_unknown_stop_reason_with_text_still_completes() {
+        // `Other` now means only what its name says. A stop reason this code
+        // does not recognize is not a refusal and must still return the
+        // model's answer.
+        let resp = anthropic_response("some_future_reason", "still an answer");
+        let parsed = anthropic_chat_response(resp, "anthropic")
+            .expect("an unknown stop reason is not an error");
+        assert_eq!(parsed.stop_reason, StopReason::Other);
+        assert_eq!(parsed.content, "still an answer");
+        assert_eq!(parsed.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn test_anthropic_known_stop_reasons_map_as_before() {
+        for (raw, expected) in [
+            ("end_turn", StopReason::EndTurn),
+            ("stop_sequence", StopReason::EndTurn),
+            ("max_tokens", StopReason::MaxTokens),
+            ("tool_use", StopReason::ToolUse),
+        ] {
+            let parsed = anthropic_chat_response(anthropic_response(raw, "hi"), "anthropic")
+                .unwrap_or_else(|err| panic!("{raw} must not error: {err}"));
+            assert_eq!(parsed.stop_reason, expected, "for {raw}");
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Anthropic prompt-cache breakpoint (Stage 1b-A)
+    // ---------------------------------------------------------------
+
+    fn cache_control_count(body: &serde_json::Value) -> usize {
+        serde_json::to_string(body)
+            .unwrap()
+            .matches("cache_control")
+            .count()
+    }
+
+    #[test]
+    fn test_anthropic_body_caches_the_prefix_exactly_once_at_the_system_block() {
+        let mut messages = vec![Message::text(Role::System, "You are Ion")];
+        messages.extend(tool_use_pair());
+        let body = build_anthropic_body(&sample_request(messages, sample_tools()), true).unwrap();
+
+        assert_eq!(
+            cache_control_count(&body),
+            1,
+            "exactly one breakpoint per request: {body}"
+        );
+        // System is the last element of the tools-then-system prefix, so the
+        // breakpoint sits there and covers the tools before it.
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["text"], "You are Ion");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            body["tools"][1].get("cache_control").is_none(),
+            "tools must not carry a second breakpoint: {body}"
+        );
+        // Never inside the conversation, which changes every round.
+        assert!(
+            !serde_json::to_string(&body["messages"])
+                .unwrap()
+                .contains("cache_control"),
+            "got: {body}"
+        );
+    }
+
+    #[test]
+    fn test_anthropic_body_caches_the_last_tool_when_there_is_no_system_prompt() {
+        let body =
+            build_anthropic_body(&sample_request(tool_use_pair(), sample_tools()), true).unwrap();
+        assert_eq!(cache_control_count(&body), 1, "got: {body}");
+        assert!(body.get("system").is_none());
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["tools"][1]["name"], "bash_exec");
+    }
+
+    #[test]
+    fn test_anthropic_body_emits_no_breakpoint_without_a_prefix() {
+        let body =
+            build_anthropic_body(&sample_request(tool_use_pair(), Vec::new()), true).unwrap();
+        assert_eq!(cache_control_count(&body), 0, "got: {body}");
+    }
+
+    #[test]
+    fn test_anthropic_body_omits_the_breakpoint_when_caching_is_disabled() {
+        let mut messages = vec![Message::text(Role::System, "You are Ion")];
+        messages.extend(tool_use_pair());
+        let body = build_anthropic_body(&sample_request(messages, sample_tools()), false).unwrap();
+        assert_eq!(cache_control_count(&body), 0, "got: {body}");
+        // System falls back to the plain string form.
+        assert_eq!(body["system"], "You are Ion");
+        assert_eq!(body["tools"][0]["name"], "file_read");
+    }
+
+    #[test]
+    fn test_anthropic_body_keeps_the_tool_use_pair_and_request_fields() {
+        let body =
+            build_anthropic_body(&sample_request(tool_use_pair(), Vec::new()), true).unwrap();
+        assert_eq!(body["model"], "test-model");
+        assert_eq!(body["max_tokens"], 1024);
+        let messages = serde_json::to_string(&body["messages"]).unwrap();
+        assert!(messages.contains("tool_use"), "got: {messages}");
+        assert!(messages.contains("tool_result"), "got: {messages}");
+    }
+
+    #[test]
+    fn test_anthropic_provider_enables_the_prompt_cache_by_default() {
+        let provider = AnthropicProvider::new("k".to_string());
+        assert!(provider.prompt_cache_enabled());
+        assert!(!provider.with_prompt_cache(false).prompt_cache_enabled());
     }
 
     #[test]
@@ -759,14 +2051,14 @@ mod tests {
     /// against the ones asserting the unset-env defaults.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]
     fn test_select_base_url_falls_back_to_default_when_nothing_set() {
         assert_eq!(
-            select_base_url(None, None, "https://api.anthropic.com"),
+            select_base_url(None, None, "https://api.anthropic.com").unwrap(),
             "https://api.anthropic.com"
         );
     }
@@ -778,7 +2070,8 @@ mod tests {
                 None,
                 Some("http://127.0.0.1:8080"),
                 "https://api.anthropic.com"
-            ),
+            )
+            .unwrap(),
             "http://127.0.0.1:8080"
         );
     }
@@ -790,7 +2083,8 @@ mod tests {
                 Some("http://explicit.test"),
                 Some("http://from-env.test"),
                 "https://api.anthropic.com"
-            ),
+            )
+            .unwrap(),
             "http://explicit.test"
         );
     }
@@ -798,16 +2092,16 @@ mod tests {
     #[test]
     fn test_select_base_url_blank_override_falls_back_to_default() {
         assert_eq!(
-            select_base_url(Some("   "), Some(""), "https://api.anthropic.com"),
+            select_base_url(Some("   "), Some(""), "https://api.anthropic.com").unwrap(),
             "https://api.anthropic.com"
         );
     }
 
     #[test]
-    fn test_select_base_url_override_without_http_scheme_falls_back_to_default() {
+    fn test_select_base_url_override_without_http_scheme_is_refused() {
         assert_eq!(
             select_base_url(None, Some("api.anthropic.com"), "https://api.anthropic.com"),
-            "https://api.anthropic.com"
+            Err((OverrideSource::Environment, "it is not an absolute URL"))
         );
     }
 
@@ -818,7 +2112,8 @@ mod tests {
                 None,
                 Some("http://127.0.0.1:8080/"),
                 "https://api.anthropic.com"
-            ),
+            )
+            .unwrap(),
             "http://127.0.0.1:8080"
         );
     }
@@ -869,7 +2164,9 @@ mod tests {
         let var = "IMPULSE_TEST_PROVIDER_BASE_URL";
         std::env::set_var(var, "http://127.0.0.1:9999");
         let provider = BaseProvider::new("test", "api_key".to_string(), "gpt-4");
-        let url = provider.endpoint(var, "https://api.example.com", "/v1/messages");
+        let url = provider
+            .endpoint(var, "https://api.example.com", "/v1/messages", true)
+            .unwrap();
         std::env::remove_var(var);
         assert_eq!(url, "http://127.0.0.1:9999/v1/messages");
     }
@@ -881,9 +2178,24 @@ mod tests {
         std::env::set_var(var, "http://from-env.test");
         let provider = BaseProvider::new("test", "api_key".to_string(), "gpt-4")
             .with_base_url("http://explicit.test");
-        let url = provider.endpoint(var, "https://api.example.com", "/v1/messages");
+        let url = provider
+            .endpoint(var, "https://api.example.com", "/v1/messages", true)
+            .unwrap();
         std::env::remove_var(var);
         assert_eq!(url, "http://explicit.test/v1/messages");
+    }
+
+    #[cfg(feature = "photon-subagent")]
+    #[test]
+    fn test_anthropic_api_origin_follows_env_and_rejects_schemeless_override() {
+        let _guard = env_guard();
+        std::env::remove_var(ANTHROPIC_BASE_URL_ENV);
+        assert_eq!(anthropic_api_origin(), "https://api.anthropic.com");
+        std::env::set_var(ANTHROPIC_BASE_URL_ENV, "http://127.0.0.1:4010/");
+        assert_eq!(anthropic_api_origin(), "http://127.0.0.1:4010");
+        std::env::set_var(ANTHROPIC_BASE_URL_ENV, "api.anthropic.test");
+        assert_eq!(anthropic_api_origin(), "https://api.anthropic.com");
+        std::env::remove_var(ANTHROPIC_BASE_URL_ENV);
     }
 
     #[test]
@@ -891,7 +2203,10 @@ mod tests {
         let _guard = env_guard();
         std::env::remove_var(ANTHROPIC_BASE_URL_ENV);
         let provider = AnthropicProvider::new("test_key".to_string());
-        assert_eq!(provider.endpoint(), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            provider.endpoint().unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 
     #[test]
@@ -899,7 +2214,7 @@ mod tests {
         let _guard = env_guard();
         std::env::set_var(ANTHROPIC_BASE_URL_ENV, "http://127.0.0.1:4010");
         let provider = AnthropicProvider::new("test_key".to_string());
-        let url = provider.endpoint();
+        let url = provider.endpoint().unwrap();
         std::env::remove_var(ANTHROPIC_BASE_URL_ENV);
         assert_eq!(url, "http://127.0.0.1:4010/v1/messages");
     }
@@ -910,7 +2225,7 @@ mod tests {
         std::env::remove_var(OPENAI_BASE_URL_ENV);
         let provider = OpenAiProvider::new("test_key".to_string());
         assert_eq!(
-            provider.endpoint(),
+            provider.endpoint().unwrap(),
             "https://api.openai.com/v1/chat/completions"
         );
     }
@@ -920,7 +2235,7 @@ mod tests {
         let _guard = env_guard();
         std::env::set_var(OPENAI_BASE_URL_ENV, "http://127.0.0.1:4011");
         let provider = OpenAiProvider::new("test_key".to_string());
-        let url = provider.endpoint();
+        let url = provider.endpoint().unwrap();
         std::env::remove_var(OPENAI_BASE_URL_ENV);
         assert_eq!(url, "http://127.0.0.1:4011/v1/chat/completions");
     }
@@ -931,7 +2246,7 @@ mod tests {
         std::env::remove_var(MINIMAX_BASE_URL_ENV);
         let provider = MinimaxProvider::new("test_key".to_string());
         assert_eq!(
-            provider.endpoint(),
+            provider.endpoint().unwrap(),
             "https://api.minimax.chat/v1/text/chatcompletion_v2"
         );
     }
@@ -941,7 +2256,7 @@ mod tests {
         let _guard = env_guard();
         std::env::set_var(MINIMAX_BASE_URL_ENV, "http://127.0.0.1:4012");
         let provider = MinimaxProvider::new("test_key".to_string());
-        let url = provider.endpoint();
+        let url = provider.endpoint().unwrap();
         std::env::remove_var(MINIMAX_BASE_URL_ENV);
         assert_eq!(url, "http://127.0.0.1:4012/v1/text/chatcompletion_v2");
     }
@@ -986,5 +2301,703 @@ mod tests {
         assert_eq!(blocks[0]["tool_use_id"], "call_1");
         assert_eq!(blocks[0]["content"], "Approve");
         assert_eq!(blocks[0]["is_error"], false);
+    }
+}
+
+/// Provider requests against loopback mock servers. Every request goes to
+/// 127.0.0.1 with the fake key `test-key`; each provider is pinned with an
+/// explicit base URL, which outranks any environment override.
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    const FAKE_KEY: &str = "test-key";
+    const MIB: usize = 1024 * 1024;
+
+    /// What the server saw of one request.
+    #[derive(Debug, Clone)]
+    struct Seen {
+        head: String,
+    }
+
+    enum Reply {
+        Json {
+            status: u16,
+            body: String,
+        },
+        Redirect {
+            status: u16,
+            location: String,
+        },
+        /// `filler` bytes of `A` with a status, sent with a length header
+        /// or, when `sized` is false, until the connection closes.
+        Bulk {
+            status: u16,
+            filler: usize,
+            sized: bool,
+        },
+        /// Accept the request and never answer.
+        Silent,
+    }
+
+    async fn read_request_head(stream: &mut TcpStream) -> String {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok(n) = stream.read(&mut chunk).await {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                let length: usize = head
+                    .lines()
+                    .find_map(|line| {
+                        let (key, value) = line.split_once(':')?;
+                        key.trim()
+                            .eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().ok())?
+                    })
+                    .unwrap_or(0);
+                let mut have = buf.len() - end - 4;
+                while have < length {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => have += n,
+                    }
+                }
+                return head;
+            }
+        }
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    async fn write_reply(stream: &mut TcpStream, reply: &Reply) {
+        match reply {
+            Reply::Json { status, body } => {
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+            Reply::Redirect { status, location } => {
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+            }
+            Reply::Bulk {
+                status,
+                filler,
+                sized,
+            } => {
+                let length = if *sized {
+                    format!("content-length: {filler}\r\n")
+                } else {
+                    String::new()
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n{length}connection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let chunk = vec![b'A'; MIB];
+                let mut left = *filler;
+                while left > 0 {
+                    let n = left.min(chunk.len());
+                    // The client may stop reading; that is the point.
+                    if stream.write_all(&chunk[..n]).await.is_err() {
+                        return;
+                    }
+                    left -= n;
+                }
+            }
+            Reply::Silent => {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        }
+        let _ = stream.flush().await;
+    }
+
+    /// A loopback server answering one scripted reply per connection.
+    async fn serve(replies: Vec<Reply>) -> (String, Arc<Mutex<Vec<Seen>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        tokio::spawn(async move {
+            for reply in replies {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let head = read_request_head(&mut stream).await;
+                record.lock().unwrap().push(Seen { head });
+                write_reply(&mut stream, &reply).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (origin, seen)
+    }
+
+    fn anthropic_at(origin: &str) -> AnthropicProvider {
+        let provider = AnthropicProvider {
+            base: BaseProvider::new("anthropic", FAKE_KEY.to_string(), "claude-sonnet-4-6")
+                .with_base_url(origin),
+            cache_system_and_tools: false,
+        };
+        assert!(provider
+            .endpoint()
+            .unwrap()
+            .starts_with("http://127.0.0.1:"));
+        provider
+    }
+
+    fn openai_at(origin: &str) -> OpenAiProvider {
+        let provider = OpenAiProvider(
+            BaseProvider::new("openai", FAKE_KEY.to_string(), "gpt-4o").with_base_url(origin),
+        );
+        assert!(provider
+            .endpoint()
+            .unwrap()
+            .starts_with("http://127.0.0.1:"));
+        provider
+    }
+
+    fn minimax_at(origin: &str) -> MinimaxProvider {
+        let provider = MinimaxProvider(
+            BaseProvider::new("minimax", FAKE_KEY.to_string(), "abab6.5s-chat")
+                .with_base_url(origin),
+        );
+        assert!(provider
+            .endpoint()
+            .unwrap()
+            .starts_with("http://127.0.0.1:"));
+        provider
+    }
+
+    fn hello() -> ChatRequest {
+        ChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message::text(Role::User, "hello")],
+            temperature: 0.0,
+            max_tokens: Some(16),
+            tools: Vec::new(),
+        }
+    }
+
+    /// Review finding: the client followed redirects, and reqwest drops
+    /// `Authorization` but not `x-api-key` on a hop to another host, so a
+    /// 307 delivered the Anthropic key and the prompt to a host nobody
+    /// configured.
+    #[tokio::test]
+    async fn test_a_redirect_is_an_error_and_its_target_gets_nothing() {
+        let (other, other_seen) = serve(vec![Reply::Json {
+            status: 200,
+            body: "{}".to_string(),
+        }])
+        .await;
+        let (origin, seen) = serve(vec![Reply::Redirect {
+            status: 307,
+            location: format!("{other}/collect"),
+        }])
+        .await;
+
+        let err = anthropic_at(&origin).chat(hello()).await.unwrap_err();
+
+        assert!(
+            err.to_string().contains("redirects are not followed"),
+            "{err}"
+        );
+        assert!(err.to_string().contains(&other), "names the target: {err}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(
+            other_seen.lock().unwrap().is_empty(),
+            "the redirect was followed"
+        );
+    }
+
+    /// Review finding: success and error bodies were read whole, however
+    /// large, and error bodies were quoted whole in the error.
+    #[tokio::test]
+    async fn test_bodies_are_read_with_a_cap() {
+        for sized in [true, false] {
+            let (origin, _) = serve(vec![Reply::Bulk {
+                status: 200,
+                filler: MAX_RESPONSE_BYTES + MIB,
+                sized,
+            }])
+            .await;
+            let err = openai_at(&origin).chat(hello()).await.unwrap_err();
+            assert!(
+                err.to_string().contains("longer than"),
+                "sized={sized}: {err}"
+            );
+        }
+
+        let (origin, _) = serve(vec![Reply::Bulk {
+            status: 500,
+            filler: MIB,
+            sized: true,
+        }])
+        .await;
+        let err = openai_at(&origin).chat(hello()).await.unwrap_err();
+        let message = err.to_string();
+        assert!(message.ends_with('…'), "{}", &message[..80]);
+        assert!(
+            message.chars().count() < MAX_ERROR_TEXT_CHARS + 100,
+            "{} chars",
+            message.chars().count()
+        );
+    }
+
+    /// Review finding: MiniMax reports failures in `base_resp` with HTTP
+    /// 200, and those came back as successful empty answers, or, with
+    /// `choices: null`, as a parse error that dropped MiniMax's reason.
+    #[tokio::test]
+    async fn test_minimax_status_errors_are_errors() {
+        let (origin, _) = serve(vec![
+            Reply::Json {
+                status: 200,
+                body: r#"{"base_resp": {"status_code": 1004, "status_msg": "login fail"}}"#
+                    .to_string(),
+            },
+            Reply::Json {
+                status: 200,
+                body: r#"{"choices": null, "base_resp": {"status_code": 1008, "status_msg": "insufficient balance"}}"#
+                    .to_string(),
+            },
+        ])
+        .await;
+        let provider = minimax_at(&origin);
+
+        let err = provider.chat(hello()).await.unwrap_err();
+        assert!(
+            matches!(&err, AgentError::Authentication(message) if message == "login fail"),
+            "{err:?}"
+        );
+        let err = provider.chat(hello()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("1008") && err.to_string().contains("insufficient balance"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_error_object_in_a_successful_reply_is_an_error() {
+        let (origin, _) = serve(vec![Reply::Json {
+            status: 200,
+            body: r#"{"error": {"message": "bad key", "type": "invalid_request_error"}}"#
+                .to_string(),
+        }])
+        .await;
+        let err = openai_at(&origin).chat(hello()).await.unwrap_err();
+        assert!(err.to_string().contains("bad key"), "{err}");
+    }
+
+    /// Review finding: `finish_reason: "stop"` beside tool calls made the
+    /// turn an end of turn, and the loop dropped the calls.
+    #[test]
+    fn test_tool_calls_make_a_tool_use_turn_whatever_the_stop_reason() {
+        let resp: OpenAiStyleResponse = serde_json::from_value(serde_json::json!({
+            "choices": [{
+                "message": {"content": null, "tool_calls": [
+                    {"id": "c1", "function": {"name": "echo_tool", "arguments": "{}"}}
+                ]},
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+        let parsed = openai_style_chat_response(resp, "openai", "m").unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::ToolUse);
+
+        let resp: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "id": "msg_1", "model": "m", "stop_reason": "end_turn",
+            "content": [{"type": "tool_use", "id": "t1", "name": "echo_tool", "input": {}}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .unwrap();
+        let parsed = anthropic_chat_response(resp, "anthropic").unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::ToolUse);
+
+        let resp: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "id": "msg_1", "model": "m", "stop_reason": "max_tokens",
+            "content": [{"type": "tool_use", "id": "t1", "name": "echo_tool", "input": {}}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .unwrap();
+        let parsed = anthropic_chat_response(resp, "anthropic").unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::MaxTokens);
+    }
+
+    /// Review finding: a client that failed to build was replaced with
+    /// `Client::new()`, which panics in that case and follows redirects.
+    #[tokio::test]
+    async fn test_a_client_that_could_not_be_built_fails_each_request() {
+        let mut base = BaseProvider::new("anthropic", FAKE_KEY.to_string(), "m");
+        base.http_client = Arc::new(Err("could not build the HTTP client: no TLS".to_string()));
+        let provider = AnthropicProvider {
+            base,
+            cache_system_and_tools: false,
+        };
+        let err = provider.chat(hello()).await.unwrap_err();
+        assert!(err.to_string().contains("could not build"), "{err}");
+    }
+
+    /// Review finding: a timeout read as "invalid response: error decoding
+    /// response body", and every transport failure looked alike.
+    #[tokio::test]
+    async fn test_transport_errors_name_their_cause() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let err = openai_at(&origin).chat(hello()).await.unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("refused"),
+            "{err}"
+        );
+
+        let (silent, _) = serve(vec![Reply::Silent]).await;
+        let short = Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let timeout = short.get(&silent).send().await.unwrap_err();
+        assert!(timeout.is_timeout());
+        let provider = openai_at(&origin);
+        let mapped = provider.0.transport_error(&timeout);
+        assert!(
+            mapped.to_string().contains("timed out within 120s"),
+            "{mapped}"
+        );
+    }
+
+    /// Review finding: the loopback check matched any host starting with
+    /// `127.`, and credentials in an override were logged verbatim.
+    /// Verification finding: refusing an override fell back to the public
+    /// API with the key and the prompt, and refused real gateway prefixes
+    /// (OpenRouter's `https://openrouter.ai/api`). An override that can't be
+    /// used now fails instead, and prefixes and credentials are kept.
+    #[test]
+    fn test_base_url_overrides_fail_closed_and_keep_prefixes() {
+        let default = "https://api.anthropic.com";
+        for refused in [
+            "127.0.0.1:4010",
+            "http://127.0.0.1:4010/?debug=1",
+            "http://127.0.0.1:4010/#top",
+            "ftp://127.0.0.1",
+            "http://[fe80::1%25en0]:8080",
+        ] {
+            assert!(
+                matches!(
+                    select_base_url(None, Some(refused), default),
+                    Err((OverrideSource::Environment, _))
+                ),
+                "{refused}"
+            );
+        }
+        assert!(matches!(
+            select_base_url(Some("localhost:4010"), Some("http://127.0.0.1:9"), default),
+            Err((OverrideSource::Configured, _))
+        ));
+        for (kept, base) in [
+            ("https://openrouter.ai/api", "https://openrouter.ai/api"),
+            ("http://127.0.0.1:4010/v1/", "http://127.0.0.1:4010/v1"),
+            (
+                "http://user:pw@127.0.0.1:4010",
+                "http://user:pw@127.0.0.1:4010",
+            ),
+        ] {
+            assert_eq!(select_base_url(None, Some(kept), default).unwrap(), base);
+        }
+        assert_eq!(
+            classify_base_url("http://127.attacker.example", default),
+            BaseUrlKind::OverrideCleartextHttp
+        );
+        assert_eq!(
+            classify_base_url("http://127.0.0.1@attacker.example", default),
+            BaseUrlKind::OverrideCleartextHttp
+        );
+        for loopback in [
+            "http://127.0.0.1:4010",
+            "http://[::1]:4010",
+            "http://LOCALHOST:4010",
+            "http://localhost.:4010",
+            "http://[::ffff:127.0.0.1]:4010",
+        ] {
+            assert_eq!(
+                classify_base_url(loopback, default),
+                BaseUrlKind::OverrideLoopbackHttp,
+                "{loopback}"
+            );
+        }
+    }
+
+    /// An unusable override is an error naming where it came from. Checked
+    /// on `endpoint()`, which `chat` calls before building a request: were
+    /// this ever to regress into a fall back, a test calling `chat` would
+    /// reach the real API.
+    #[test]
+    fn test_an_unusable_override_is_an_error_naming_its_source() {
+        let provider = AnthropicProvider {
+            base: BaseProvider::new("anthropic", FAKE_KEY.to_string(), "m")
+                .with_base_url("localhost:4010"),
+            cache_system_and_tools: false,
+        };
+        let err = provider.endpoint().unwrap_err();
+        assert!(
+            matches!(&err, AgentError::InvalidRequest(message)
+                if message.contains("configured base URL") && message.contains("fix or unset it")),
+            "{err:?}"
+        );
+
+        let _guard = super::tests::env_guard();
+        let var = "IMPULSE_TEST_UNUSABLE_BASE_URL";
+        std::env::set_var(var, "localhost:4010");
+        let base = BaseProvider::new("test", FAKE_KEY.to_string(), "m");
+        let result = base.endpoint(var, "https://api.example.com", "/v1/messages", true);
+        std::env::remove_var(var);
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains(var), "{err}");
+    }
+
+    /// Verification finding: serde quotes an unexpected value in full, so a
+    /// malformed 200 body put megabytes into the error.
+    #[tokio::test]
+    async fn test_a_malformed_success_body_is_quoted_briefly() {
+        let (origin, _) = serve(vec![Reply::Json {
+            status: 200,
+            body: serde_json::json!({ "content": "x".repeat(MIB) }).to_string(),
+        }])
+        .await;
+        let err = anthropic_at(&origin).chat(hello()).await.unwrap_err();
+        assert!(
+            err.to_string().chars().count() < MAX_ERROR_TEXT_CHARS + 100,
+            "{} chars",
+            err.to_string().chars().count()
+        );
+    }
+
+    /// Verification finding: a stop at the context window cut tool blocks
+    /// off like a token-limit stop, but they were run.
+    #[test]
+    fn test_a_context_window_stop_is_a_token_limit_stop() {
+        let resp: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "id": "msg_1", "model": "m", "stop_reason": "model_context_window_exceeded",
+            "content": [{"type": "tool_use", "id": "t1", "name": "bash_exec",
+                         "input": {"command": "rm -rf ./bui"}}],
+            "usage": {"input_tokens": 1, "output_tokens": 1}
+        }))
+        .unwrap();
+        let parsed = anthropic_chat_response(resp, "anthropic").unwrap();
+        assert_eq!(parsed.stop_reason, StopReason::MaxTokens);
+    }
+
+    /// Verification finding: typing `base_resp` and `error` strictly failed
+    /// otherwise good replies whose envelope was spelled loosely.
+    #[test]
+    fn test_loosely_spelled_envelopes_do_not_fail_a_good_reply() {
+        let good_choice =
+            serde_json::json!([{"message": {"content": "hi"}, "finish_reason": "stop"}]);
+        for envelope in [
+            serde_json::json!({"base_resp": {"status_code": 0, "status_msg": null}}),
+            serde_json::json!({"base_resp": {"status_code": "0", "status_msg": "success"}}),
+            serde_json::json!({"error": {}}),
+            serde_json::json!({"error": ""}),
+            serde_json::json!({"error": false}),
+            serde_json::json!({"error": null, "base_resp": null}),
+        ] {
+            let mut raw = envelope.clone();
+            raw["choices"] = good_choice.clone();
+            let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+            let parsed = openai_style_chat_response(resp, "minimax", "m")
+                .unwrap_or_else(|e| panic!("{envelope}: {e:?}"));
+            assert_eq!(parsed.content, "hi");
+        }
+        let resp: OpenAiStyleResponse = serde_json::from_value(serde_json::json!({
+            "choices": good_choice,
+            "base_resp": {"status_code": "1004", "status_msg": "login fail"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            openai_style_chat_response(resp, "minimax", "m"),
+            Err(AgentError::Authentication(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_a_successful_reply_still_parses() {
+        let (origin, seen) = serve(vec![Reply::Json {
+            status: 200,
+            body: serde_json::json!({
+                "id": "msg_1", "model": "m", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })
+            .to_string(),
+        }])
+        .await;
+        let reply = anthropic_at(&origin).chat(hello()).await.unwrap();
+        assert_eq!(reply.content, "hi");
+        let head = seen.lock().unwrap()[0].head.to_ascii_lowercase();
+        assert!(head.contains("x-api-key: test-key"), "{head}");
+    }
+
+    /// Second verification round: the non-UTF-8 branch had no test, and a
+    /// non-UTF-8 environment value also failed a configured URL it should
+    /// lose to.
+    #[test]
+    fn test_a_non_utf8_environment_override_fails_only_when_it_is_used() {
+        use std::os::unix::ffi::OsStrExt;
+        let _guard = super::tests::env_guard();
+        let var = "IMPULSE_TEST_NON_UTF8_BASE_URL";
+        std::env::set_var(var, std::ffi::OsStr::from_bytes(b"http://\xff"));
+        let unset = BaseProvider::new("test", FAKE_KEY.to_string(), "m").endpoint(
+            var,
+            "https://api.example.com",
+            "/v1/messages",
+            true,
+        );
+        let configured = BaseProvider::new("test", FAKE_KEY.to_string(), "m")
+            .with_base_url("http://127.0.0.1:4010")
+            .endpoint(var, "https://api.example.com", "/v1/messages", true);
+        std::env::remove_var(var);
+        let err = unset.unwrap_err();
+        assert!(
+            err.to_string().contains(var) && err.to_string().contains("UTF-8"),
+            "{err}"
+        );
+        assert_eq!(configured.unwrap(), "http://127.0.0.1:4010/v1/messages");
+    }
+
+    /// Second verification round: the origin-only log line had no test.
+    #[test]
+    fn test_the_override_log_shows_only_the_origin() {
+        assert_eq!(
+            override_log_origin("http://user:SECRETPW@127.0.0.1:4010/acct/SECRETPATH"),
+            "http://127.0.0.1:4010"
+        );
+    }
+
+    /// Second verification round: URL credentials became a second
+    /// `Authorization` header beside an OpenAI or MiniMax key, and ones that
+    /// don't decode to UTF-8 stayed in the URL and reached error text.
+    #[test]
+    fn test_url_credentials_are_refused_where_they_cannot_work() {
+        let openai = OpenAiProvider(
+            BaseProvider::new("openai", FAKE_KEY.to_string(), "gpt-4o")
+                .with_base_url("http://user:pw@127.0.0.1:4010"),
+        );
+        let err = openai.endpoint().unwrap_err();
+        assert!(err.to_string().contains("Authorization header"), "{err}");
+        let minimax = MinimaxProvider(
+            BaseProvider::new("minimax", FAKE_KEY.to_string(), "m")
+                .with_base_url("http://user:pw@127.0.0.1:4010"),
+        );
+        assert!(minimax.endpoint().is_err());
+        let anthropic = AnthropicProvider {
+            base: BaseProvider::new("anthropic", FAKE_KEY.to_string(), "m")
+                .with_base_url("http://user:pw@127.0.0.1:4010"),
+            cache_system_and_tools: false,
+        };
+        assert_eq!(
+            anthropic.endpoint().unwrap(),
+            "http://user:pw@127.0.0.1:4010/v1/messages"
+        );
+
+        assert_eq!(
+            parse_base_url("http://%FF:pw@127.0.0.1:4010"),
+            Err("its credentials are not valid UTF-8")
+        );
+        assert!(parse_base_url("http://user:p%40ss@127.0.0.1:4010").is_ok());
+    }
+
+    /// Second verification round: transport errors quoted the whole URL,
+    /// credentials and account path included.
+    #[tokio::test]
+    async fn test_transport_errors_quote_only_the_origin() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = closed.local_addr().unwrap();
+        drop(closed);
+        let provider = AnthropicProvider {
+            base: BaseProvider::new("anthropic", FAKE_KEY.to_string(), "m")
+                .with_base_url(format!("http://user:SECRETPW@{address}/SECRETPATH")),
+            cache_system_and_tools: false,
+        };
+        let endpoint = reqwest::Url::parse(&provider.endpoint().unwrap()).unwrap();
+        assert_eq!(endpoint.host_str(), Some("127.0.0.1"));
+        let err = provider.chat(hello()).await.unwrap_err().to_string();
+        assert!(
+            !err.contains("SECRETPW") && !err.contains("SECRETPATH"),
+            "{err}"
+        );
+        assert!(err.contains(&address.to_string()), "{err}");
+    }
+
+    /// Second verification round: the OpenAI SDK convention gives a base
+    /// ending in `/v1`, which doubled into `/v1/v1/...`.
+    #[test]
+    fn test_a_base_ending_in_v1_is_not_doubled() {
+        let openai = OpenAiProvider(
+            BaseProvider::new("openai", FAKE_KEY.to_string(), "gpt-4o")
+                .with_base_url("http://127.0.0.1:11434/v1"),
+        );
+        assert_eq!(
+            openai.endpoint().unwrap(),
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+        let gateway = OpenAiProvider(
+            BaseProvider::new("openai", FAKE_KEY.to_string(), "gpt-4o")
+                .with_base_url("https://openrouter.ai/api/v1/"),
+        );
+        assert_eq!(
+            gateway.endpoint().unwrap(),
+            "https://openrouter.ai/api/v1/chat/completions"
+        );
+    }
+
+    /// Second verification round: loosely read envelopes still misread a
+    /// few shapes.
+    #[test]
+    fn test_envelope_edge_cases() {
+        let good_choice =
+            serde_json::json!([{"message": {"content": "hi"}, "finish_reason": "stop"}]);
+        for no_error in [
+            serde_json::json!({"error": {"message": ""}}),
+            serde_json::json!({"error": {"message": null, "code": null}}),
+            serde_json::json!({"error": []}),
+        ] {
+            let mut raw = no_error.clone();
+            raw["choices"] = good_choice.clone();
+            let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+            assert!(
+                openai_style_chat_response(resp, "openai", "m").is_ok(),
+                "{no_error}"
+            );
+        }
+        for an_error in [
+            serde_json::json!({"error": true}),
+            serde_json::json!({"error": ["boom"]}),
+        ] {
+            let mut raw = an_error.clone();
+            raw["choices"] = good_choice.clone();
+            let resp: OpenAiStyleResponse = serde_json::from_value(raw).unwrap();
+            assert!(
+                openai_style_chat_response(resp, "openai", "m").is_err(),
+                "{an_error}"
+            );
+        }
+        let resp: OpenAiStyleResponse = serde_json::from_value(serde_json::json!({
+            "choices": good_choice,
+            "base_resp": {"status_code": 1004.0, "status_msg": "login fail"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            openai_style_chat_response(resp, "minimax", "m"),
+            Err(AgentError::Authentication(_))
+        ));
     }
 }

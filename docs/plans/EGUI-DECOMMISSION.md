@@ -184,13 +184,21 @@ Preferred Dioxus packaging path:
       cannot load local xterm assets, or never reports the live Dioxus bridge status.
 - [ ] Make the tag release consume only the proven Dioxus package recipe.
 
-Fallback CLI-only path, only if explicitly chosen:
+Fallback CLI-only path, explicitly chosen on 2026-09-14 for release truth. The legacy GUI source
+remains preserved; the inactive bundler entry point now refuses before any artifact mutation.
+The release matrix retains all four CLI target/artifact names, uses native runners, smoke-tests
+the staged executables, and validates the complete checksum set on relevant PRs and version tags:
 
-- [ ] Remove the broken DMG job and stale GUI bundler from active release automation.
-- [ ] State clearly that tagged releases contain CLI artifacts only until Dioxus packaging lands.
-- [ ] Keep Track C blocked; CLI-only release truth is not Dioxus operational acceptance.
+
+- [x] Remove the broken DMG job and stale GUI bundler from active release automation.
+- [x] State clearly that tagged releases contain CLI artifacts only until Dioxus packaging lands.
+- [x] Keep Track C blocked; CLI-only release truth is not Dioxus operational acceptance.
 
 **Gate:** no active release script or workflow may reference `impulse-gui`.
+
+The baseline table above records the earlier stale DMG path; this R1 fallback supersedes only that
+release row. Track A source removal and Track C remain incomplete. Verification and cross-platform
+limits are recorded in [the release lane work card](worktrees/2026-09-14-cli-release-workflow.md).
 
 ### R2 — Remove resurrection vectors and dead affordances
 

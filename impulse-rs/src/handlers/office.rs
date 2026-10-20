@@ -34,7 +34,7 @@ pub fn handle_office(
     match subcommand.as_str() {
         "info" | "status" => {
             println!("Office Document Support:");
-            println!("  Formats: xlsx, xls, csv, docx");
+            println!("  Formats: xlsx, csv, docx (legacy .xls is refused)");
             println!("  Status: Available (enable office-support feature for full functionality)");
 
             let formats = office::supported_formats();

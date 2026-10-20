@@ -65,6 +65,19 @@ mod tests {
     }
 
     #[test]
+    fn test_build_init_message_shortens_a_multibyte_session_id() {
+        // A session id may be any non-control text; cutting it at byte 8
+        // panicked inside the third character here.
+        let msg = ContextInjector::build_init_message(
+            AgentKind::ClaudeCode,
+            Some("セッション識別子テスト"),
+            "claude-1",
+            &[],
+        );
+        assert!(msg.contains("Session: セッション識別子 | "), "{msg}");
+    }
+
+    #[test]
     fn test_build_refresh_message() {
         let msg = ContextInjector::build_refresh_message(
             AgentKind::ClaudeCode,

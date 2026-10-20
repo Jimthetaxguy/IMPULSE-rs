@@ -9,12 +9,10 @@
 //! which an in-process test cannot observe because `handle_ion_verify` calls
 //! `std::process::exit` on a failing/violating verdict (G1).
 //!
-//! T4 scenario 1 (pass) and scenario 4 (non-zero exit) are covered at the
-//! `run_ion_verify` unit level (`src/handlers/ion.rs`) and are not repeated
-//! here as subprocess tests, since both a failing verdict and a gate-side
-//! error currently produce the same CLI-observable outcome (non-zero exit,
-//! `main`'s default `Result` handling) — the interesting CLI-only surface is
-//! the exit-code-vs-verdict mapping and the `--json` envelope, covered below.
+//! T4 scenario 1 (pass) is covered at the `run_ion_verify` unit level
+//! (`src/handlers/ion.rs`). A failing verdict exits 1. A gate-side error
+//! (non-zero exit, timeout, unparseable output) exits 2, matching
+//! `handlers::guard`.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -26,16 +24,31 @@ fn impulse_rs_dir() -> PathBuf {
 
 /// Creates a throwaway git repo with one empty commit, so `--diff-ref HEAD`
 /// resolves via `git rev-parse` inside `run_ion_verify`.
+///
+/// Hermetic against the invoking user's real git config, same as
+/// `impulse_rs::test_support::init_git_repo` (Stage 1 lane,
+/// `docs/superpowers/specs/2026-09-02-ion-tool-sandbox-and-untrusted-output.md`):
+/// this file is a *separate* integration-test crate compiled against a
+/// normal (non-`--cfg test`) build of the library, so it cannot see that
+/// `#[cfg(test)]`-gated module regardless of visibility -- this is a
+/// deliberate, minimal, kept-in-sync copy, not a missed consolidation.
 fn init_git_repo() -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().expect("failed to create tempdir");
     let run = |args: &[&str]| {
-        let status = Command::new("git")
+        let output = Command::new("git")
             .arg("-C")
             .arg(dir.path())
             .args(args)
-            .status()
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", dir.path())
+            .output()
             .expect("failed to run git");
-        assert!(status.success(), "git {args:?} failed");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     };
     run(&["init", "--quiet"]);
     run(&["config", "user.email", "test@example.com"]);
@@ -73,9 +86,10 @@ fn ion_verify_cli_exits_non_zero_on_changes_requested_verdict() {
 
     let output = run_ion_verify_cli(repo.path(), &gate_script, &[]);
 
-    assert!(
-        !output.status.success(),
-        "CLI must exit non-zero for a CHANGES REQUESTED verdict; stdout: {}",
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "CLI must exit 1 for a CHANGES REQUESTED verdict; stdout: {}",
         stdout_str(&output)
     );
     let stdout = stdout_str(&output);
@@ -119,5 +133,29 @@ fn ion_verify_cli_json_reports_contract_violation_and_exits_non_zero() {
         violation.contains("CriticalBlocksApprove")
             || violation.to_lowercase().contains("critical"),
         "contract_violation should describe the critical/approve conflict, got: {violation}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a contract violation is a verdict failure, not a gate error"
+    );
+}
+
+/// A gate that exits before producing a verdict is an evaluation error.
+/// `ion-verify` exits 2, the same code `impulse-rs guard` uses when
+/// evaluation itself fails.
+#[test]
+fn ion_verify_cli_exits_2_on_gate_error() {
+    let repo = init_git_repo();
+    let gate_script = impulse_rs_dir().join("tests/fakes/ion-verify-stub-gate-nonzero-exit.sh");
+
+    let output = run_ion_verify_cli(repo.path(), &gate_script, &[]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a gate crash must exit 2; stdout: {} stderr: {}",
+        stdout_str(&output),
+        String::from_utf8_lossy(&output.stderr)
     );
 }

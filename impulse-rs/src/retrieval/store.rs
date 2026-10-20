@@ -1,10 +1,36 @@
 use anyhow::{bail, Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::retrieval::types::SearchResult;
+use crate::retrieval::types::{IndexScope, SearchResult};
+
+/// Percent-encodes `path` for embedding in a SQLite `file:` URI (review
+/// round 6, MEDIUM REFUTED -- used by [`RetrievalStore::open_read_only`]'s
+/// `immutable=1` connection: `immutable` can only be requested via a URI,
+/// and SQLite's own URI parser treats `?`/`#`/`%` -- and, conservatively,
+/// anything else outside the unreserved/`/` set -- as syntactically
+/// significant, so a path containing any of them would otherwise corrupt
+/// the URI or be silently misinterpreted). Keeps `/` and RFC 3986
+/// "unreserved" characters (`A-Za-z0-9-._~`) literal; every other byte
+/// becomes `%XX`. Operates on UTF-8 bytes (`Path::to_string_lossy`),
+/// matching how the rest of this codebase already displays paths.
+fn percent_encode_uri_path(path: &Path) -> String {
+    let mut out = String::new();
+    for byte in path.to_string_lossy().as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(*byte as char);
+            }
+            other => {
+                out.push('%');
+                out.push_str(&format!("{other:02X}"));
+            }
+        }
+    }
+    out
+}
 
 pub struct RetrievalStore {
     conn: Connection,
@@ -20,6 +46,20 @@ pub struct HistoryUpsert<'a> {
     pub summary: &'a str,
     pub files_touched_json: &'a str,
     pub tools_used_json: &'a str,
+    pub search_text: &'a str,
+    pub content_hash: &'a str,
+}
+
+/// One promoted memory record, as the retrieval index stores it.
+pub struct MemoryRecordUpsert<'a> {
+    pub record_id: &'a str,
+    pub project_id: &'a str,
+    pub scope: &'a str,
+    pub kind: &'a str,
+    pub valid_from: &'a str,
+    pub title: &'a str,
+    pub body: &'a str,
+    pub source_json: &'a str,
     pub search_text: &'a str,
     pub content_hash: &'a str,
 }
@@ -47,6 +87,85 @@ impl RetrievalStore {
         conn.busy_timeout(Duration::from_secs(5))
             .context("Failed to set busy_timeout on retrieval.db")?;
 
+        Ok(Self { conn, db_path })
+    }
+
+    /// Opens `retrieval.db` under `base_path` strictly READ-ONLY: no
+    /// `create_dir_all`, no database-file creation (`OpenFlags::
+    /// SQLITE_OPEN_READ_ONLY` has no `CREATE` bit), no journal-mode/
+    /// pragma writes, and no `init_schema()` call -- every one of those is
+    /// a side effect [`RetrievalStore::open`] performs unconditionally,
+    /// appropriate for a genuine indexer but never appropriate for a
+    /// read-only consumer.
+    ///
+    /// **Why this exists (review round 5, MEDIUM/Cursor on PR #54):** the
+    /// `memory_search` ion tool is registered ungated (read-only,
+    /// `Capability::FileSystemRead` only) precisely because it is supposed
+    /// to be safe to point at any `/allow`-granted directory. But it called
+    /// `retrieval::search_history`/`search_genome`, which call
+    /// `RetrievalStore::open` -- so after granting read access to some
+    /// directory for an unrelated reason, the model could cause
+    /// `retrieval.db` (plus WAL `-wal`/`-shm` sidecars) to be CREATED there,
+    /// a write side effect a read-only tool must never have. This method,
+    /// plus `memory_search`'s own explicit `retrieval.db`-existence check
+    /// before ever calling it, closes that gap: a directory with no
+    /// existing index is left completely untouched.
+    ///
+    /// Returns `Err` if `retrieval.db` does not exist under `base_path` --
+    /// callers needing to distinguish "no index yet" from "index exists but
+    /// failed to open" should check for that file's existence themselves
+    /// first (as `memory_search` does), since this error is a plain
+    /// `anyhow::Error`, not a matchable variant.
+    pub fn open_read_only(base_path: &Path) -> Result<Self> {
+        let db_path = base_path.join("retrieval.db");
+        if !db_path.exists() {
+            bail!(
+                "no retrieval index found at {} (retrieval.db does not exist)",
+                db_path.display()
+            );
+        }
+        // Review round 6, MEDIUM REFUTED (CONFIRMED): a plain
+        // `SQLITE_OPEN_READ_ONLY` open of a WAL-mode database still
+        // materializes `-shm`/`-wal` sidecar files on the FIRST query
+        // (SQLite must still track the WAL read-mark for a consistent
+        // snapshot, which needs those files to exist even for a reader),
+        // and those sidecars persist after this connection is dropped --
+        // exactly the write side effect this method exists to prevent.
+        // `immutable=1` (SQLite's own documented flag for "this file will
+        // not change for the duration I have it open, and no other
+        // connection will change it either") tells SQLite it never needs
+        // WAL bookkeeping at all, so no sidecar is ever created. It can
+        // ONLY be passed via a `file:` URI (there is no `OpenFlags` bit for
+        // it), which requires `SQLITE_OPEN_URI` and an absolute,
+        // percent-encoded path (`std::path::absolute` -- no filesystem
+        // access, so it works even for a relative `base_path` that
+        // resolves to a directory the process cannot otherwise inspect --
+        // and `percent_encode_uri_path` for the reserved-character escaping
+        // SQLite's own URI parser requires).
+        let absolute_db_path = std::path::absolute(&db_path).with_context(|| {
+            format!(
+                "failed to resolve {} to an absolute path",
+                db_path.display()
+            )
+        })?;
+        let uri = format!(
+            "file:{}?immutable=1",
+            percent_encode_uri_path(&absolute_db_path)
+        );
+        let conn = Connection::open_with_flags(
+            &uri,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+        )
+        .with_context(|| format!("failed to open {} read-only (immutable)", db_path.display()))?;
+        // Read-only AND immutable: no pragma writes (journal_mode/
+        // synchronous/foreign_keys all either write the database header or
+        // are irrelevant to a connection that only ever runs SELECTs).
+        // `busy_timeout` is a connection-local setting with no on-disk side
+        // effect, so it stays -- though an immutable connection never
+        // actually contends with a writer for a lock the way a plain
+        // read-only one could.
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("Failed to set busy_timeout on retrieval.db (read-only)")?;
         Ok(Self { conn, db_path })
     }
 
@@ -165,6 +284,23 @@ CREATE TABLE IF NOT EXISTS genome_decisions (
   content_hash TEXT NOT NULL DEFAULT ''
 );
 
+-- ADR-0020: promoted memory records. Deliberately its own table rather than
+-- extra rows in `genome_decisions`: the hand-curated GENOME and the promoted
+-- record log are different artifacts with different owners, and collapsing
+-- them into one table would make "where did this fact come from" unanswerable.
+CREATE TABLE IF NOT EXISTS memory_records (
+  record_id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  valid_from TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  source_json TEXT NOT NULL,
+  search_text TEXT NOT NULL,
+  content_hash TEXT NOT NULL DEFAULT ''
+);
+
 CREATE TABLE IF NOT EXISTS retrieval_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -177,6 +313,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
 
 CREATE VIRTUAL TABLE IF NOT EXISTS genome_fts USING fts5(
   decision_id,
+  search_text
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+  record_id,
   search_text
 );
 
@@ -206,7 +347,7 @@ CREATE TABLE IF NOT EXISTS genome_vec (
         )
         .context("Failed to ensure content_hash column on genome_decisions")?;
 
-        self.set_meta("schema_version", "2")
+        self.set_meta("schema_version", "3")
             .context("Failed to set schema_version in retrieval_meta")?;
         Ok(())
     }
@@ -367,27 +508,43 @@ CREATE TABLE IF NOT EXISTS genome_vec (
         Ok(())
     }
 
+    /// Clears the history and genome tables.
     pub fn clear_all(&self) -> Result<()> {
+        self.clear_scope(IndexScope::All)
+    }
+
+    /// Clears the tables a rebuild of `scope` re-indexes, and nothing else.
+    /// Promoted memory records (`memory_records`, `memory_fts`) are never
+    /// cleared here: they are indexed separately from the memory projection
+    /// (`index_promoted_memory_records`, with its own dirty marker), which a
+    /// history or genome rebuild never re-runs. Clearing everything for any
+    /// scope used to leave `--scope genome --rebuild` with an empty history
+    /// index and wiped promoted records the marker still called current.
+    pub fn clear_scope(&self, scope: IndexScope) -> Result<()> {
         let tx = self
             .conn
             .unchecked_transaction()
-            .context("Failed to begin clear_all transaction")?;
-        tx.execute("DELETE FROM history_entries", [])
-            .context("Failed to delete from history_entries")?;
-        tx.execute("DELETE FROM genome_decisions", [])
-            .context("Failed to delete from genome_decisions")?;
-        tx.execute("DELETE FROM history_fts", [])
-            .context("Failed to delete from history_fts")?;
-        tx.execute("DELETE FROM genome_fts", [])
-            .context("Failed to delete from genome_fts")?;
-        tx.execute("DELETE FROM history_vec", [])
-            .context("Failed to delete from history_vec")?;
-        tx.execute("DELETE FROM genome_vec", [])
-            .context("Failed to delete from genome_vec")?;
-        let _ = tx.execute("DELETE FROM history_vec0", []);
-        let _ = tx.execute("DELETE FROM genome_vec0", []);
+            .context("Failed to begin index clear transaction")?;
+        let mut tables: Vec<&str> = Vec::new();
+        if matches!(scope, IndexScope::History | IndexScope::All) {
+            tables.extend(["history_entries", "history_fts", "history_vec"]);
+        }
+        if matches!(scope, IndexScope::Genome | IndexScope::All) {
+            tables.extend(["genome_decisions", "genome_fts", "genome_vec"]);
+        }
+        for table in tables {
+            tx.execute(&format!("DELETE FROM {table}"), [])
+                .with_context(|| format!("Failed to delete from {table}"))?;
+        }
+        // The vec0 tables exist only when sqlite-vec is loaded.
+        if matches!(scope, IndexScope::History | IndexScope::All) {
+            let _ = tx.execute("DELETE FROM history_vec0", []);
+        }
+        if matches!(scope, IndexScope::Genome | IndexScope::All) {
+            let _ = tx.execute("DELETE FROM genome_vec0", []);
+        }
         tx.commit()
-            .context("Failed to commit clear_all transaction")?;
+            .context("Failed to commit index clear transaction")?;
         Ok(())
     }
 
@@ -543,6 +700,9 @@ ON CONFLICT(decision_id) DO UPDATE SET
                 .context("Failed to delete all from history_entries")?;
             tx.execute("DELETE FROM history_vec", [])
                 .context("Failed to delete all from history_vec")?;
+            // History only: promoted memory records belong to the memory
+            // projection's indexer. Deleting them here wiped every promoted
+            // record whenever HISTORY.jsonl was empty.
             let _ = tx.execute("DELETE FROM history_vec0", []);
             tx.commit()
                 .context("Failed to commit delete_history_except transaction")?;
@@ -636,6 +796,12 @@ ON CONFLICT(decision_id) DO UPDATE SET
             "INSERT INTO genome_fts(decision_id, search_text) SELECT decision_id, search_text FROM genome_decisions",
             [],
         ).context("Failed to repopulate genome_fts from genome_decisions")?;
+        tx.execute("DELETE FROM memory_fts", [])
+            .context("Failed to delete from memory_fts")?;
+        tx.execute(
+            "INSERT INTO memory_fts(record_id, search_text) SELECT record_id, search_text FROM memory_records",
+            [],
+        ).context("Failed to repopulate memory_fts from memory_records")?;
         tx.commit()
             .context("Failed to commit refresh_fts transaction")?;
         Ok(())
@@ -721,16 +887,57 @@ ON CONFLICT(decision_id) DO UPDATE SET
         Ok(())
     }
 
+    /// An FTS5 MATCH expression requiring every word of `query`. Each word is
+    /// quoted (so FTS5 operators in user text stay literal) and the words are
+    /// joined by FTS5's implicit AND. Quoting the whole input instead made it
+    /// one phrase, so `auth bug` matched only those words adjacent and in
+    /// order, not "fixed bug in auth module" (ADR-0003 promises tokenized
+    /// keyword matching).
     fn sanitize_fts_query(query: &str) -> String {
-        let q = query.trim();
-        if q.is_empty() {
-            return String::new();
-        }
-        format!("\"{}\"", q.replace('"', "\"\""))
+        Self::quoted_words(query).join(" ")
+    }
+
+    /// The same quoted words joined by `OR`: an entry matching any of them.
+    fn any_word_fts_query(query: &str) -> String {
+        Self::quoted_words(query).join(" OR ")
+    }
+
+    fn quoted_words(query: &str) -> Vec<String> {
+        query
+            .split_whitespace()
+            .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+            .collect()
+    }
+
+    /// FTS5's `bm25()` is lower-is-better (more negative means a stronger
+    /// match). Every `SearchResult::score` is higher-is-better, like the
+    /// semantic backends' similarity, so callers that sort descending keep
+    /// the strongest matches; the raw value used to put the weakest first.
+    fn bm25_score(raw: f64) -> f64 {
+        -raw
     }
 
     pub fn search_history_keyword(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        let fts_query = Self::sanitize_fts_query(query);
+        self.history_fts(Self::sanitize_fts_query(query), query, limit)
+    }
+
+    /// Candidates for semantic search: entries matching any word of
+    /// `query`, strongest first. Requiring every word, as keyword search
+    /// does, dropped semantically close entries that miss one of them.
+    pub fn history_keyword_candidates(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        self.history_fts(Self::any_word_fts_query(query), query, limit)
+    }
+
+    fn history_fts(
+        &self,
+        fts_query: String,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
@@ -755,7 +962,7 @@ LIMIT ?2
                 id: row.get(0)?,
                 title: row.get(1)?,
                 snippet: row.get(2)?,
-                score: row.get::<_, f64>(3)?,
+                score: Self::bm25_score(row.get::<_, f64>(3)?),
             })
         });
 
@@ -806,7 +1013,25 @@ LIMIT ?2
     }
 
     pub fn search_genome_keyword(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-        let fts_query = Self::sanitize_fts_query(query);
+        self.genome_fts(Self::sanitize_fts_query(query), query, limit)
+    }
+
+    /// Candidates for semantic search over decisions; see
+    /// [`Self::history_keyword_candidates`].
+    pub fn genome_keyword_candidates(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
+        self.genome_fts(Self::any_word_fts_query(query), query, limit)
+    }
+
+    fn genome_fts(
+        &self,
+        fts_query: String,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchResult>> {
         if fts_query.is_empty() {
             return Ok(Vec::new());
         }
@@ -831,7 +1056,7 @@ LIMIT ?2
                 id: row.get(0)?,
                 title: row.get(1)?,
                 snippet: row.get(2)?,
-                score: row.get::<_, f64>(3)?,
+                score: Self::bm25_score(row.get::<_, f64>(3)?),
             })
         });
 
@@ -877,6 +1102,185 @@ LIMIT ?2
         let mut out = Vec::new();
         for row in rows {
             out.push(row.context("Failed to read genome_decisions LIKE search result row")?);
+        }
+        Ok(out)
+    }
+
+    /// Insert or replace one promoted memory record and its FTS row.
+    pub fn upsert_memory_record(&self, row: MemoryRecordUpsert<'_>) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+INSERT INTO memory_records(record_id, project_id, scope, kind, valid_from, title, body, source_json, search_text, content_hash)
+VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+ON CONFLICT(record_id) DO UPDATE SET
+  project_id=excluded.project_id,
+  scope=excluded.scope,
+  kind=excluded.kind,
+  valid_from=excluded.valid_from,
+  title=excluded.title,
+  body=excluded.body,
+  source_json=excluded.source_json,
+  search_text=excluded.search_text,
+  content_hash=excluded.content_hash
+"#,
+                params![
+                    row.record_id,
+                    row.project_id,
+                    row.scope,
+                    row.kind,
+                    row.valid_from,
+                    row.title,
+                    row.body,
+                    row.source_json,
+                    row.search_text,
+                    row.content_hash
+                ],
+            )
+            .context("Failed to upsert memory record into retrieval store")?;
+        self.conn
+            .execute(
+                "DELETE FROM memory_fts WHERE record_id = ?1",
+                params![row.record_id],
+            )
+            .context("Failed to clear stale memory_fts row")?;
+        self.conn
+            .execute(
+                "INSERT INTO memory_fts(record_id, search_text) VALUES(?1, ?2)",
+                params![row.record_id, row.search_text],
+            )
+            .context("Failed to insert memory_fts row")?;
+        Ok(())
+    }
+
+    /// Drop indexed records that are no longer in the projection, so a
+    /// superseded or removed record cannot keep answering searches.
+    pub fn delete_memory_records_except(&self, keep_ids: &HashSet<String>) -> Result<()> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT record_id FROM memory_records")
+            .context("Failed to prepare memory_records id scan")?;
+        let existing = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .context("Failed to scan memory_records ids")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to read memory_records ids")?;
+        for record_id in existing {
+            if keep_ids.contains(&record_id) {
+                continue;
+            }
+            self.conn
+                .execute(
+                    "DELETE FROM memory_records WHERE record_id = ?1",
+                    params![record_id],
+                )
+                .context("Failed to delete stale memory record")?;
+            self.conn
+                .execute(
+                    "DELETE FROM memory_fts WHERE record_id = ?1",
+                    params![record_id],
+                )
+                .context("Failed to delete stale memory_fts row")?;
+        }
+        Ok(())
+    }
+
+    pub fn count_history_entries(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM history_entries", [], |row| row.get(0))
+            .context("Failed to count history entries")?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn count_genome_decisions(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM genome_decisions", [], |row| {
+                row.get(0)
+            })
+            .context("Failed to count genome decisions")?;
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn count_memory_records(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_records", [], |row| row.get(0))
+            .context("Failed to count memory records")?;
+        Ok(count.max(0) as usize)
+    }
+
+    /// Keyword search over promoted memory records only. A pending or dismissed
+    /// candidate is never in this table, so it can never be returned here
+    /// (ADR-0013 rule 9).
+    pub fn search_memory_keyword(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let fts_query = Self::sanitize_fts_query(query);
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut stmt = match self.conn.prepare_cached(
+            r#"
+SELECT m.record_id, m.title, m.body, bm25(memory_fts) AS rank
+FROM memory_fts
+JOIN memory_records m ON m.record_id = memory_fts.record_id
+WHERE memory_fts MATCH ?1
+ORDER BY rank
+LIMIT ?2
+"#,
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return self.search_memory_keyword_like(query, limit),
+        };
+        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+            Ok(SearchResult {
+                source: "memory".to_string(),
+                id: row.get(0)?,
+                title: row.get(1)?,
+                snippet: row.get(2)?,
+                score: Self::bm25_score(row.get::<_, f64>(3)?),
+            })
+        });
+        match rows {
+            Ok(rows) => {
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row.context("Failed to read FTS result row from memory_fts")?);
+                }
+                Ok(out)
+            }
+            Err(_) => self.search_memory_keyword_like(query, limit),
+        }
+    }
+
+    fn search_memory_keyword_like(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+        let like = format!("%{}%", query.to_lowercase());
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                r#"
+SELECT record_id, title, body
+FROM memory_records
+WHERE lower(search_text) LIKE ?1
+ORDER BY valid_from DESC
+LIMIT ?2
+"#,
+            )
+            .context("Failed to prepare LIKE search on memory_records")?;
+        let rows = stmt
+            .query_map(params![like, limit as i64], |row| {
+                Ok(SearchResult {
+                    source: "memory".to_string(),
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    snippet: row.get(2)?,
+                    score: 0.0,
+                })
+            })
+            .context("Failed to execute LIKE search on memory_records")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("Failed to read memory_records LIKE search result row")?);
         }
         Ok(out)
     }
@@ -1050,6 +1454,70 @@ mod tests {
         (tmp, store)
     }
 
+    #[test]
+    fn test_open_read_only_refuses_when_retrieval_db_does_not_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `RetrievalStore` intentionally has no `Debug` impl, so
+        // `unwrap_err()` (which requires `T: Debug`) is not usable here;
+        // match instead.
+        match RetrievalStore::open_read_only(tmp.path()) {
+            Ok(_) => panic!("expected open_read_only to refuse a missing retrieval.db"),
+            Err(err) => assert!(
+                err.to_string().contains("no retrieval index found"),
+                "{err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn test_open_read_only_creates_no_files_when_retrieval_db_does_not_exist() {
+        // Review round 5, MEDIUM/Cursor: the whole point of this method --
+        // a directory with no existing index must be left untouched, not
+        // even the parent directory materialized.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("not-yet-created");
+
+        let _ = RetrievalStore::open_read_only(&target);
+
+        assert!(
+            !target.exists(),
+            "open_read_only must not create the base directory"
+        );
+    }
+
+    #[test]
+    fn test_open_read_only_succeeds_against_an_existing_index() {
+        let (tmp, store) = open_test_store();
+        store
+            .upsert_history(HistoryUpsert {
+                search_text: "retrieval testing needle",
+                ..test_history_row("s1", "session one")
+            })
+            .unwrap();
+        store.refresh_fts().unwrap();
+        drop(store);
+
+        let ro = RetrievalStore::open_read_only(tmp.path()).unwrap();
+        let results = ro.search_history_keyword("needle", 10).unwrap();
+        assert!(
+            !results.is_empty(),
+            "read-only store must still find rows a writer inserted"
+        );
+    }
+
+    #[test]
+    fn test_open_read_only_connection_refuses_a_write() {
+        let (tmp, store) = open_test_store();
+        drop(store);
+
+        let ro = RetrievalStore::open_read_only(tmp.path()).unwrap();
+        let result = ro.upsert_history(test_history_row("s1", "session one"));
+        assert!(
+            result.is_err(),
+            "a connection opened with SQLITE_OPEN_READ_ONLY must refuse a write"
+        );
+    }
+
     fn test_history_row<'a>(session_id: &'a str, session_name: &'a str) -> HistoryUpsert<'a> {
         HistoryUpsert {
             session_id,
@@ -1087,9 +1555,11 @@ mod tests {
         assert!(store.table_exists("genome_fts").unwrap());
         assert!(store.table_exists("history_vec").unwrap());
         assert!(store.table_exists("genome_vec").unwrap());
+        assert!(store.table_exists("memory_records").unwrap());
+        assert!(store.table_exists("memory_fts").unwrap());
         assert_eq!(
             store.get_meta("schema_version").unwrap(),
-            Some("2".to_string())
+            Some("3".to_string())
         );
     }
 
@@ -1173,6 +1643,121 @@ mod tests {
         let results = store.search_history_keyword("retrieval", 10).unwrap();
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(|r| r.source == "history"));
+    }
+
+    /// Review P2: raw bm25 made `memory_search` and injection, which sort
+    /// descending, keep the weakest matches.
+    #[test]
+    fn test_keyword_scores_are_higher_for_stronger_matches() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_history(HistoryUpsert {
+                search_text: "auth auth auth auth auth token refresh",
+                ..test_history_row("strong", "Strong")
+            })
+            .unwrap();
+        store
+            .upsert_history(HistoryUpsert {
+                search_text: "auth mentioned once among many other unrelated words here",
+                ..test_history_row("weak", "Weak")
+            })
+            .unwrap();
+        store
+            .upsert_history(HistoryUpsert {
+                search_text: "nothing relevant",
+                ..test_history_row("none", "None")
+            })
+            .unwrap();
+        store.refresh_fts().unwrap();
+
+        let results = store.search_history_keyword("auth", 10).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].id, "strong");
+        assert!(
+            results[0].score > results[1].score,
+            "stronger match must score higher: {results:?}"
+        );
+    }
+
+    /// Review P2: the whole query used to be one FTS5 phrase.
+    #[test]
+    fn test_keyword_search_matches_words_in_any_order() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_history(HistoryUpsert {
+                search_text: "fixed bug in auth module",
+                ..test_history_row("s1", "Session")
+            })
+            .unwrap();
+        store.refresh_fts().unwrap();
+        let results = store.search_history_keyword("auth bug", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(store
+            .search_history_keyword("auth missing", 10)
+            .unwrap()
+            .is_empty());
+        // FTS5 syntax in user text stays literal instead of erroring.
+        assert!(store.search_history_keyword("auth OR \"bug", 10).is_ok());
+    }
+
+    fn index_one_memory_record(store: &RetrievalStore) {
+        store
+            .upsert_memory_record(MemoryRecordUpsert {
+                record_id: "rec-1",
+                project_id: "p",
+                scope: "project",
+                kind: "decision",
+                valid_from: "2026-09-12",
+                title: "promoted",
+                body: "kept",
+                source_json: "{}",
+                search_text: "promoted kept",
+                content_hash: "h",
+            })
+            .unwrap();
+    }
+
+    /// Review P2: an empty history wiped the promoted memory records too.
+    #[test]
+    fn test_delete_history_except_empty_keeps_memory_records() {
+        let (_tmp, store) = open_test_store();
+        index_one_memory_record(&store);
+        store.delete_history_except(&HashSet::new()).unwrap();
+        assert_eq!(store.count_memory_records().unwrap(), 1);
+    }
+
+    /// Review P2: a genome-only rebuild cleared the history index (and the
+    /// promoted records) with nothing to re-index them.
+    #[test]
+    fn test_clear_scope_clears_only_that_scope() {
+        let (_tmp, store) = open_test_store();
+        store
+            .upsert_history(HistoryUpsert {
+                search_text: "history text",
+                ..test_history_row("s1", "Session")
+            })
+            .unwrap();
+        store
+            .upsert_genome(GenomeUpsert {
+                search_text: "genome text",
+                ..test_genome_row("d1", "Decision")
+            })
+            .unwrap();
+        index_one_memory_record(&store);
+        store.refresh_fts().unwrap();
+
+        store.clear_scope(IndexScope::Genome).unwrap();
+        assert!(store.get_genome_by_id("d1").unwrap().is_none());
+        assert!(store.get_history_by_id("s1").unwrap().is_some());
+        assert_eq!(
+            store.search_history_keyword("history", 10).unwrap().len(),
+            1
+        );
+        assert_eq!(store.count_memory_records().unwrap(), 1);
+
+        store.clear_scope(IndexScope::All).unwrap();
+        assert!(store.get_history_by_id("s1").unwrap().is_none());
+        assert_eq!(store.count_memory_records().unwrap(), 1);
     }
 
     #[test]

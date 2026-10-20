@@ -12,6 +12,7 @@ mod tests {
 
     // Re-import handler functions from the extracted handlers module.
     // super::super = daemon module (tests.rs is daemon::tests, inner mod is daemon::tests::tests)
+    use super::super::actor_provenance::ConnectionClass;
     use super::super::handlers::{
         handle_delegation_request, handle_governed_task_request, handle_guard_request,
         handle_ops_request, handle_plugin_request, handle_session_request, handle_status,
@@ -753,15 +754,89 @@ mod tests {
 
     // -- Plugin registry initialization test --------------------------------------
 
+    // `init_global_registry` registers the office context provider only when the
+    // `office-support` feature is compiled in (`src/plugin/registry.rs`). Without
+    // it, nothing registers a context provider or an action handler, so the two
+    // variants below assert what each configuration actually produces instead of
+    // one assertion that is only true under the default feature set.
+
+    #[cfg(feature = "office-support")]
     #[test]
-    fn test_plugin_registry_initialized_after_init() {
-        crate::plugin::registry::init_global_registry();
-        let registry = crate::plugin::registry::global_registry();
-        // After init, the office context provider should be registered
+    fn test_init_global_registry_with_office_support_registers_office_provider() {
+        let registry = crate::plugin::registry::init_global_registry();
         let providers = registry.list_context_providers().unwrap();
         assert!(
-            !providers.is_empty(),
-            "init_global_registry should register at least the office context provider"
+            providers.iter().any(|p| p.name == "office"),
+            "init_global_registry should register the office context provider, got {:?}",
+            providers
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        for format in [
+            crate::office::OfficeFormat::Docx,
+            crate::office::OfficeFormat::Xlsx,
+            crate::office::OfficeFormat::Csv,
+        ] {
+            assert!(
+                registry.supports_format(format).unwrap(),
+                "office provider should be registered for {}",
+                format.as_str()
+            );
+        }
+        // Legacy `.xls` cannot be read under the office bounds, so the
+        // provider does not claim it.
+        assert!(!registry
+            .supports_format(crate::office::OfficeFormat::Xls)
+            .unwrap());
+    }
+
+    #[cfg(not(feature = "office-support"))]
+    #[test]
+    fn test_init_global_registry_without_office_support_registers_no_plugins() {
+        let registry = crate::plugin::registry::init_global_registry();
+        let providers = registry.list_context_providers().unwrap();
+        assert!(
+            providers.is_empty(),
+            "no context provider is registered without office-support, got {:?}",
+            providers
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            registry.list_action_handlers().unwrap().is_empty(),
+            "no action handler is registered by init_global_registry"
+        );
+    }
+
+    #[test]
+    fn test_init_global_registry_is_idempotent_and_returns_global() {
+        let first = crate::plugin::registry::init_global_registry();
+        let providers_before = first
+            .list_context_providers()
+            .unwrap()
+            .into_iter()
+            .map(|provider| provider.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let second = crate::plugin::registry::init_global_registry();
+        let providers_after = second
+            .list_context_providers()
+            .unwrap()
+            .into_iter()
+            .map(|provider| provider.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            std::ptr::eq(first, second),
+            "init_global_registry must return the single global registry"
+        );
+        assert!(
+            std::ptr::eq(first, crate::plugin::registry::global_registry()),
+            "init_global_registry must return the same instance as global_registry"
+        );
+        assert_eq!(
+            providers_before, providers_after,
+            "re-initializing must not change the provider set"
         );
     }
 
@@ -911,7 +986,8 @@ mod tests {
         let request: DaemonRequest =
             serde_json::from_str(&wire).expect("deserialize register request");
 
-        let registered = handle_governed_task_request(request, &state).await;
+        let registered =
+            handle_governed_task_request(request, &state, ConnectionClass::Operator).await;
         let DaemonResponse::Ok { result } = registered else {
             panic!("expected governed task registration success");
         };
@@ -934,6 +1010,7 @@ mod tests {
                 },
             },
             &state,
+            ConnectionClass::Operator,
         )
         .await;
         let DaemonResponse::Ok { result } = running else {
@@ -949,6 +1026,7 @@ mod tests {
                 task_id: running.id.clone(),
             },
             &state,
+            ConnectionClass::Operator,
         )
         .await;
         let DaemonResponse::Ok { result } = fetched else {
@@ -966,6 +1044,7 @@ mod tests {
                 project_id: "daemon-project".to_string(),
             },
             &state,
+            ConnectionClass::Operator,
         )
         .await;
         let DaemonResponse::Ok { result } = listed else {
@@ -1074,6 +1153,50 @@ mod tests {
             }
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    /// Review finding: the daemon accepted a second CompleteDelegation for
+    /// the same id and replaced the first worker's result.
+    #[tokio::test]
+    async fn test_handle_delegation_second_completion_is_refused() {
+        let tracker = delegation_tracker_handle();
+        let spec = crate::delegation::types::DelegationSpec {
+            task: "refactor auth".to_string(),
+            target_files: vec![],
+            constraints: None,
+            max_depth: 2,
+            restricted_tools: vec![],
+        };
+        let id = match handle_delegation_request(
+            DaemonRequest::RegisterDelegation {
+                spec,
+                coordinator_pane_id: 0,
+                context_snapshot: String::new(),
+            },
+            &tracker,
+        )
+        .await
+        {
+            DaemonResponse::Ok { result } => result["delegation_id"].as_str().unwrap().to_string(),
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        let complete = |summary: &str| DaemonRequest::CompleteDelegation {
+            delegation_id: id.clone(),
+            summary: summary.to_string(),
+            tool_trace: vec![],
+            diff_summary: None,
+        };
+
+        let first = handle_delegation_request(complete("worker A"), &tracker).await;
+        assert!(matches!(first, DaemonResponse::Ok { .. }), "{first:?}");
+        match handle_delegation_request(complete("worker B"), &tracker).await {
+            DaemonResponse::Error { message, .. } => {
+                assert!(message.contains("already completed"), "{message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+        let prompt = tracker.read().await.build_handoff_prompt(&id).unwrap();
+        assert!(prompt.contains("worker A") && !prompt.contains("worker B"));
     }
 
     #[tokio::test]
@@ -1287,6 +1410,112 @@ mod tests {
             }
             _ => panic!("Expected Ok response"),
         }
+    }
+
+    // ── Startup fallbacks (review P3-7) ──────────────────
+
+    fn state_in_project(tmp: &tempfile::TempDir) -> std::sync::Arc<crate::state::State> {
+        let impulse_dir = tmp.path().join(".impulse");
+        std::fs::create_dir_all(&impulse_dir).unwrap();
+        std::sync::Arc::new(crate::state::State::new(impulse_dir).unwrap())
+    }
+
+    /// An invalid manifest in `tools.d` dropped every external tool without
+    /// a word; the reason is now kept for `start` to log.
+    #[tokio::test]
+    async fn test_new_records_why_external_tools_were_not_loaded() {
+        use super::super::Daemon;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tools_dir = tmp.path().join(".impulse").join("tools.d");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(tools_dir.join("broken.json"), "{ not json").unwrap();
+
+        let daemon = Daemon::new(state_in_project(&tmp));
+        assert!(
+            daemon
+                .startup_warnings()
+                .iter()
+                .any(|w| w.contains("were not loaded") && w.contains("tools.d")),
+            "{:?}",
+            daemon.startup_warnings()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_without_fallbacks_has_no_startup_warnings() {
+        use super::super::Daemon;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let daemon = Daemon::new(state_in_project(&tmp));
+        assert!(
+            daemon.startup_warnings().is_empty(),
+            "{:?}",
+            daemon.startup_warnings()
+        );
+    }
+
+    /// Round 3 on d2789af: lock emulation on some network filesystems
+    /// reports a held lock as EACCES, which read as "flock unsupported" and
+    /// started a second daemon unlocked. Unknown errors refuse to start.
+    #[test]
+    fn test_classify_lock_failure_holds_eacces_and_refuses_the_unknown() {
+        use super::super::{classify_lock_failure, LockFailure};
+        assert_eq!(
+            classify_lock_failure(Some(libc::EWOULDBLOCK)),
+            LockFailure::Held
+        );
+        assert_eq!(classify_lock_failure(Some(libc::EACCES)), LockFailure::Held);
+        assert_eq!(
+            classify_lock_failure(Some(libc::ENOTSUP)),
+            LockFailure::Unsupported
+        );
+        assert_eq!(
+            classify_lock_failure(Some(libc::ENOLCK)),
+            LockFailure::Unsupported
+        );
+        assert_eq!(classify_lock_failure(Some(libc::EIO)), LockFailure::Other);
+        assert_eq!(classify_lock_failure(None), LockFailure::Other);
+    }
+
+    /// Refutation review of dddee6d (suspected): ownership rested on a
+    /// connect() check alone. A held lock now stops a second daemon before it
+    /// touches the socket or reconciles anything.
+    #[tokio::test]
+    async fn test_start_refuses_while_another_daemon_holds_the_lock() {
+        use super::super::{acquire_daemon_lock, Daemon};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let daemon = Daemon::new(state_in_project(&tmp));
+        let lock_path = daemon.socket_path().parent().unwrap().join("daemon.lock");
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let held = acquire_daemon_lock(&lock_path)
+            .expect("the first holder gets the lock")
+            .expect("flock is supported here");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), daemon.start())
+            .await
+            .expect("start must refuse at once, not run");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("already running"), "{err}");
+        assert!(
+            !daemon.socket_path().exists(),
+            "a refused daemon must not bind"
+        );
+
+        drop(held);
+        // A child another test forks in this process holds a copy of the
+        // descriptor until it execs (files are close-on-exec), so the release
+        // can lag the drop by a moment.
+        let mut again = acquire_daemon_lock(&lock_path);
+        for _ in 0..100 {
+            if matches!(again, Ok(Some(_))) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            again = acquire_daemon_lock(&lock_path);
+        }
+        assert!(
+            matches!(again, Ok(Some(_))),
+            "released with its holder: {again:?}"
+        );
     }
 
     // ── Stale socket detection tests ─────────────────────
@@ -1768,5 +1997,61 @@ mod tests {
         let json = serde_json::to_value(history).unwrap();
         assert!(json.is_array());
         assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    /// ADR-0023: the maintenance task's first pass runs immediately, so a
+    /// restarted daemon purges rows that expired while it was down, and a
+    /// project with no blackboard is never given one.
+    #[tokio::test]
+    async fn test_blackboard_maintenance_purges_on_startup_and_creates_nothing() {
+        let with_board = tempfile::TempDir::new().unwrap();
+        {
+            let board = crate::blackboard::Blackboard::open(with_board.path()).unwrap();
+            let entry = |task_id, ttl_seconds| crate::blackboard::NewEntry {
+                task_id,
+                payload: b"x",
+                content_type: "text/plain",
+                ttl_seconds,
+                metadata: serde_json::Value::Null,
+            };
+            board.put(entry("kept", None)).unwrap();
+            // Written with a creation time long past: a row that expired
+            // while the daemon was down.
+            board.put_at(entry("stale", Some(1)), 1_000).unwrap();
+        }
+        let raw_rows = |dir: &std::path::Path| -> i64 {
+            rusqlite::Connection::open(crate::blackboard::db_path(dir))
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM blackboard", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(raw_rows(with_board.path()), 2, "stale row is on disk");
+        let empty = tempfile::TempDir::new().unwrap();
+
+        let tasks = [
+            super::super::spawn_blackboard_maintenance(
+                with_board.path().to_path_buf(),
+                std::time::Duration::from_millis(20),
+            ),
+            super::super::spawn_blackboard_maintenance(
+                empty.path().to_path_buf(),
+                std::time::Duration::from_millis(20),
+            ),
+        ];
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        for task in &tasks {
+            assert!(!task.is_finished(), "maintenance keeps running");
+            task.abort();
+        }
+
+        assert_eq!(
+            raw_rows(with_board.path()),
+            1,
+            "the startup pass deleted the expired row"
+        );
+        assert!(
+            !crate::blackboard::db_path(empty.path()).exists(),
+            "the daemon must not create a blackboard in a project without one"
+        );
     }
 }

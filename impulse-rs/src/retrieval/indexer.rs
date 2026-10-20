@@ -8,9 +8,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use impulse_ops::memory_candidate::MemoryRecord;
+
 use crate::memory::{Decision, Genome};
 use crate::retrieval::embedding::embed_texts;
-use crate::retrieval::store::{GenomeUpsert, HistoryUpsert, RetrievalStore};
+use crate::retrieval::store::{GenomeUpsert, HistoryUpsert, MemoryRecordUpsert, RetrievalStore};
 use crate::retrieval::types::{IndexScope, IndexState};
 use crate::state::{Config, HistoryEntry, Platform};
 use crate::storage::Storage;
@@ -215,6 +217,67 @@ fn embed_genome_jobs(
     Ok(())
 }
 
+/// Index the promoted memory records that back the GENOME projection
+/// (ADR-0020).
+///
+/// This is a separate entry point from [`index_memory`] on purpose. Promoted
+/// records live in their own table and are never merged into
+/// `genome_decisions`: the hand-curated GENOME and the promoted-record log are
+/// different artifacts with different owners.
+///
+/// Only records passed in are indexed, and the caller is the state layer, which
+/// passes the *projection* — so a pending or dismissed candidate cannot reach
+/// the index at all (ADR-0013 rule 9).
+pub fn index_promoted_memory_records(base_path: &Path, records: &[MemoryRecord]) -> Result<usize> {
+    let _lock =
+        IndexLockGuard::acquire(base_path).context("Failed to acquire retrieval index lock")?;
+    let store = RetrievalStore::open(base_path).context("Failed to open retrieval store")?;
+    store
+        .init_schema()
+        .context("Failed to initialize retrieval schema")?;
+
+    let mut keep = HashSet::new();
+    for record in records {
+        let source_json = serde_json::to_string(&record.source)
+            .context("Failed to serialize memory record source for the retrieval index")?;
+        let search_text = format!("{} {}", record.title, record.body);
+        store
+            .upsert_memory_record(MemoryRecordUpsert {
+                record_id: record.id.as_str(),
+                project_id: &record.project_id,
+                scope: record.scope.label(),
+                kind: record.kind.label(),
+                valid_from: &record.valid_from,
+                title: &record.title,
+                body: &record.body,
+                source_json: &source_json,
+                search_text: &search_text,
+                // The record's own content digest is already a hash of exactly
+                // the indexed fields; there is no second hash to invent.
+                content_hash: &record.digest,
+            })
+            .context("Failed to index a promoted memory record")?;
+        keep.insert(record.id.as_str().to_string());
+    }
+    store
+        .delete_memory_records_except(&keep)
+        .context("Failed to drop memory records that left the projection")?;
+    Ok(records.len())
+}
+
+/// Keyword search over promoted memory records.
+pub fn search_promoted_memory(
+    base_path: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<crate::retrieval::types::SearchResult>> {
+    let store = RetrievalStore::open(base_path).context("Failed to open retrieval store")?;
+    store
+        .init_schema()
+        .context("Failed to initialize retrieval schema")?;
+    store.search_memory_keyword(query, limit)
+}
+
 pub fn index_memory(
     base_path: &Path,
     history: &[HistoryEntry],
@@ -233,7 +296,7 @@ pub fn index_memory(
         .context("Failed to initialize retrieval schema")?;
     if rebuild {
         store
-            .clear_all()
+            .clear_scope(scope)
             .context("Failed to clear retrieval store for rebuild")?;
     }
 
@@ -404,6 +467,14 @@ pub fn index_memory(
         backend_health.push("vector_backend_disabled=true".to_string());
     }
 
+    // A single-scope run leaves the other scope's rows in place; record
+    // what the store holds for it rather than 0.
+    if !matches!(scope, IndexScope::History | IndexScope::All) {
+        history_count = store.count_history_entries()?;
+    }
+    if !matches!(scope, IndexScope::Genome | IndexScope::All) {
+        genome_count = store.count_genome_decisions()?;
+    }
     let duration_ms = started.elapsed().as_millis() as u64;
     let state = IndexState {
         version: "1".to_string(),
@@ -461,7 +532,7 @@ pub fn index_memory_from_storage(
         .context("Failed to initialize retrieval schema")?;
     if rebuild {
         store
-            .clear_all()
+            .clear_scope(scope)
             .context("Failed to clear retrieval store for rebuild")?;
     }
 
@@ -638,6 +709,14 @@ pub fn index_memory_from_storage(
         backend_health.push("vector_backend_disabled=true".to_string());
     }
 
+    // A single-scope run leaves the other scope's rows in place; record
+    // what the store holds for it rather than 0.
+    if !matches!(scope, IndexScope::History | IndexScope::All) {
+        history_count = store.count_history_entries()?;
+    }
+    if !matches!(scope, IndexScope::Genome | IndexScope::All) {
+        genome_count = store.count_genome_decisions()?;
+    }
     let duration_ms = started.elapsed().as_millis() as u64;
     let state = IndexState {
         version: "1".to_string(),
@@ -750,6 +829,74 @@ mod tests {
             "vector must be removed when changed row re-embed fails"
         );
         std::env::remove_var("IMPULSE_EMBED_ALLOW_FAKE");
+    }
+
+    /// Refutation review of 6a060c7: semantic candidates came from the
+    /// all-words keyword search, so an entry missing one query word was
+    /// never scored. Candidates now match any word.
+    #[test]
+    fn test_semantic_candidates_match_any_query_word() {
+        let _guard = retrieval_embedding_env_lock();
+        let temp = TempDir::new().unwrap();
+        let cfg = Config {
+            retrieval_vector_enabled: false,
+            retrieval_backend: "fts".to_string(),
+            ..Config::default()
+        };
+        let mut history = vec![
+            sample_history("token refresh flow"),
+            sample_history("refresh the token later"),
+            sample_history("token renewal path"),
+        ];
+        for (i, entry) in history.iter_mut().enumerate() {
+            entry.session_id = format!("s{i}");
+        }
+        index_memory(
+            temp.path(),
+            &history,
+            &Genome::default(),
+            &cfg,
+            IndexScope::All,
+            true,
+        )
+        .unwrap();
+        let store = crate::retrieval::store::RetrievalStore::open(temp.path()).unwrap();
+        assert_eq!(
+            store
+                .search_history_keyword("token refresh", 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            store
+                .history_keyword_candidates("token refresh", 10)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    /// Refutation review of e5c5dc3: a genome-only rebuild kept the history
+    /// index but recorded history_count = 0.
+    #[test]
+    fn test_a_single_scope_rebuild_reports_the_other_scope_it_kept() {
+        let _guard = retrieval_embedding_env_lock();
+        let temp = TempDir::new().unwrap();
+        let cfg = Config {
+            retrieval_vector_enabled: false,
+            retrieval_backend: "fts".to_string(),
+            ..Config::default()
+        };
+        let history = vec![sample_history("kept across a genome rebuild")];
+        let mut genome = Genome::default();
+        genome.add_decision("Keep counts honest".to_string(), None, Vec::new());
+
+        index_memory(temp.path(), &history, &genome, &cfg, IndexScope::All, true).unwrap();
+        let state =
+            index_memory(temp.path(), &[], &genome, &cfg, IndexScope::Genome, true).unwrap();
+        assert_eq!(state.history_count, 1);
+        assert_eq!(state.genome_count, 1);
     }
 
     #[test]

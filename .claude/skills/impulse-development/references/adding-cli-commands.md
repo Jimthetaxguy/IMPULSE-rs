@@ -6,13 +6,14 @@ Step-by-step guide for adding a new CLI subcommand.
 
 ## Steps
 
-### 1. Add the enum variant in `src/main.rs`
+### 1. Add the enum variant in `src/cli.rs`
 
-Find the `Command` enum (clap derive) and add a new variant:
+`src/main.rs` is a thin entrypoint (it only calls `cli::Cli::parse()` and dispatches) — the
+`Commands` enum (clap derive) itself lives in `src/cli.rs`. Find it and add a new variant:
 
 ```rust
 #[derive(Subcommand)]
-enum Command {
+enum Commands {
     // ... existing commands ...
 
     /// Description of what this command does
@@ -38,17 +39,22 @@ For feature-gated commands:
 MyFeatureCommand { /* ... */ },
 ```
 
-### 2. Add the match arm in `main()`
+### 2. Add the match arm in the dispatch handlers
 
-Find the main match dispatch and add the new arm:
+The handler is shared, not duplicated per execution mode: `direct_dispatch.rs` and
+`daemon_dispatch.rs` both match on the same `cli::Commands` variant. Add the new arm to
+whichever dispatcher(s) the command applies to:
 
 ```rust
-Command::MyNewCommand { name, format, verbose } => {
+Commands::MyNewCommand { name, format, verbose } => {
     handle_my_new_command(&name, &format, verbose, &impulse_dir)?;
 }
 ```
 
-Keep the match arm thin — just extract args and call a handler function.
+Keep the match arm thin — just extract args and call a handler function. If the command is also
+exposed from the `ion` binary (`src/bin/ion.rs`), add a matching variant on `ion`'s own minimal
+`IonCommand` enum whose handler still calls the same shared function in `handlers::` — never a
+second implementation of the command's actual logic.
 
 ### 3. Create the handler function
 

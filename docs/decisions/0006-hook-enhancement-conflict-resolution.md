@@ -146,6 +146,37 @@ fn check_file_conflicts(file: &str, state: &State) -> Option<Conflict> {
 }
 ```
 
+## Amendment (2026-10-04): the PreToolUse hook exits 2 and reads stdin
+
+The guard never blocked a Claude Code tool call. Claude Code blocks a PreToolUse call only when
+the hook exits 2 (its stderr then goes to the model); exit 1 is a non-blocking error and the call
+proceeds. The generated hook also ran `guard --action "$INPUT"`, but Claude Code sets no `$INPUT`
+and sends the call as JSON on stdin, so every call was evaluated as an empty string. And
+`impulse-rs hooks` wrote `.claude/hooks/hooks.json`, which Claude Code does not load. The
+consequence above, "blocking provides real protection", did not hold.
+
+- `impulse-rs guard --hook` reads the PreToolUse payload from stdin, checks Bash commands against
+  `bash` rules and Write, Edit, MultiEdit, and NotebookEdit content against `file-write` rules, and
+  exits 2 on a Block-tier match with the rule's reason on stderr. Warn-tier matches print and exit 0.
+- It fails closed: a payload it cannot read, one with no `tool_name`, a checked tool missing the
+  field it checks, or a `config.json` it cannot load, exits 2. It runs
+  before the daemon client and before `State::new`, so neither can turn into an "allow" exit.
+- `impulse-rs guard --action ...` keeps exit 1 for scripts.
+- The generated PreToolUse entry is `impulse-rs -c "$CLAUDE_PROJECT_DIR/.impulse" guard --hook`
+  with matcher `Bash|Write|Edit|MultiEdit|NotebookEdit`. Anchoring on the project matters: Claude
+  Code can run the hook from a subdirectory, where a relative `.impulse` has no `config.json`, so
+  custom rules silently fell back to the built-in set. `impulse-rs hooks` still writes the template to
+  `.claude/hooks/hooks.json` and prints the entry to add to `.claude/settings.local.json`; the
+  template's session-tracking hooks are not installed, because they also rely on variables Claude
+  Code does not set.
+- The hook finds its `.impulse` the way git finds a repository.
+  - It uses the named directory if it exists. Otherwise it uses the nearest `.impulse` up to the
+    repository root, so a session started in a subdirectory still gets the project's own rules. An
+    `.impulse` above the repository, such as a user-level one, never counts.
+  - With none found and `CLAUDE_PROJECT_DIR` set, the built-in rules apply, so `impulse-rs init`
+    can run.
+  - With the variable unset or blank, the hook cannot tell which project it guards and exits 2.
+
 ## Related ADRs
 
 - ADR 0002: File-first memory — Uses `.impulse/` directory

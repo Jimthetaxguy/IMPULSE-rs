@@ -18,11 +18,13 @@ use std::os::unix::process::CommandExt;
 use anyhow::{Context, Result};
 use impulse_ops::governed_task::{
     GovernedActor, GovernedActorKind, GovernedClaimRequest, GovernedCommandEvidence,
-    GovernedSupervisorReviewEnvelope, GovernedTaskRun, GovernedVerificationInput,
-    GovernedVerificationOutcome, GovernedVerificationProfile, SupervisorVerdictInput,
-    WorkerCompletionClaimInput, MAX_PROFILED_ACCEPTANCE_CRITERIA,
-    MAX_PROFILED_ACCEPTANCE_CRITERION_BYTES, MAX_PROFILED_CLAIM_SUMMARY_BYTES,
-    MAX_PROFILED_TASK_BYTES,
+    GovernedPromotionInput, GovernedPromotionOutcome, GovernedSupervisorReviewEnvelope,
+    GovernedTaskRun, GovernedVerificationInput, GovernedVerificationOutcome,
+    GovernedVerificationProfile, PromotionBlockedReason, SharedConfigComponent,
+    SharedRepositoryConfigDigest, SharedRepositoryConfigPin, StagedWorktreeInput,
+    SupervisorVerdictInput, WorkerCompletionClaimInput, WorldScope,
+    MAX_PROFILED_ACCEPTANCE_CRITERIA, MAX_PROFILED_ACCEPTANCE_CRITERION_BYTES,
+    MAX_PROFILED_CLAIM_SUMMARY_BYTES, MAX_PROFILED_TASK_BYTES,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -390,6 +392,21 @@ fn reap_sync_child_after_kill(
     }
 }
 
+/// Run `command` until it exits or `timeout` passes, whichever comes first,
+/// with bounded output capture and process-group cleanup.
+///
+/// The child is polled every 10 ms. A poll that finds an exit status wins over
+/// a deadline that expired during the sleep before it: a child that finished is
+/// reported as finished.
+///
+/// A **zero** `timeout` is a deadline that has already expired. The child is
+/// spawned, killed and reaped without being polled, so the result is always
+/// `timed_out`. Polling first would leave the outcome to the scheduler: a fast
+/// child can exit between `spawn` and the first poll whenever this thread loses
+/// the CPU there, and the caller would see a completed process for a deadline
+/// that gave it no time to run. Production callers pass the fixed timeouts at
+/// the top of this module; zero is what a test passes to reach the deadline
+/// path without waiting for one.
 fn run_bounded_process(
     command: &mut std::process::Command,
     label: &str,
@@ -425,12 +442,16 @@ fn run_bounded_process(
 
     let started = Instant::now();
     let (status, timed_out) = loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("failed waiting for {label}"))?
-        {
-            process_group.kill_now();
-            break (Some(status), false);
+        // An already-expired deadline is never polled. That has to be decided
+        // here and not left to timing; see the function comment.
+        if !timeout.is_zero() {
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| format!("failed waiting for {label}"))?
+            {
+                process_group.kill_now();
+                break (Some(status), false);
+            }
         }
         if started.elapsed() >= timeout {
             process_group.kill_now();
@@ -460,15 +481,148 @@ fn run_bounded_process(
     })
 }
 
-fn run_git(workspace: &Path, args: &[&str]) -> Result<BoundedProcessOutput> {
+/// A `git` invocation with the repository's own hooks disabled.
+///
+/// `.git/hooks` is shared across every linked worktree, so a staged Builder can
+/// write a hook there that would otherwise execute inside a daemon-owned
+/// producer — at materialization, at promotion, or during any ordinary
+/// observation. `post-index-change` and `fsmonitor-watchman` fire on a bare
+/// `git status`, which the promotion path runs twice, so this is not only about
+/// the obviously mutating commands.
+///
+/// **Every** Git invocation in this module must be built here. There is no
+/// "read-only enough to skip it" category.
+///
+/// `core.fsmonitor` is disabled here as well. It is a second hook mechanism
+/// that `core.hooksPath` does not cover: given a pathname, Git executes it to
+/// query changed files, and it fires on a bare `git status` (confirmed against
+/// Git 2.50.1 as well as the 2.43 the review used). This is **belt and braces,
+/// not the guarantee** — the guarantee is that the pinned shared configuration
+/// is compared, byte for byte, before any Git process is spawned against that
+/// repository at all. Git honors the last `-c` for a key, so a value set inside
+/// the repository's own config cannot outrank this one.
+///
+/// Global and system configuration are suppressed outright. The env scrub keeps
+/// `HOME`, so without this a `filter.<name>.clean` in the operator's own
+/// `~/.gitconfig` would execute inside a daemon-owned producer — the same class
+/// of execution the repository-level pin exists to govern, through a file the
+/// pin does not and cannot cover. The producers need nothing from global config:
+/// they never commit, so `user.*` is irrelevant, and every behavior they depend
+/// on is either a default or passed explicitly. The one accepted cost is that a
+/// global `core.autocrlf` no longer applies to a producer's checkout, which
+/// matters only on a platform this gate does not yet run on.
+fn hook_free_git(workspace: &Path) -> std::process::Command {
     let mut command = std::process::Command::new("git");
-    command.arg("-C").arg(workspace).args(args);
+    command
+        .arg("-C")
+        .arg(workspace)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(["-c", "core.fsmonitor=false"]);
     scrub_and_allowlist_std_env(&mut command, &[]);
-    run_bounded_process(
-        &mut command,
-        &format!("git {}", args.join(" ")),
-        GIT_PROBE_TIMEOUT,
-    )
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null");
+    command
+}
+
+fn run_git(workspace: &Path, args: &[&str]) -> Result<BoundedProcessOutput> {
+    run_git_with_timeout(workspace, args, GIT_PROBE_TIMEOUT)
+}
+
+fn run_git_with_timeout(
+    workspace: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<BoundedProcessOutput> {
+    let mut command = hook_free_git(workspace);
+    command.args(args);
+    run_bounded_process(&mut command, &format!("git {}", args.join(" ")), timeout)
+}
+
+/// A bounded Git invocation that never reported an exit status of its own.
+///
+/// This is a typed error rather than a `false`, because the two are not the
+/// same claim and the producers translate exit status into governance findings.
+/// A `git merge-base --is-ancestor` that exits non-zero means *the subject is
+/// not descended from the registered OID*; the same call killed at its timeout
+/// means *we do not know*. Reporting the second as the first accuses a run of a
+/// violation that did not happen — and under load it is the likelier of the two,
+/// because a timed-out child is killed and reaped, so it comes back with a
+/// signal status that is simply "not success".
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GitProbeFailure {
+    #[error(
+        "`{command}` timed out in a governed producer; the observation is unknown, not a finding"
+    )]
+    TimedOut { command: String },
+    #[error(
+        "`{command}` was killed before reporting an exit status in a governed producer; the observation is unknown, not a finding"
+    )]
+    Killed { command: String },
+}
+
+/// Whether a bounded Git invocation *completed* and succeeded.
+///
+/// Every producer call site that turns an exit status into a decision must go
+/// through this, so a timed-out or killed probe can never be read as a decision
+/// the process never made.
+fn git_completed_successfully(output: &BoundedProcessOutput, command: &str) -> Result<bool> {
+    if output.timed_out {
+        return Err(GitProbeFailure::TimedOut {
+            command: command.to_string(),
+        }
+        .into());
+    }
+    match output.status {
+        Some(status) => Ok(status.success()),
+        None => Err(GitProbeFailure::Killed {
+            command: command.to_string(),
+        }
+        .into()),
+    }
+}
+
+/// Create one detached Git worktree at `checkout`, pinned to `subject_revision`.
+///
+/// Shared by daemon-owned verification (a throwaway snapshot under a temporary
+/// directory) and by the ADR-0019 staged Builder worktree, so both paths use
+/// exactly the same bounded, env-scrubbed, closed-argv Git invocation and the
+/// same failure cleanup. A failed or timed-out add is unregistered before the
+/// error propagates, so a killed `git worktree add` cannot leave a locked
+/// administrative entry behind.
+fn add_detached_worktree(
+    source_workspace: &Path,
+    checkout: &Path,
+    subject_revision: &str,
+    timeout: Duration,
+    label: &str,
+) -> Result<()> {
+    validate_oid(subject_revision)?;
+    let mut command = hook_free_git(source_workspace);
+    command
+        .args(["worktree", "add", "--detach"])
+        .arg(checkout)
+        .arg(subject_revision);
+    let output =
+        match run_bounded_process(&mut command, &format!("{label} materialization"), timeout) {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = cleanup_detached_worktree(source_workspace, checkout);
+                return Err(error);
+            }
+        };
+    let completed = match git_completed_successfully(&output, "git worktree add --detach") {
+        Ok(completed) => completed,
+        Err(error) => {
+            let _ = cleanup_detached_worktree(source_workspace, checkout);
+            return Err(error).with_context(|| format!("{label} materialization"));
+        }
+    };
+    if !completed {
+        let _ = cleanup_detached_worktree(source_workspace, checkout);
+        anyhow::bail!("failed to materialize {label}");
+    }
+    Ok(())
 }
 
 struct DetachedVerificationWorkspace {
@@ -479,16 +633,13 @@ struct DetachedVerificationWorkspace {
 }
 
 fn cleanup_detached_worktree(source_workspace: &Path, checkout: &Path) -> bool {
-    let mut command = std::process::Command::new("git");
+    let mut command = hook_free_git(source_workspace);
     command
-        .arg("-C")
-        .arg(source_workspace)
         // A killed `git worktree add` can leave its administrative entry
         // locked in the "initializing" state. Git requires force twice to
         // remove a locked worktree; one force only covers ordinary dirtiness.
         .args(["worktree", "remove", "--force", "--force"])
         .arg(checkout);
-    scrub_and_allowlist_std_env(&mut command, &[]);
     run_bounded_process(
         &mut command,
         "detached governed subject cleanup",
@@ -534,32 +685,13 @@ impl DetachedVerificationWorkspace {
             .context("failed to allocate detached verification directory")?;
         let checkout = temporary_root.path().join("subject");
         let target_dir = temporary_root.path().join("target");
-        let mut command = std::process::Command::new("git");
-        command
-            .arg("-C")
-            .arg(source_workspace)
-            .args(["worktree", "add", "--detach"])
-            .arg(&checkout)
-            .arg(subject_revision);
-        scrub_and_allowlist_std_env(&mut command, &[]);
-        let output = match run_bounded_process(
-            &mut command,
-            "detached governed subject materialization",
+        add_detached_worktree(
+            source_workspace,
+            &checkout,
+            subject_revision,
             timeout,
-        ) {
-            Ok(output) => output,
-            Err(error) => {
-                let _ = cleanup_detached_worktree(source_workspace, &checkout);
-                return Err(error);
-            }
-        };
-        if output.timed_out || !output.status.is_some_and(|status| status.success()) {
-            let _ = cleanup_detached_worktree(source_workspace, &checkout);
-            if output.timed_out {
-                anyhow::bail!("detached governed subject materialization timed out");
-            }
-            anyhow::bail!("failed to materialize detached governed subject");
-        }
+            "detached governed subject",
+        )?;
         Ok(Self {
             source_workspace: source_workspace.to_path_buf(),
             checkout,
@@ -641,10 +773,9 @@ impl Drop for DetachedVerificationWorkspace {
 
 fn successful_git_bytes(workspace: &Path, args: &[&str], label: &str) -> Result<Vec<u8>> {
     let output = run_git(workspace, args)?;
-    if output.timed_out {
-        anyhow::bail!("{label} timed out for governed workspace");
-    }
-    if !output.status.is_some_and(|status| status.success()) {
+    if !git_completed_successfully(&output, &format!("git {}", args.join(" ")))
+        .with_context(|| format!("{label} could not be observed"))?
+    {
         anyhow::bail!("{label} failed for governed workspace");
     }
     if output.stdout_truncated {
@@ -710,8 +841,78 @@ fn is_untracked_impulse_runtime_artifact(path: &[u8]) -> bool {
             | b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json"
             | b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.lock"
             | b".impulse/sockets/impulse.pid"
+            // ADR-0019: a staged Builder worktree lives inside the project's own
+            // `.impulse` namespace, so an ungitignored `.impulse` would otherwise
+            // report the canonical tree as dirty for the rest of the run.
+            | b".impulse/worktrees"
+            | b".impulse/worktrees/"
+            // ADR-0012's reservation journal (PR #45). Nothing wrote this file
+            // on a governed path until the producer handlers adopted
+            // `with_reservation`, at which point an ungitignored `.impulse`
+            // started reporting the canonical tree as dirty the moment a
+            // verification reserved -- breaking every later claim and
+            // registration in the same workspace.
+            | b".impulse/PRODUCER_RESERVATIONS.json"
+            // ADR-0013's accepted-run memory candidates. `impulse init`
+            // gitignores this file but the cleanliness check never exempted it,
+            // so in a project whose `.impulse` is not gitignored, recording an
+            // operator approval dirtied the canonical tree -- and the very next
+            // promotion, which is only reachable *after* an approval, failed on
+            // a tree the daemon had dirtied itself.
+            | b".impulse/MEMORY_CANDIDATES.json"
+            // ADR-0023's blackboard. Ion opens it inside whatever worktree it
+            // runs in, including a staged Builder worktree, the moment a tool
+            // result spills; an ungitignored `.impulse` would then report the
+            // very tree the Builder is about to claim as dirty.
+            | b".impulse/blackboard.db"
     ) || path.starts_with(b".impulse/GOVERNED_TASKS.tmp.")
+        || path.starts_with(b".impulse/blackboard.db-")
         || path.starts_with(b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-")
+        || path.starts_with(b".impulse/PRODUCER_RESERVATIONS.tmp.")
+        || path.starts_with(b".impulse/MEMORY_CANDIDATES.tmp.")
+        || path.starts_with(b".impulse/worktrees/")
+        || is_impulse_memory_evidence_artifact(path)
+}
+
+/// ADR-0020 rule 3a: the promoted-memory log and its projection are tracked and
+/// deliberately not gitignored, so without an exemption the first promotion
+/// makes the next governed registration refuse the workspace as dirty — as an
+/// untracked `??` before the first commit, and as a tracked ` M` forever after.
+///
+/// Sound for exactly these two paths and no others: they are written only by
+/// the daemon's own decision path, a launched Builder is never given a way to
+/// write them, and their content is digest-chained, so a Builder that did write
+/// them would fail the memory log's own load rather than smuggle a fact into an
+/// accepted run.
+fn is_impulse_memory_evidence_artifact(path: &[u8]) -> bool {
+    matches!(
+        path,
+        b".impulse/MEMORY.jsonl" | b".impulse/GENOME_PROJECTION.md"
+    ) || path.starts_with(b".impulse/GENOME_PROJECTION.tmp.")
+}
+
+/// Status codes whose tracked mutation a memory-evidence path may be exempt for.
+///
+/// Modification and addition only. A **deletion** of the promoted-memory log is
+/// still a subject change: destroying evidence is not a promotion side effect.
+const EXEMPT_TRACKED_STATUS_CODES: &[&[u8; 2]] = &[b" M", b"M ", b"MM", b"A ", b"AM"];
+
+/// Split a porcelain-v1 record into its status code and path, when it has one.
+///
+/// A `-z` rename emits the origin path as its own bare record with no status
+/// prefix; that record returns `None` and is treated as a subject change.
+fn tracked_status_and_path(record: &[u8]) -> Option<(&[u8], &[u8])> {
+    if record.len() < 4 || record[2] != b' ' {
+        return None;
+    }
+    let (code, rest) = record.split_at(2);
+    if !EXEMPT_TRACKED_STATUS_CODES
+        .iter()
+        .any(|exempt| exempt.as_slice() == code)
+    {
+        return None;
+    }
+    Some((code, &rest[1..]))
 }
 
 fn status_contains_subject_change(status: &[u8]) -> bool {
@@ -721,9 +922,14 @@ fn status_contains_subject_change(status: &[u8]) -> bool {
         }
         match record.strip_prefix(b"?? ") {
             Some(path) => !is_untracked_impulse_runtime_artifact(path),
-            // Tracked/staged mutations are always subject changes, even when
-            // their path is in Impulse's generated runtime namespace.
-            None => true,
+            // Tracked/staged mutations are subject changes, even when their path
+            // is in Impulse's generated runtime namespace — with the single
+            // ADR-0020 exemption above, which is why this arm is no longer a
+            // bare `true`.
+            None => match tracked_status_and_path(record) {
+                Some((_, path)) => !is_impulse_memory_evidence_artifact(path),
+                None => true,
+            },
         }
     })
 }
@@ -743,6 +949,20 @@ fn validate_oid(oid: &str) -> Result<()> {
 pub(crate) fn observe_clean_git_subject(
     workspace: &Path,
     initial_oid: Option<&str>,
+) -> Result<String> {
+    observe_clean_git_subject_with_ancestry_timeout(workspace, initial_oid, GIT_PROBE_TIMEOUT)
+}
+
+/// The ancestry probe's timeout is injectable for exactly one reason: its
+/// non-zero exit is the only Git exit status this function translates into a
+/// *governance finding*, so it is the one probe whose timeout handling has to be
+/// provable. Production always passes [`GIT_PROBE_TIMEOUT`]; the test passes a
+/// zero deadline. Same test-seam shape as `chat_with_tools_capped_timeout` and
+/// `harness_query_structured_with_timeout`.
+fn observe_clean_git_subject_with_ancestry_timeout(
+    workspace: &Path,
+    initial_oid: Option<&str>,
+    ancestry_timeout: Duration,
 ) -> Result<String> {
     let canonical_workspace = workspace
         .canonicalize()
@@ -783,11 +1003,17 @@ pub(crate) fn observe_clean_git_subject(
 
     if let Some(initial_oid) = initial_oid {
         validate_oid(initial_oid)?;
-        let ancestry = run_git(
+        let ancestry = run_git_with_timeout(
             &canonical_workspace,
             &["merge-base", "--is-ancestor", initial_oid, &oid],
+            ancestry_timeout,
         )?;
-        if !ancestry.status.is_some_and(|status| status.success()) {
+        // A non-zero exit here is a finding; a probe that never reported one is
+        // not. Under load the second is the likelier failure — a timed-out child
+        // is killed and reaped, so it comes back as simply "not success" — and
+        // reporting it as the first accuses a run of a violation that did not
+        // happen.
+        if !git_completed_successfully(&ancestry, "git merge-base --is-ancestor")? {
             anyhow::bail!("governed Git subject is not descended from the registered initial OID");
         }
     }
@@ -806,6 +1032,120 @@ async fn observe_clean_git_subject_async(
     .context("governed Git subject observer worker panicked")?
 }
 
+/// Why a producer refused to run Git in a staged worktree at all.
+///
+/// A typed error rather than a string, because a caller (a daemon endpoint, a
+/// future reservation wrapper) has to be able to tell "the staged world is not
+/// in a state we may touch" apart from an ordinary Git failure, without parsing
+/// prose.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StagedConfigRefusal {
+    #[error(
+        "governed task `{task_id}`'s staged worktree carries no comparable shared-repository-configuration pin; discard it and re-materialize before running a producer"
+    )]
+    Unpinned { task_id: String },
+    #[error(
+        "shared repository configuration changed since governed task `{task_id}`'s staged worktree was materialized ({component}); refusing to run Git in that worktree"
+    )]
+    Changed {
+        task_id: String,
+        component: SharedConfigComponent,
+    },
+    #[error(
+        "governed task `{task_id}` targets a repository with submodule configuration ({path}); the staged world scope does not support submodules"
+    )]
+    UnsupportedSubmodules { task_id: String, path: String },
+}
+
+/// Refuse a repository that carries submodule configuration.
+///
+/// Each submodule is a repository with a configuration file of its own —
+/// `<common>/modules/<name>/config` for the main worktree and
+/// `<common>/worktrees/<id>/modules/<name>/config` for a linked one — and a
+/// `filter.<name>.clean` defined there fires on the enclosing worktree's
+/// `git status`, which is the first thing every producer runs. Reproduced
+/// against Git 2.50.1.
+///
+/// Pinning that set would mean walking a directory tree whose shape is Git's to
+/// change, so the staged scope refuses submodule repositories outright instead.
+/// That is the honest position: rule 13 claims to pin *every* repository-level
+/// configuration file Git reads, and a scope that cannot make that true for a
+/// repository must not run in it. Filesystem reads only, so it is callable
+/// before the first Git invocation.
+fn ensure_no_submodule_configuration(
+    task_id: &str,
+    workspace: &Path,
+    staged_root: Option<&Path>,
+) -> Result<()> {
+    let mut candidates = vec![workspace.join(".gitmodules")];
+    candidates.push(
+        SharedGitPaths::resolve(workspace)?
+            .common_dir
+            .join("modules"),
+    );
+    if let Some(staged_root) = staged_root {
+        candidates.push(staged_root.join(".gitmodules"));
+        candidates.push(
+            SharedGitPaths::resolve(staged_root)?
+                .git_dir
+                .join("modules"),
+        );
+    }
+    for candidate in candidates {
+        if candidate.symlink_metadata().is_ok() {
+            return Err(StagedConfigRefusal::UnsupportedSubmodules {
+                task_id: task_id.to_string(),
+                path: candidate.display().to_string(),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Refuse to run Git in a staged worktree whose shared configuration no longer
+/// matches the pin recorded at materialization.
+///
+/// Promotion had this gate from the start; the claim and verification producers
+/// did not, and they run `git status` in the staged worktree — which applies
+/// `filter.<name>.clean` to any file the attributes route through it. A Builder
+/// that writes `filter.evil.clean` into the shared `.git/config` and commits a
+/// matching `.gitattributes` therefore executed its own script inside a
+/// daemon-owned producer at claim time, before an operator ever saw the run.
+/// Reproduced against Git 2.50.1.
+///
+/// Reads files and runs no Git, so it is callable before the first invocation.
+/// A non-staged task, or a staged task with no active worktree, has nothing to
+/// compare and is left to the caller's own checks.
+fn ensure_staged_config_pin_holds(task: &GovernedTaskRun) -> Result<()> {
+    let Some(staged) = task.active_staged_worktree() else {
+        return Ok(());
+    };
+    let task_id = task.id.as_str().to_string();
+    let workspace = Path::new(&task.workspace_root);
+    let staged_root = Path::new(staged.root.as_str());
+    ensure_no_submodule_configuration(&task_id, workspace, Some(staged_root))?;
+    let Some(pinned) = staged.shared_config_digest.comparable() else {
+        return Err(StagedConfigRefusal::Unpinned { task_id }.into());
+    };
+    let observed = shared_repository_config_digest(workspace, Some(staged_root))?;
+    match pinned.first_difference(&observed) {
+        Some(component) => Err(StagedConfigRefusal::Changed { task_id, component }.into()),
+        None => Ok(()),
+    }
+}
+
+/// The working tree a governed producer observes the subject in.
+///
+/// The canonical workspace root for every non-staged task; the active staged
+/// worktree for a `staged_authoritative` one. A staged task whose worktree has
+/// not been materialized has no source tree at all, and that is an error rather
+/// than a fallback to the canonical checkout — see ADR-0019's post-merge fixes.
+fn governed_source_root(task: &GovernedTaskRun) -> Result<&str> {
+    task.launch_working_directory()
+        .context("governed producer cannot locate the task's source tree")
+}
+
 /// Build a claim from daemon-observed task and Git state. The caller supplies
 /// only the human/model summary and artifact references.
 pub(crate) fn derive_claim(
@@ -819,8 +1159,15 @@ pub(crate) fn derive_claim(
         .initial_subject_revision
         .as_deref()
         .context("profiled governed task lost its initial Git OID")?;
+    // Before the first Git invocation, exactly as promotion does.
+    ensure_staged_config_pin_holds(task)?;
+    // ADR-0019: a staged Builder commits inside its own worktree, so the claim's
+    // subject must be observed there. `launch_working_directory` returns the
+    // canonical workspace root for every non-staged task, so this is the same
+    // path it always was for them, and errors rather than falling back when a
+    // staged task has no materialized worktree.
     let subject_revision =
-        observe_clean_git_subject(Path::new(&task.workspace_root), Some(initial_oid))?;
+        observe_clean_git_subject(Path::new(governed_source_root(task)?), Some(initial_oid))?;
 
     // Keep profile read explicit so adding another subject type cannot silently
     // reuse Git semantics.
@@ -1089,11 +1436,26 @@ pub(crate) async fn run_verification(task: &GovernedTaskRun) -> Result<GovernedV
     let claim = task
         .latest_claim()
         .context("governed verification requires a current worker claim")?;
-    let workspace = PathBuf::from(&task.workspace_root);
+    // Before the first Git invocation, exactly as promotion does. The reads are
+    // a handful of small files, so they stay on this task rather than paying for
+    // a blocking-pool round trip.
+    ensure_staged_config_pin_holds(task)?;
+    // ADR-0019, 2026-09-12 post-merge fix for the first #50 P1 finding. The
+    // verifier must observe the same tree the claim was derived from. A staged
+    // Builder commits inside its staged worktree and the canonical checkout
+    // deliberately stays on the registered initial OID until promotion, so
+    // observing `workspace_root` here meant every staged run failed this exact
+    // check — before the detached verifier was ever created — and could never
+    // reach Supervisor review or operator acceptance. `launch_working_directory`
+    // is the canonical workspace root for every non-staged task, so nothing
+    // changes for them. The detached verification worktree is then created from
+    // the staged worktree's own commit, still detached and still hook-free, and
+    // the canonical tree is never read or written by this producer.
+    let workspace = PathBuf::from(governed_source_root(task)?);
     let before =
         observe_clean_git_subject_async(workspace.clone(), Some(initial_oid.to_string())).await?;
     if before != claim.subject_revision {
-        anyhow::bail!("governed workspace HEAD does not match the claimed subject revision");
+        anyhow::bail!("governed source HEAD does not match the claimed subject revision");
     }
     let verification_workspace = DetachedVerificationWorkspace::materialize_async(
         workspace.clone(),
@@ -1334,6 +1696,1047 @@ pub(crate) fn bind_supervisor_review(
     })
 }
 
+// ---------------------------------------------------------------------------
+// ADR-0019: staged Builder world scope
+// ---------------------------------------------------------------------------
+
+/// Where the shared Git state of one worktree lives, resolved without running
+/// Git.
+///
+/// This mirrors Git's own resolution: `<workspace>/.git` is either the Git
+/// directory itself (main worktree) or a `gitdir:` pointer file (linked
+/// worktree); a Git directory that carries a `commondir` file points at the
+/// directory shared by every worktree. Resolving it by hand is the point — the
+/// promotion gate must be able to compare the pinned bytes *before* any Git
+/// process is spawned against a repository whose configuration is exactly what
+/// is in question.
+struct SharedGitPaths {
+    /// This worktree's own Git directory.
+    git_dir: PathBuf,
+    /// The directory shared by every worktree of the repository.
+    common_dir: PathBuf,
+}
+
+impl SharedGitPaths {
+    fn resolve(workspace: &Path) -> Result<Self> {
+        let dot_git = workspace.join(".git");
+        // Following symlinks deliberately: a symlinked `.git` is unusual but
+        // legal, and the question here is what it *is*, not what it points at.
+        let metadata = std::fs::metadata(&dot_git)
+            .with_context(|| format!("failed to stat {}", dot_git.display()))?;
+        let git_dir = if metadata.is_dir() {
+            dot_git
+        } else {
+            let pointer = std::fs::read_to_string(&dot_git)
+                .with_context(|| format!("failed to read {}", dot_git.display()))?;
+            let target = pointer
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("gitdir:"))
+                .map(str::trim)
+                .filter(|target| !target.is_empty())
+                .with_context(|| format!("{} is not a Git directory pointer", dot_git.display()))?;
+            resolve_against(workspace, Path::new(target))
+        };
+        let common_dir = match std::fs::read_to_string(git_dir.join("commondir")) {
+            Ok(pointer) => {
+                let target = pointer.trim();
+                if target.is_empty() {
+                    anyhow::bail!("{} is empty", git_dir.join("commondir").display());
+                }
+                resolve_against(&git_dir, Path::new(target))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir.clone(),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read {}", git_dir.join("commondir").display())
+                })
+            }
+        };
+        Ok(Self {
+            git_dir,
+            common_dir,
+        })
+    }
+
+    /// Every path whose bytes `.git/config` is pinned over. The included files
+    /// are added by the include walk, not here.
+    fn repository_config(&self) -> PathBuf {
+        self.common_dir.join("config")
+    }
+
+    /// Worktree-scoped config is per-worktree, so this worktree's own copy and
+    /// the shared one are both pinned. They are the same file in a main
+    /// worktree, and the digest helpers deduplicate.
+    fn worktree_configs(&self) -> Vec<PathBuf> {
+        vec![
+            self.git_dir.join("config.worktree"),
+            self.common_dir.join("config.worktree"),
+        ]
+    }
+
+    /// `info/attributes` resolves to the common directory in today's Git, but
+    /// the per-worktree spelling is pinned too rather than relying on that
+    /// staying true. Nothing writes it, so pinning it costs nothing.
+    fn info_attributes(&self) -> Vec<PathBuf> {
+        vec![
+            self.common_dir.join("info").join("attributes"),
+            self.git_dir.join("info").join("attributes"),
+        ]
+    }
+}
+
+fn resolve_against(base: &Path, target: &Path) -> PathBuf {
+    if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        base.join(target)
+    }
+}
+
+/// How many files one include chain may reach before the walk gives up. A
+/// repository with a deeper chain than this is refused rather than partially
+/// digested.
+const MAX_CONFIG_INCLUDE_FILES: usize = 64;
+
+/// Digest every piece of worktree-shared state that can turn a later Git
+/// checkout into command execution.
+///
+/// `.git/config` and `.git/info/attributes` are shared by the main worktree and
+/// every linked one, so a staged Builder can write them from inside its own
+/// checkout — and `info/attributes` never appears in a diff of the work tree,
+/// so it is invisible to code review. A `filter.<name>.smudge` or
+/// `diff.<name>.textconv` defined there runs whenever Git materializes a file,
+/// including the working-tree sync promotion performs, in the canonical
+/// workspace, under operator authority, after review has already passed.
+/// Disabling hooks does not touch that path.
+///
+/// **Raw bytes, never a rendered listing.** The original implementation hashed
+/// a *sorted* `git config --local --list` rendering. That was wrong twice over,
+/// and both were found by the #50 review:
+///
+/// 1. Sorting erases order, and order is semantic: Git resolves a repeated
+///    scalar key to the **last** value. Swapping two existing
+///    `filter.<name>.smudge` lines arms a different driver while producing an
+///    identical digest. Reproduced against Git 2.50.1.
+/// 2. Producing the listing meant running Git — inside the very repository
+///    whose configuration is under suspicion — before the comparison could
+///    refuse anything.
+///
+/// Hashing the file bytes fixes both: no ordering is lost, and no process is
+/// spawned. Files reachable through `include.path` / `includeIf.*.path` are
+/// hashed into the same component, because their contents are configuration
+/// too and they can be edited without touching `.git/config` itself; adding a
+/// new include is caught by the bytes of the config that names it.
+///
+/// **Why this gate is safe, and exactly how far that goes:** within the files it
+/// covers, it detects *change*, so it never has to enumerate which Git keys are
+/// dangerous — a driver cannot be defined in a pinned file without changing the
+/// bytes being compared. What it does *not* survive is being wrong about the
+/// **set of files Git reads**: a configuration source outside this list is
+/// outside the gate, which is precisely how the staged worktree's own
+/// `config.worktree` was missed in the first round and how global and system
+/// configuration were reachable until `hook_free_git` began suppressing them.
+/// Treat the file list as the security-relevant surface and re-derive it when
+/// Git grows a new source.
+///
+/// `.git/config.worktree` is included because worktree-scoped config *not*
+/// accepting filter keys is convention, not a Git guarantee — the file takes
+/// arbitrary keys, and it is only read when `extensions.worktreeConfig` is on.
+/// Turning that extension on would itself rewrite `.git/config` and be caught,
+/// but pinning the file directly costs nothing and removes the argument.
+///
+/// Pinning across the run is the trust boundary: configuration that predates
+/// the run is the operator's own and is honored; configuration the Builder
+/// introduced blocks promotion until a human looks at it.
+fn shared_repository_config_digest(
+    workspace: &Path,
+    staged_root: Option<&Path>,
+) -> Result<SharedRepositoryConfigDigest> {
+    let canonical = SharedGitPaths::resolve(workspace)?;
+    // The staged worktree has a Git directory of its own, and Git reads
+    // `<common>/worktrees/<id>/config.worktree` for every command run there —
+    // including the `git status` the producers run in that worktree. Pinning
+    // only the canonical worktree's copy left that file unpinned, which is
+    // reachable whenever `extensions.worktreeConfig` is already on (enabling it
+    // rewrites `.git/config` and would be caught, but `git sparse-checkout` in a
+    // linked worktree turns it on for perfectly ordinary reasons). A Builder
+    // could then define a `filter.<name>.clean` plus a `core.attributesFile`
+    // there, leave `.git/config` byte-identical, and have the script execute in
+    // a daemon-owned producer. Reproduced against Git 2.50.1.
+    let staged = staged_root.map(SharedGitPaths::resolve).transpose()?;
+
+    let repository_config = digest_config_chain(&[canonical.repository_config()])?
+        .context("a Git repository with no shared config file cannot be pinned")?;
+
+    let mut worktree_configs = canonical.worktree_configs();
+    let mut info_attributes = canonical.info_attributes();
+    if let Some(staged) = &staged {
+        worktree_configs.extend(staged.worktree_configs());
+        info_attributes.extend(staged.info_attributes());
+    }
+
+    Ok(SharedRepositoryConfigDigest::current(
+        repository_config,
+        digest_config_chain(&worktree_configs)?,
+        digest_files(&info_attributes)?,
+    ))
+}
+
+/// The staged worktree a pin is computed against, when the task has one.
+///
+/// A pin recorded at materialization covers the staged worktree's own
+/// per-worktree state, so every later comparison must cover the same paths or
+/// the two digests answer different questions.
+fn pinned_staged_root(task: &GovernedTaskRun) -> Option<&Path> {
+    task.active_staged_worktree()
+        .map(|staged| Path::new(staged.root.as_str()))
+}
+
+/// Digest the raw bytes of every configuration file in `roots`, plus every file
+/// their `include`/`includeIf` directives name, transitively.
+///
+/// Returns `None` only when no root exists at all; a root that exists is
+/// digested with every reachable include, and an include target that is absent
+/// is digested as an absence marker (creating it later is a change).
+fn digest_config_chain(roots: &[PathBuf]) -> Result<Option<String>> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"impulse-shared-repo-config-v2\0");
+    let mut visited: Vec<PathBuf> = Vec::new();
+    let mut queue: Vec<PathBuf> = Vec::new();
+    let mut any_root_exists = false;
+    for root in roots {
+        queue.push(root.clone());
+    }
+    let mut index = 0usize;
+    while index < queue.len() {
+        let path = queue[index].clone();
+        index += 1;
+        // Compare on the literal path, and on the canonical one when it
+        // resolves, so a symlinked or `../`-spelled cycle terminates.
+        let identity = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if visited.contains(&identity) {
+            continue;
+        }
+        visited.push(identity);
+        if visited.len() > MAX_CONFIG_INCLUDE_FILES {
+            anyhow::bail!(
+                "shared Git configuration reaches more than {MAX_CONFIG_INCLUDE_FILES} included files; refusing to pin it"
+            );
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => {
+                if roots.contains(&path) {
+                    any_root_exists = true;
+                }
+                Some(bytes)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to read shared Git configuration {}", path.display())
+                })
+            }
+        };
+        // The path is part of the digest so that moving content between two
+        // included files is a change, not a wash.
+        let path_bytes = path.as_os_str().as_encoded_bytes();
+        hasher.update((path_bytes.len() as u64).to_be_bytes());
+        hasher.update(path_bytes);
+        match bytes {
+            None => hasher.update([0u8]),
+            Some(bytes) => {
+                hasher.update([1u8]);
+                hasher.update((bytes.len() as u64).to_be_bytes());
+                hasher.update(&bytes);
+                let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                for include in config_include_paths(&bytes, parent).with_context(|| {
+                    format!(
+                        "failed to resolve the include directives in shared Git configuration {}",
+                        path.display()
+                    )
+                })? {
+                    queue.push(include);
+                }
+            }
+        }
+    }
+    if !any_root_exists {
+        return Ok(None);
+    }
+    Ok(Some(format!("sha256:{:x}", hasher.finalize())))
+}
+
+/// Every path an `include.path` or `includeIf.<condition>.path` line names.
+///
+/// Conditions are deliberately ignored: an `includeIf` whose condition is false
+/// today can become true later, and the gate is about detecting change rather
+/// than predicting Git's evaluation.
+///
+/// **Parsed as bytes, never as UTF-8.** The first version decoded the file and
+/// gave up on the whole thing when the decode failed — so a single Latin-1 byte
+/// anywhere, in a comment or a user's name, skipped *every* include directive in
+/// that file while Git went on honoring them. An included file defining a filter
+/// could then change after materialization with the recorded and observed
+/// digests still equal, which is the one outcome this pin exists to prevent.
+/// Git's configuration syntax is ASCII; values are bytes. So is this.
+///
+/// Paths are taken as the exact bytes Git would open (on Unix an `OsStr` is
+/// bytes, so no decoding happens at all). On a platform where paths are not
+/// bytes, a non-UTF-8 path fails closed rather than being guessed at, because a
+/// guessed path digests the wrong file — or nothing — and reports it as pinned.
+///
+/// Backslash line continuation is honored, because Git honors it. The one
+/// spelling deliberately left unresolved is `~user/`, which needs a passwd
+/// lookup the standard library does not offer; it is recorded as a residual in
+/// ADR-0019 rather than half-implemented.
+fn config_include_paths(bytes: &[u8], base: &Path) -> Result<Vec<PathBuf>> {
+    let mut includes = Vec::new();
+    let mut section: Vec<u8> = Vec::new();
+    for raw_line in join_continued_lines(bytes) {
+        let mut line = raw_line.trim_ascii();
+        if let Some(rest) = line.strip_prefix(b"[") {
+            let Some(end) = rest.iter().position(|byte| *byte == b']') else {
+                continue;
+            };
+            section = rest[..end].trim_ascii().to_ascii_lowercase();
+            line = rest[end + 1..].trim_ascii();
+            if line.is_empty() {
+                continue;
+            }
+        }
+        if !(section == b"include" || section.starts_with(b"includeif")) {
+            continue;
+        }
+        let Some(separator) = line.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        if !line[..separator].trim_ascii().eq_ignore_ascii_case(b"path") {
+            continue;
+        }
+        let Some(value) = config_value(&line[separator + 1..]) else {
+            continue;
+        };
+        includes.push(expand_config_path(&value, base)?);
+    }
+    Ok(includes)
+}
+
+/// One configuration value's bytes as the path Git would open.
+///
+/// On Unix a path *is* bytes, so this is exact. Elsewhere a non-UTF-8 value
+/// cannot be turned into a path without guessing, and this fails closed: the
+/// caller propagates the error, the pin cannot be computed, and materialization
+/// refuses rather than recording a digest that covers the wrong file.
+#[cfg(unix)]
+fn path_from_config_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(PathBuf::from(OsStr::from_bytes(bytes)))
+}
+
+#[cfg(not(unix))]
+fn path_from_config_bytes(bytes: &[u8]) -> Result<PathBuf> {
+    let text = std::str::from_utf8(bytes).context(
+        "a shared Git configuration include path is not valid UTF-8 and cannot be resolved on this platform",
+    )?;
+    Ok(PathBuf::from(text))
+}
+
+/// Join lines that Git treats as one: a value ending in a single backslash
+/// continues on the next line.
+///
+/// Counted rather than matched, so `path = c:\\` (an even number of trailing
+/// backslashes, meaning one escaped backslash) is not mistaken for a
+/// continuation.
+///
+/// Comment lines never continue. In Git the continuation lives inside *value*
+/// parsing, not at the line level, so `# hidden \` does not swallow the line
+/// after it — and treating it as a continuation would let a comment hide a real
+/// `[include]` header from this walk, leaving its target unpinned. A comment
+/// also ends any continuation in progress rather than being appended to it,
+/// which is the conservative direction: at worst the walk finds an include Git
+/// would not honor, never the reverse.
+fn join_continued_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut joined: Vec<Vec<u8>> = Vec::new();
+    let mut pending: Option<Vec<u8>> = None;
+    for raw_line in bytes.split(|byte| *byte == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let comment = matches!(line.trim_ascii_start().first(), Some(b'#') | Some(b';'));
+        if comment {
+            if let Some(buffer) = pending.take() {
+                joined.push(buffer);
+            }
+            joined.push(line.to_vec());
+            continue;
+        }
+        let trailing = line.len()
+            - line
+                .iter()
+                .rposition(|byte| *byte != b'\\')
+                .map(|index| index + 1)
+                .unwrap_or(0);
+        let continues = trailing % 2 == 1;
+        let body = if continues {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
+        match pending.as_mut() {
+            Some(buffer) => buffer.extend_from_slice(body),
+            None => pending = Some(body.to_vec()),
+        }
+        if !continues {
+            if let Some(buffer) = pending.take() {
+                joined.push(buffer);
+            }
+        }
+    }
+    if let Some(buffer) = pending.take() {
+        joined.push(buffer);
+    }
+    joined
+}
+
+/// Strip an inline comment, surrounding quotes, and backslash escapes from one
+/// configuration value. Bytes in, bytes out: a value can name a path that is not
+/// valid UTF-8, and Git will open it.
+fn config_value(raw: &[u8]) -> Option<Vec<u8>> {
+    let mut value: Vec<u8> = Vec::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    for byte in raw.trim_ascii_start() {
+        if escaped {
+            value.push(*byte);
+            escaped = false;
+            continue;
+        }
+        match *byte {
+            b'\\' => escaped = true,
+            b'"' => quoted = !quoted,
+            b'#' | b';' if !quoted => break,
+            other => value.push(other),
+        }
+    }
+    let value = value.trim_ascii().to_vec();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Resolve one include path the way Git does: `~/` against the home directory,
+/// anything else relative against the including file's own directory.
+fn expand_config_path(value: &[u8], base: &Path) -> Result<PathBuf> {
+    if let Some(rest) = value.strip_prefix(b"~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return Ok(PathBuf::from(home).join(path_from_config_bytes(rest)?));
+        }
+    }
+    Ok(resolve_against(base, &path_from_config_bytes(value)?))
+}
+
+/// Digest the raw bytes of a fixed list of shared files, or `None` when none of
+/// them exists. Absence is pinned too: creating one during a run is a change.
+///
+/// Unlike [`digest_config_chain`] this follows no includes, because the files it
+/// covers (`info/attributes`) have no include mechanism.
+fn digest_files(paths: &[PathBuf]) -> Result<Option<String>> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"impulse-shared-file-v2\0");
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut any_exists = false;
+    for path in paths {
+        let identity = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if seen.contains(&identity) {
+            continue;
+        }
+        seen.push(identity);
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => {
+                any_exists = true;
+                Some(bytes)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read shared Git file {}", path.display()))
+            }
+        };
+        let path_bytes = path.as_os_str().as_encoded_bytes();
+        hasher.update((path_bytes.len() as u64).to_be_bytes());
+        hasher.update(path_bytes);
+        match bytes {
+            None => hasher.update([0u8]),
+            Some(bytes) => {
+                hasher.update([1u8]);
+                hasher.update((bytes.len() as u64).to_be_bytes());
+                hasher.update(&bytes);
+            }
+        }
+    }
+    if !any_exists {
+        return Ok(None);
+    }
+    Ok(Some(format!("sha256:{:x}", hasher.finalize())))
+}
+
+/// Actor recorded for daemon-owned staged-worktree and promotion side effects.
+fn staged_system_actor() -> GovernedActor {
+    GovernedActor {
+        kind: GovernedActorKind::System,
+        id: "impulse-daemon:staged_worktree".to_string(),
+    }
+}
+
+fn require_staged_scope(task: &GovernedTaskRun) -> Result<()> {
+    if task.world_scope != WorldScope::StagedAuthoritative {
+        anyhow::bail!("this producer requires a staged_authoritative world scope");
+    }
+    Ok(())
+}
+
+/// Materialize the disposable worktree a staged Builder works in.
+///
+/// The daemon observes a clean canonical tree still sitting on the attested
+/// initial OID, then creates `<workspace>/.impulse/worktrees/<task id>` through
+/// the same detached `git worktree add` path verification already uses. Nothing
+/// here is caller-authored: the path is derived from the task record and the
+/// revision is the one the registration attested.
+///
+/// The configuration pin is computed after the worktree exists, so it covers
+/// that worktree's own per-worktree files. The window between the two is
+/// synchronous with no `.await` and no launch path: launching requires the
+/// active staged record this function's caller has not recorded yet,
+/// `MarkRunning` refuses a staged task without one, and materialization is
+/// operator-only. Nothing runs in the staged worktree before its pin exists.
+pub fn materialize_staged_worktree(task: &GovernedTaskRun) -> Result<StagedWorktreeInput> {
+    require_staged_scope(task)?;
+    let initial = task
+        .initial_subject_revision
+        .as_deref()
+        .context("staged governed task lost its initial Git OID")?;
+    validate_oid(initial)?;
+    let workspace = PathBuf::from(&task.workspace_root);
+    // Before anything is created, and before the first Git call: a repository
+    // with submodules carries configuration this scope cannot pin.
+    ensure_no_submodule_configuration(task.id.as_str(), &workspace, None)?;
+    let head = observe_clean_git_subject(&workspace, None)?;
+    if head != initial {
+        anyhow::bail!(
+            "canonical workspace HEAD moved off the registered initial OID before staging"
+        );
+    }
+    let root = task
+        .expected_staged_worktree_root()
+        .context("staged governed task cannot derive its worktree root")?;
+    if root.symlink_metadata().is_ok() {
+        // Fail closed: reusing a surviving directory could hand the Builder
+        // someone else's half-finished tree. Name the recovery rather than
+        // leaving the operator to guess it.
+        anyhow::bail!(
+            "staged worktree path {} already exists; refusing to reuse it. \
+             If it survived an interrupted run, delete that directory and then \
+             run `git -C {} worktree prune` to drop its administrative entry.",
+            root.display(),
+            workspace.display()
+        );
+    }
+    let parent = root
+        .parent()
+        .context("staged worktree root has no parent directory")?;
+    std::fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "failed to create staged worktree parent {}",
+            parent.display()
+        )
+    })?;
+    add_detached_worktree(
+        &workspace,
+        &root,
+        initial,
+        GIT_MATERIALIZE_TIMEOUT,
+        "governed staged Builder worktree",
+    )?;
+    // Everything past the `git worktree add` must undo it on failure. Without
+    // that, a pin that cannot be computed — an include chain over the cap, an
+    // unreadable include target — leaves the checkout and its administrative
+    // entry behind, and every retry then dies at the "already exists" check with
+    // a message about a leftover the *first* attempt created. The recovery text
+    // that check prints is for a crash, not for an error this function returned.
+    let recorded = (|| -> Result<StagedWorktreeInput> {
+        // Computed after the worktree exists, so the pin covers the staged
+        // worktree's own per-worktree configuration as well as the canonical
+        // worktree's and the shared files. Every later comparison passes the
+        // same staged root.
+        let shared_config_digest = shared_repository_config_digest(&workspace, Some(&root))?;
+        let root = root
+            .to_str()
+            .context("staged worktree root is not valid UTF-8")?
+            .to_string();
+        Ok(StagedWorktreeInput {
+            actor: staged_system_actor(),
+            root,
+            initial_subject_revision: initial.to_string(),
+            shared_config_digest: SharedRepositoryConfigPin::Recorded(shared_config_digest),
+        })
+    })();
+
+    match recorded {
+        Ok(input) => Ok(input),
+        Err(error) => {
+            discard_materialized_worktree(&workspace, &root);
+            Err(error)
+        }
+    }
+}
+
+/// Remove a staged checkout and its administrative entry, best effort.
+///
+/// Shared by the failure path of [`materialize_staged_worktree`] and by
+/// [`discard_staged_worktree`]: a worktree this producer created and could not
+/// finish recording must not outlive the call, or it blocks every retry.
+fn discard_materialized_worktree(workspace: &Path, root: &Path) {
+    if !cleanup_detached_worktree(workspace, root) {
+        tracing::warn!(
+            checkout = %root.display(),
+            "failed to unregister staged governed Builder worktree"
+        );
+    }
+    if root.symlink_metadata().is_ok() {
+        if let Err(error) = std::fs::remove_dir_all(root) {
+            tracing::warn!(
+                checkout = %root.display(),
+                %error,
+                "failed to remove staged governed Builder worktree"
+            );
+        }
+    }
+}
+
+pub async fn materialize_staged_worktree_async(
+    task: GovernedTaskRun,
+) -> Result<StagedWorktreeInput> {
+    tokio::task::spawn_blocking(move || materialize_staged_worktree(&task))
+        .await
+        .context("staged governed worktree materialization worker panicked")?
+}
+
+/// The branch HEAD currently points at, or `None` on a detached HEAD.
+///
+/// `git symbolic-ref --quiet HEAD` exits non-zero without output when HEAD is
+/// detached, which is a legitimate observation rather than a failure.
+fn canonical_branch_ref(workspace: &Path) -> Result<Option<String>> {
+    let mut command = hook_free_git(workspace);
+    command.args(["symbolic-ref", "--quiet", "HEAD"]);
+    let output = run_bounded_process(
+        &mut command,
+        "canonical branch resolution",
+        GIT_PROBE_TIMEOUT,
+    )?;
+    // `symbolic-ref --quiet` exits non-zero on a detached HEAD, which is a real
+    // observation. A killed probe is not one, and must not be read as a detached
+    // head: promotion would block with `detached_head` for a head that is on a
+    // branch.
+    if !git_completed_successfully(&output, "git symbolic-ref --quiet HEAD")? {
+        return Ok(None);
+    }
+    if output.stdout_truncated {
+        anyhow::bail!("canonical branch resolution exceeded the bounded Git output limit");
+    }
+    let reference = String::from_utf8(output.stdout)
+        .context("canonical branch reference is not valid UTF-8")?
+        .trim()
+        .to_string();
+    if !reference.starts_with("refs/heads/") {
+        anyhow::bail!("canonical HEAD resolved to `{reference}`, which is not a local branch");
+    }
+    Ok(Some(reference))
+}
+
+/// Read the canonical HEAD commit **without running Git**, for the one caller
+/// that must report a head while refusing to spawn Git against the repository:
+/// a promotion blocked because the pinned shared configuration no longer holds.
+///
+/// This walks the ref files the way Git's own files backend does — `HEAD`, then
+/// the loose ref, then `packed-refs`. A repository using a backend that does not
+/// store refs as files (the `reftable` backend) is not readable this way, and
+/// this returns an error rather than a guess; the caller turns that into a
+/// refusal that still names the configuration component that changed.
+fn read_head_oid_without_git(workspace: &Path) -> Result<String> {
+    let paths = SharedGitPaths::resolve(workspace)?;
+    let head_path = paths.git_dir.join("HEAD");
+    let head = std::fs::read_to_string(&head_path)
+        .with_context(|| format!("failed to read {}", head_path.display()))?;
+    let head = head.trim();
+    let Some(reference) = head.strip_prefix("ref:").map(str::trim) else {
+        // A detached HEAD stores the OID directly.
+        validate_oid(head)?;
+        return Ok(head.to_string());
+    };
+    let mut ref_roots = vec![&paths.git_dir];
+    if paths.common_dir != paths.git_dir {
+        ref_roots.push(&paths.common_dir);
+    }
+    for directory in ref_roots {
+        let loose = directory.join(reference);
+        match std::fs::read_to_string(&loose) {
+            Ok(oid) => {
+                let oid = oid.trim().to_string();
+                validate_oid(&oid)?;
+                return Ok(oid);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", loose.display()))
+            }
+        }
+    }
+    let packed_path = paths.common_dir.join("packed-refs");
+    let packed = match std::fs::read_to_string(&packed_path) {
+        Ok(packed) => packed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", packed_path.display()))
+        }
+    };
+    for line in packed.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with('^') {
+            continue;
+        }
+        if let Some((oid, name)) = line.split_once(' ') {
+            if name.trim() == reference {
+                let oid = oid.trim().to_string();
+                validate_oid(&oid)?;
+                return Ok(oid);
+            }
+        }
+    }
+    anyhow::bail!("could not resolve canonical `{reference}` without running Git")
+}
+
+/// Read HEAD without asserting cleanliness. Used only to report what a lost
+/// compare-and-swap actually found.
+fn observe_head_oid(workspace: &Path) -> Result<String> {
+    let oid = successful_git_text(
+        workspace,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        "canonical head observation",
+    )?;
+    validate_oid(&oid)?;
+    Ok(oid)
+}
+
+/// The whole canonical-branch side effect, isolated in one function.
+///
+/// A durable producer reservation (the sibling journal lane) wraps exactly this
+/// call: everything before it is observation, everything after it is recording.
+///
+/// The move is a real compare-and-swap. `git update-ref <ref> <new> <old>`
+/// fails unless the ref is still exactly `expected_revision` at the instant it
+/// writes, which `git merge --ff-only` cannot promise — it re-reads HEAD and
+/// then writes, leaving a window for a concurrent commit. Returns `false` when
+/// the swap lost, which the caller reports as a blocked promotion rather than
+/// an error.
+/// The reflog message the compare-and-swap writes, naming the exact move.
+/// A retried promotion looks for it to tell its own landed swap apart from
+/// a branch that merely sits at the accepted commit.
+fn promotion_reflog_message(initial_revision: &str, accepted_revision: &str) -> String {
+    format!("impulse governed promotion {initial_revision}..{accepted_revision}")
+}
+
+/// Whether `branch_ref`'s recent reflog shows this promotion moving it from
+/// `initial_revision` to `accepted_revision`, with nothing moving it off the
+/// accepted commit since. No reflog, or a probe that fails, is no evidence.
+fn branch_carries_this_promotion(
+    workspace: &Path,
+    branch_ref: &str,
+    initial_revision: &str,
+    accepted_revision: &str,
+) -> Result<bool> {
+    let mut command = hook_free_git(workspace);
+    command
+        .args(["reflog", "show", "-n", "20", "--format=%H%x09%gs"])
+        .arg(branch_ref);
+    let output = run_bounded_process(
+        &mut command,
+        "governed outcome promotion reflog check",
+        GIT_PROBE_TIMEOUT,
+    )?;
+    if !git_completed_successfully(&output, "git reflog show")? {
+        return Ok(false);
+    }
+    if output.stdout_truncated {
+        anyhow::bail!("promotion reflog check exceeded the bounded Git output limit");
+    }
+    let entries = String::from_utf8(output.stdout).context("branch reflog is not valid UTF-8")?;
+    let expected = promotion_reflog_message(initial_revision, accepted_revision);
+    // Newest first: every entry down to ours must leave the branch at the
+    // accepted commit (a later `reset` to the same commit does).
+    for entry in entries.lines() {
+        let (revision, subject) = entry.split_once('\t').unwrap_or((entry, ""));
+        if revision != accepted_revision {
+            return Ok(false);
+        }
+        if subject == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn compare_and_swap_canonical_branch(
+    workspace: &Path,
+    branch_ref: &str,
+    expected_revision: &str,
+    accepted_revision: &str,
+) -> Result<bool> {
+    validate_oid(expected_revision)?;
+    validate_oid(accepted_revision)?;
+    let mut command = hook_free_git(workspace);
+    // `--create-reflog` writes the entry even where `core.logAllRefUpdates`
+    // is off, so a retry can always find it.
+    command
+        .arg("update-ref")
+        .arg("--create-reflog")
+        .arg("-m")
+        .arg(promotion_reflog_message(
+            expected_revision,
+            accepted_revision,
+        ))
+        .arg(branch_ref)
+        .arg(accepted_revision)
+        .arg(expected_revision);
+    let output = run_bounded_process(
+        &mut command,
+        "governed outcome promotion compare-and-swap",
+        GIT_MATERIALIZE_TIMEOUT,
+    )?;
+    // `false` here is reported as `concurrent_branch_update` — a claim about what
+    // another writer did. A probe that never reported an exit status supports no
+    // such claim, so it errors instead.
+    git_completed_successfully(&output, "git update-ref")
+}
+
+/// Bring the canonical working tree in line with the branch the swap just moved.
+///
+/// `update-ref` writes the ref and nothing else, so without this the working
+/// tree and index would still hold the pre-promotion revision. The tree was
+/// observed clean immediately before the swap, so this replaces nothing a human
+/// authored; the residual window between that observation and this call is
+/// documented in ADR-0019.
+fn sync_canonical_worktree(workspace: &Path, accepted_revision: &str) -> Result<()> {
+    validate_oid(accepted_revision)?;
+    let mut command = hook_free_git(workspace);
+    command
+        .args(["reset", "--hard", "--quiet"])
+        .arg(accepted_revision);
+    let output = run_bounded_process(
+        &mut command,
+        "governed outcome promotion worktree sync",
+        GIT_MATERIALIZE_TIMEOUT,
+    )?;
+    let completed =
+        git_completed_successfully(&output, "git worktree sync").with_context(|| {
+            format!(
+                "governed outcome promotion advanced the canonical branch to {accepted_revision}, \
+             but the working-tree sync never reported an exit status; sync it manually before \
+             further work"
+            )
+        })?;
+    if !completed {
+        anyhow::bail!(
+            "governed outcome promotion advanced the canonical branch to {accepted_revision}, \
+             but the working tree could not be synced to it; sync it manually before further work"
+        );
+    }
+    Ok(())
+}
+
+/// Promote an accepted staged outcome onto the canonical branch.
+///
+/// Fast-forward only, and only while the canonical head is still exactly the
+/// OID the task was registered at. A canonical head that moved is reported as
+/// [`GovernedPromotionOutcome::PromotionBlocked`]: an execution fact recorded
+/// against an already-accepted run, never an error that rewrites review state.
+pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromotionInput> {
+    require_staged_scope(task)?;
+    if !task.is_accepted() {
+        anyhow::bail!("promotion requires an accepted governed task");
+    }
+    let staged = task
+        .active_staged_worktree()
+        .context("promotion requires an active staged worktree")?;
+    let claim = task
+        .latest_claim()
+        .context("promotion requires an accepted worker claim")?;
+    let accepted_revision = claim.subject_revision.clone();
+    validate_oid(&accepted_revision)?;
+    let initial = staged.initial_subject_revision.clone();
+    let workspace = PathBuf::from(&task.workspace_root);
+
+    let blocked = |canonical_head: String, reason: PromotionBlockedReason| GovernedPromotionInput {
+        actor: staged_system_actor(),
+        accepted_revision: accepted_revision.clone(),
+        initial_subject_revision: initial.clone(),
+        outcome: GovernedPromotionOutcome::PromotionBlocked {
+            canonical_head,
+            reason,
+        },
+    };
+
+    // FIRST, before any Git process is spawned against this repository:
+    // submodule configuration is unpinnable, and worktree-shared configuration
+    // must be exactly what it was when this worktree was materialized.
+    //
+    // Submodules are an *error* rather than a blocked outcome: a blocked
+    // promotion says "the canonical branch could not be advanced, retry after
+    // reconciling it", and that is not what happened here. A repository this
+    // scope cannot govern is a registration-time mistake, and materialization
+    // already refuses it — this catches only a `.gitmodules` introduced mid-run.
+    ensure_no_submodule_configuration(
+        task.id.as_str(),
+        &workspace,
+        Some(Path::new(staged.root.as_str())),
+    )?;
+    //
+    // The original code observed the staged worktree and the canonical tree
+    // first, and compared configuration afterwards. Both observations run
+    // `git status`, and a `core.fsmonitor` set to a pathname is a hook Git
+    // executes there — `core.hooksPath` does not cover it, confirmed against
+    // Git 2.50.1. The Builder writes that key from inside its own checkout,
+    // because `.git/config` is shared with every linked worktree, so the
+    // comparison that was supposed to refuse the run happened *after* the
+    // Builder's program had already run under operator authority. The order is
+    // the fix; the `-c core.fsmonitor=false` in `hook_free_git` is only belt
+    // and braces. Everything above this point is pure filesystem reading.
+    let config_block = match staged.shared_config_digest.comparable() {
+        // Materialized before the pin existed, or under a superseded digest
+        // scheme: there is nothing to compare, and guessing is exactly what
+        // this gate must not do.
+        None => Some(PromotionBlockedReason::RepositoryConfigUnpinned),
+        Some(pinned) => pinned
+            .first_difference(&shared_repository_config_digest(
+                &workspace,
+                pinned_staged_root(task),
+            )?)
+            .map(|component| PromotionBlockedReason::RepositoryConfigChanged { component }),
+    };
+    if let Some(reason) = config_block {
+        // Reporting the head must not spawn Git here either, which is why this
+        // one read walks the ref files directly.
+        let canonical_head = read_head_oid_without_git(&workspace).with_context(|| {
+            format!(
+                "promotion is blocked ({reason}) and the canonical head could not be read \
+                 without running Git in a repository whose configuration is in question"
+            )
+        })?;
+        return Ok(blocked(canonical_head, reason));
+    }
+
+    let staged_head = observe_clean_git_subject(Path::new(&staged.root), Some(&initial))
+        .context("staged worktree is not a clean descendant of the initial OID")?;
+    if staged_head != accepted_revision {
+        anyhow::bail!("staged worktree HEAD does not match the accepted subject revision");
+    }
+
+    let canonical_head = observe_clean_git_subject(&workspace, None)?;
+
+    // A detached canonical HEAD has no branch to advance. Moving HEAD alone
+    // would look like a successful promotion right up until the next
+    // `git switch`, which would orphan the accepted commit entirely.
+    let Some(branch_ref) = canonical_branch_ref(&workspace)? else {
+        return Ok(blocked(
+            canonical_head,
+            PromotionBlockedReason::DetachedHead,
+        ));
+    };
+    // A retry after the branch already advanced -- the swap landed, then the
+    // receipt failed or the daemon died before recording it, or the worktree
+    // sync failed and was redone by hand as its error asks -- finds the clean
+    // canonical branch at the accepted commit. When the branch's reflog shows
+    // this promotion's own swap, that is its effect, not a concurrent move;
+    // reporting it as `CanonicalHeadMoved` left the run unpromotable. A branch
+    // that only happens to sit there (say, one checked out at the accepted
+    // commit to inspect it) has no such entry and is still reported as moved.
+    if canonical_head == accepted_revision
+        && branch_carries_this_promotion(&workspace, &branch_ref, &initial, &accepted_revision)?
+    {
+        return Ok(GovernedPromotionInput {
+            actor: staged_system_actor(),
+            accepted_revision: accepted_revision.clone(),
+            initial_subject_revision: initial,
+            outcome: GovernedPromotionOutcome::Promoted {
+                promoted_revision: accepted_revision,
+            },
+        });
+    }
+    if canonical_head != initial {
+        return Ok(blocked(
+            canonical_head,
+            PromotionBlockedReason::CanonicalHeadMoved,
+        ));
+    }
+
+    if !compare_and_swap_canonical_branch(&workspace, &branch_ref, &initial, &accepted_revision)? {
+        let observed = observe_head_oid(&workspace).unwrap_or(canonical_head);
+        return Ok(blocked(
+            observed,
+            PromotionBlockedReason::ConcurrentBranchUpdate,
+        ));
+    }
+    sync_canonical_worktree(&workspace, &accepted_revision)?;
+
+    let promoted = observe_clean_git_subject(&workspace, Some(&initial))?;
+    if promoted != accepted_revision {
+        anyhow::bail!("canonical head did not land the accepted revision after promotion");
+    }
+    Ok(GovernedPromotionInput {
+        actor: staged_system_actor(),
+        accepted_revision: accepted_revision.clone(),
+        initial_subject_revision: initial,
+        outcome: GovernedPromotionOutcome::Promoted {
+            promoted_revision: accepted_revision,
+        },
+    })
+}
+
+pub async fn promote_governed_outcome_async(
+    task: GovernedTaskRun,
+) -> Result<GovernedPromotionInput> {
+    tokio::task::spawn_blocking(move || promote_governed_outcome(&task))
+        .await
+        .context("governed outcome promotion worker panicked")?
+}
+
+/// Remove a staged worktree and its administrative entry. Called after a
+/// rejection, or after a completed promotion.
+pub fn discard_staged_worktree(task: &GovernedTaskRun) -> Result<()> {
+    require_staged_scope(task)?;
+    let staged = task
+        .active_staged_worktree()
+        .context("task has no active staged worktree to discard")?;
+    let workspace = PathBuf::from(&task.workspace_root);
+    let root = PathBuf::from(&staged.root);
+    if !cleanup_detached_worktree(&workspace, &root) {
+        tracing::warn!(
+            checkout = %root.display(),
+            "failed to unregister staged governed Builder worktree"
+        );
+    }
+    if root.symlink_metadata().is_ok() {
+        std::fs::remove_dir_all(&root)
+            .with_context(|| format!("failed to remove staged worktree {}", root.display()))?;
+    }
+    Ok(())
+}
+
+pub async fn discard_staged_worktree_async(task: GovernedTaskRun) -> Result<()> {
+    tokio::task::spawn_blocking(move || discard_staged_worktree(&task))
+        .await
+        .context("staged governed worktree discard worker panicked")?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1347,6 +2750,9 @@ mod tests {
         let status = std::process::Command::new("git")
             .arg("-C")
             .arg(repo)
+            // The harness's own Git must not run project hooks either, or a
+            // planted hook would fire on the test's own commits.
+            .args(["-c", "core.hooksPath=/dev/null"])
             .args(args)
             .status()
             .unwrap();
@@ -1380,6 +2786,7 @@ mod tests {
             task: "implement the change".to_string(),
             acceptance_criteria: vec!["tests pass".to_string()],
             approval_policy: ApprovalPolicy::OperatorRequired,
+            world_scope: WorldScope::default(),
             verification_profile: Some(GovernedVerificationProfile::RustWorkspaceV1),
             role_assignment: None,
             role_compatibility: None,
@@ -1387,7 +2794,10 @@ mod tests {
             agent_id: "worker-1".to_string(),
             session_id: None,
             initial_subject_revision: Some(subject.clone()),
+            staged_worktree: None,
+            promotions: Vec::new(),
             execution_state: GovernedExecutionState::Running,
+            exit_kind: Default::default(),
             review_state: GovernedReviewState::AwaitingSupervisor,
             claims: vec![WorkerCompletionClaim {
                 id: claim_id.clone(),
@@ -1399,6 +2809,8 @@ mod tests {
                 subject_revision: subject.clone(),
                 artifact_ids: Vec::new(),
                 diff_ref: None,
+                loop_report_digest: None,
+                loop_report_version: None,
                 submitted_at: "2026-07-13T00:00:00Z".to_string(),
                 based_on_revision: 1,
             }],
@@ -1507,6 +2919,157 @@ mod tests {
             .contains("dirty"));
     }
 
+    /// ADR-0023: a real blackboard (database plus its WAL and shared-memory
+    /// sidecars) in an ungitignored `.impulse` leaves the subject clean.
+    #[test]
+    fn clean_git_subject_exempts_the_blackboard_database_and_sidecars() {
+        let repo = init_repo();
+        let initial = observe_clean_git_subject(repo.path(), None).unwrap();
+        let impulse = repo.path().join(".impulse");
+        let board = crate::blackboard::Blackboard::open(&impulse).unwrap();
+        board
+            .put(crate::blackboard::NewEntry {
+                task_id: "spill:bash_exec:1",
+                payload: b"output",
+                content_type: "text/plain",
+                ttl_seconds: None,
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        // Keep the connection open so the WAL sidecars exist during the check.
+        assert!(impulse.join("blackboard.db").exists());
+        assert_eq!(
+            observe_clean_git_subject(repo.path(), Some(&initial)).unwrap(),
+            initial
+        );
+        assert!(is_untracked_impulse_runtime_artifact(
+            b".impulse/blackboard.db-wal"
+        ));
+        assert!(is_untracked_impulse_runtime_artifact(
+            b".impulse/blackboard.db-shm"
+        ));
+        assert!(!is_untracked_impulse_runtime_artifact(
+            b".impulse/blackboard.dbx"
+        ));
+        drop(board);
+    }
+
+    /// ADR-0020 rule 3a. `.impulse/MEMORY.jsonl` and `.impulse/GENOME_PROJECTION.md`
+    /// are tracked and not gitignored, so without the exemption the first
+    /// promotion blocks registration as an untracked `??`, and every promotion
+    /// after the log is committed blocks it again as a tracked ` M`.
+    #[test]
+    fn clean_git_subject_exempts_promoted_memory_evidence_before_and_after_it_is_committed() {
+        let repo = init_repo();
+        let initial = observe_clean_git_subject(repo.path(), None).unwrap();
+        let impulse = repo.path().join(".impulse");
+        std::fs::create_dir(&impulse).unwrap();
+
+        // First promotion: both files are untracked in a repo that does not
+        // gitignore `.impulse`.
+        std::fs::write(impulse.join("MEMORY.jsonl"), "{\"seq\":0}\n").unwrap();
+        std::fs::write(impulse.join("GENOME_PROJECTION.md"), "# projection\n").unwrap();
+        std::fs::write(impulse.join("GENOME_PROJECTION.tmp.1.2"), "partial").unwrap();
+        assert_eq!(
+            observe_clean_git_subject(repo.path(), Some(&initial)).unwrap(),
+            initial
+        );
+
+        // Staging them for their first commit must not block registration either.
+        run(
+            repo.path(),
+            &[
+                "add",
+                ".impulse/MEMORY.jsonl",
+                ".impulse/GENOME_PROJECTION.md",
+            ],
+        );
+        assert_eq!(
+            observe_clean_git_subject(repo.path(), Some(&initial)).unwrap(),
+            initial
+        );
+        run(repo.path(), &["commit", "--quiet", "-m", "promote"]);
+        let committed = observe_clean_git_subject(repo.path(), None).unwrap();
+
+        // Every later promotion is a tracked modification of both files.
+        std::fs::write(impulse.join("MEMORY.jsonl"), "{\"seq\":0}\n{\"seq\":1}\n").unwrap();
+        std::fs::write(
+            impulse.join("GENOME_PROJECTION.md"),
+            "# projection\n\n## r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            observe_clean_git_subject(repo.path(), Some(&committed)).unwrap(),
+            committed
+        );
+    }
+
+    /// The exemption is modification/addition only, and only for those paths.
+    #[test]
+    fn clean_git_subject_still_refuses_a_deleted_memory_log_or_a_neighbouring_file() {
+        let repo = init_repo();
+        let impulse = repo.path().join(".impulse");
+        std::fs::create_dir(&impulse).unwrap();
+        std::fs::write(impulse.join("MEMORY.jsonl"), "{\"seq\":0}\n").unwrap();
+        std::fs::write(impulse.join("GENOME.md"), "hand curated\n").unwrap();
+        run(
+            repo.path(),
+            &["add", ".impulse/MEMORY.jsonl", ".impulse/GENOME.md"],
+        );
+        run(repo.path(), &["commit", "--quiet", "-m", "memory"]);
+        let committed = observe_clean_git_subject(repo.path(), None).unwrap();
+
+        // Deleting the evidence log is a subject change, not a promotion.
+        std::fs::remove_file(impulse.join("MEMORY.jsonl")).unwrap();
+        assert!(observe_clean_git_subject(repo.path(), Some(&committed))
+            .unwrap_err()
+            .to_string()
+            .contains("dirty"));
+        run(repo.path(), &["checkout", "--", ".impulse/MEMORY.jsonl"]);
+
+        // The hand-curated GENOME.md is not exempt.
+        std::fs::write(impulse.join("GENOME.md"), "edited\n").unwrap();
+        assert!(observe_clean_git_subject(repo.path(), Some(&committed))
+            .unwrap_err()
+            .to_string()
+            .contains("dirty"));
+    }
+
+    /// Pin the exemption to the state layer's own constants: renaming either
+    /// artifact must break this test rather than silently un-exempt the path
+    /// and start blocking every governed registration after a promotion.
+    #[test]
+    fn memory_evidence_exemption_tracks_the_state_layer_file_names() {
+        for name in [
+            crate::state::memory_record::MEMORY_LOG_FILE,
+            crate::state::memory_record::GENOME_PROJECTION_FILE,
+        ] {
+            let path = format!(".impulse/{name}");
+            assert!(
+                is_impulse_memory_evidence_artifact(path.as_bytes()),
+                "`{path}` must be exempt from the governed clean-subject check"
+            );
+            assert!(is_untracked_impulse_runtime_artifact(path.as_bytes()));
+        }
+        // Neighbouring durable project memory is deliberately not exempt.
+        assert!(!is_impulse_memory_evidence_artifact(b".impulse/GENOME.md"));
+        assert!(!is_impulse_memory_evidence_artifact(
+            b".impulse/HISTORY.jsonl"
+        ));
+    }
+
+    #[test]
+    fn tracked_status_and_path_rejects_a_bare_rename_origin_record() {
+        // A `-z` rename emits the origin path as its own bare record.
+        assert!(tracked_status_and_path(b".impulse/MEMORY.jsonl").is_none());
+        // Deletion codes are not exempt-eligible at all.
+        assert!(tracked_status_and_path(b" D .impulse/MEMORY.jsonl").is_none());
+        assert_eq!(
+            tracked_status_and_path(b" M .impulse/MEMORY.jsonl"),
+            Some((b" M".as_slice(), b".impulse/MEMORY.jsonl".as_slice()))
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn detached_materialization_bounds_hanging_smudge_filters() {
@@ -1519,7 +3082,7 @@ mod tests {
         )
         .err()
         .expect("hanging smudge filter must time out");
-        assert!(error.to_string().contains("timed out"));
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
         let worktrees = successful_git_text(
             repo.path(),
             &["worktree", "list", "--porcelain"],
@@ -1563,7 +3126,7 @@ mod tests {
             .expect("materialization task must not panic")
             .err()
             .expect("hanging smudge filter must time out");
-        assert!(error.to_string().contains("timed out"));
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
         let worktrees = successful_git_text(
             repo.path(),
             &["worktree", "list", "--porcelain"],
@@ -2029,5 +3592,1689 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("exact profiled bounds"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Review round 1
+    // -----------------------------------------------------------------------
+
+    /// P1-1: the ref move is a real compare-and-swap, so a concurrent commit
+    /// that lands between observation and the write loses instead of being
+    /// silently overwritten.
+    #[test]
+    fn test_compare_and_swap_refuses_a_stale_expected_revision() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let stale = oid(&repo);
+        std::fs::write(repo.join("concurrent.txt"), "someone else\n").unwrap();
+        run(&repo, &["add", "concurrent.txt"]);
+        run(&repo, &["commit", "--quiet", "-m", "concurrent"]);
+        let current = oid(&repo);
+        assert_ne!(stale, current);
+        let branch_ref = canonical_branch_ref(&repo).unwrap().expect("a branch");
+
+        // Swapping against the revision we observed before the concurrent
+        // commit must fail and must not move the branch.
+        let target = "0".repeat(40);
+        let swapped =
+            compare_and_swap_canonical_branch(&repo, &branch_ref, &stale, &target).unwrap();
+
+        assert!(!swapped, "a stale compare-and-swap must not win");
+        assert_eq!(oid(&repo), current);
+    }
+
+    #[test]
+    fn test_compare_and_swap_succeeds_against_the_current_revision() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let initial = oid(&repo);
+        std::fs::write(repo.join("next.txt"), "next\n").unwrap();
+        run(&repo, &["add", "next.txt"]);
+        run(&repo, &["commit", "--quiet", "-m", "next"]);
+        let next = oid(&repo);
+        let branch_ref = canonical_branch_ref(&repo).unwrap().expect("a branch");
+        run(&repo, &["reset", "--hard", "--quiet", &initial]);
+
+        assert!(
+            compare_and_swap_canonical_branch(&repo, &branch_ref, &initial, &next).unwrap(),
+            "a matching compare-and-swap must win"
+        );
+        assert_eq!(oid(&repo), next);
+    }
+
+    #[test]
+    fn test_canonical_branch_ref_reports_none_on_a_detached_head() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        assert!(canonical_branch_ref(&repo).unwrap().is_some());
+
+        run(&repo, &["checkout", "--detach", "--quiet", "HEAD"]);
+
+        assert_eq!(canonical_branch_ref(&repo).unwrap(), None);
+    }
+
+    /// P2-1: a staged Builder commits inside its own worktree, so the claim's
+    /// subject must be observed there, not in the canonical workspace root.
+    #[test]
+    fn test_derive_claim_observes_the_staged_worktree_for_a_staged_task() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let initial = oid(&repo);
+        let mut registered = task(&repo);
+        registered.world_scope = WorldScope::StagedAuthoritative;
+        registered.initial_subject_revision = Some(initial.clone());
+        registered.claims.clear();
+        registered.verifications.clear();
+        registered.supervisor_verdicts.clear();
+        registered.review_state = GovernedReviewState::AwaitingClaim;
+
+        let staged = materialize_staged_worktree(&registered).unwrap();
+        let staged_root = PathBuf::from(&staged.root);
+        std::fs::write(staged_root.join("feature.txt"), "builder work\n").unwrap();
+        run(&staged_root, &["add", "feature.txt"]);
+        run(&staged_root, &["commit", "--quiet", "-m", "builder work"]);
+        let builder_commit = oid(&staged_root);
+        assert_ne!(builder_commit, initial);
+
+        registered.staged_worktree = Some(impulse_ops::governed_task::StagedWorktree {
+            id: GovernedRecordId::try_new("staged-1").unwrap(),
+            actor: staged_system_actor(),
+            root: staged.root.clone(),
+            initial_subject_revision: initial.clone(),
+            shared_config_digest: staged.shared_config_digest.clone(),
+            status: impulse_ops::governed_task::StagedWorktreeStatus::Active,
+            materialized_at: "2026-09-02T00:00:00Z".to_string(),
+            based_on_revision: 1,
+        });
+
+        let request = GovernedClaimRequest {
+            request_id: impulse_ops::governed_task::GovernedRequestId::try_new("req-1").unwrap(),
+            project_id: registered.project_id.clone(),
+            task_id: registered.id.clone(),
+            expected_revision: registered.revision,
+            summary: "done".to_string(),
+            artifact_ids: Vec::new(),
+        };
+        let claim = derive_claim(&registered, &request).unwrap();
+
+        // The Builder's commit, not the untouched canonical head.
+        assert_eq!(claim.subject_revision, builder_commit);
+        assert_eq!(oid(&repo), initial);
+    }
+
+    // -----------------------------------------------------------------------
+    // Post-merge fixes for the #50 P1 review (2026-09-12)
+    // -----------------------------------------------------------------------
+
+    /// A minimal but real Rust workspace in a real Git repository, so
+    /// `rust_workspace_v1` has something it can genuinely verify.
+    fn init_rust_repo() -> TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"staged_subject\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub fn answer() -> u32 {\n    41\n}\n",
+        )
+        .unwrap();
+        run(dir.path(), &["init", "--quiet"]);
+        run(dir.path(), &["config", "user.email", "test@example.com"]);
+        run(dir.path(), &["config", "user.name", "Test"]);
+        let lock_status = std::process::Command::new("cargo")
+            .arg("generate-lockfile")
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(lock_status.success());
+        run(
+            dir.path(),
+            &["add", "Cargo.toml", "Cargo.lock", "src/lib.rs"],
+        );
+        run(dir.path(), &["commit", "--quiet", "-m", "initial"]);
+        dir
+    }
+
+    /// Attach a materialized staged worktree record to a task, as the ledger
+    /// holds it once `MaterializeStagedWorktree` has been applied.
+    fn with_staged_record(task: &mut GovernedTaskRun, staged: &StagedWorktreeInput, initial: &str) {
+        task.staged_worktree = Some(impulse_ops::governed_task::StagedWorktree {
+            id: GovernedRecordId::try_new("staged-1").unwrap(),
+            actor: staged_system_actor(),
+            root: staged.root.clone(),
+            initial_subject_revision: initial.to_string(),
+            shared_config_digest: staged.shared_config_digest.clone(),
+            status: impulse_ops::governed_task::StagedWorktreeStatus::Active,
+            materialized_at: "2026-09-12T00:00:00Z".to_string(),
+            based_on_revision: 1,
+        });
+    }
+
+    /// First #50 P1 finding: `derive_claim` observed the staged worktree but
+    /// `run_verification` still observed `workspace_root` and required the
+    /// canonical HEAD to equal the claim. The canonical checkout deliberately
+    /// stays on the initial OID until promotion, so every staged run failed
+    /// that check before its detached verifier was ever created, and could
+    /// never reach Supervisor review or operator acceptance.
+    ///
+    /// This drives the real chain — materialize, Builder commit, derive claim,
+    /// verify — against a real repository and a real `rust_workspace_v1` run,
+    /// and asserts the canonical tree is untouched throughout.
+    #[tokio::test]
+    async fn staged_verification_runs_against_the_staged_worktree_and_reaches_review() {
+        let dir = init_rust_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let initial = oid(&repo);
+        let canonical_source_before = std::fs::read_to_string(repo.join("src/lib.rs")).unwrap();
+
+        let mut registered = task(&repo);
+        registered.world_scope = WorldScope::StagedAuthoritative;
+        registered.initial_subject_revision = Some(initial.clone());
+        registered.claims.clear();
+        registered.verifications.clear();
+        registered.supervisor_verdicts.clear();
+        registered.review_state = GovernedReviewState::AwaitingClaim;
+
+        let staged = materialize_staged_worktree(&registered).unwrap();
+        with_staged_record(&mut registered, &staged, &initial);
+        let staged_root = PathBuf::from(&staged.root);
+
+        // The Builder works only inside its own worktree.
+        std::fs::write(
+            staged_root.join("src/lib.rs"),
+            "pub fn answer() -> u32 {\n    42\n}\n",
+        )
+        .unwrap();
+        run(&staged_root, &["add", "src/lib.rs"]);
+        run(&staged_root, &["commit", "--quiet", "-m", "builder work"]);
+        let builder_commit = oid(&staged_root);
+        assert_ne!(builder_commit, initial);
+
+        let request = GovernedClaimRequest {
+            request_id: impulse_ops::governed_task::GovernedRequestId::try_new("req-verify")
+                .unwrap(),
+            project_id: registered.project_id.clone(),
+            task_id: registered.id.clone(),
+            expected_revision: registered.revision,
+            summary: "done".to_string(),
+            artifact_ids: Vec::new(),
+        };
+        let claim_input = derive_claim(&registered, &request).unwrap();
+        assert_eq!(claim_input.subject_revision, builder_commit);
+
+        let claim_id = GovernedRecordId::try_new("claim-staged").unwrap();
+        registered.claims.push(WorkerCompletionClaim {
+            id: claim_id.clone(),
+            actor: claim_input.actor.clone(),
+            summary: claim_input.summary.clone(),
+            subject_revision: claim_input.subject_revision.clone(),
+            artifact_ids: Vec::new(),
+            diff_ref: None,
+            loop_report_digest: None,
+            loop_report_version: None,
+            submitted_at: "2026-09-12T00:00:01Z".to_string(),
+            based_on_revision: registered.revision,
+        });
+        registered.review_state = GovernedReviewState::AwaitingVerification;
+
+        let verification = run_verification(&registered).await.unwrap();
+
+        assert_eq!(verification.outcome, GovernedVerificationOutcome::Passed);
+        assert_eq!(verification.claim_id, claim_id);
+        assert_eq!(verification.subject_revision, builder_commit);
+        assert_eq!(verification.policy, "rust_workspace_v1");
+        assert_eq!(verification.commands.len(), rust_workspace_v1_steps().len());
+        assert!(verification.commands.iter().all(|command| command.success));
+
+        // The canonical checkout never moved and was never written to.
+        assert_eq!(oid(&repo), initial);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+            canonical_source_before
+        );
+        assert_eq!(observe_clean_git_subject(&repo, None).unwrap(), initial);
+
+        // Review-ready: the evidence binds into a Supervisor envelope, which is
+        // the state the old ordering could never reach for a staged run.
+        registered.verifications.push(GovernedVerification {
+            id: GovernedRecordId::try_new("verification-staged").unwrap(),
+            actor: verification.actor.clone(),
+            claim_id: verification.claim_id.clone(),
+            subject_revision: verification.subject_revision.clone(),
+            policy: verification.policy.clone(),
+            outcome: verification.outcome,
+            commands: verification.commands.clone(),
+            artifact_ids: Vec::new(),
+            notes: verification.notes.clone(),
+            recorded_at: "2026-09-12T00:00:02Z".to_string(),
+            based_on_revision: registered.revision,
+        });
+        registered.review_state = GovernedReviewState::AwaitingSupervisor;
+        let (_, prompt) = supervisor_review_prompt(&registered).unwrap();
+        assert!(prompt.contains(&builder_commit));
+    }
+
+    /// The `Err` path of the new source-root lookup: a staged task whose
+    /// worktree was never materialized has no tree to verify, and must say so
+    /// instead of quietly verifying the canonical checkout.
+    #[tokio::test]
+    async fn staged_verification_refuses_a_task_with_no_materialized_worktree() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let mut registered = task(&repo);
+        registered.world_scope = WorldScope::StagedAuthoritative;
+        assert!(registered.staged_worktree.is_none());
+
+        let error = run_verification(&registered)
+            .await
+            .expect_err("a staged task with no worktree has no source tree");
+        let message = format!("{error:#}");
+        assert!(message.contains("source tree"), "{message}");
+        assert!(message.contains("staged_authoritative"), "{message}");
+
+        let request = GovernedClaimRequest {
+            request_id: impulse_ops::governed_task::GovernedRequestId::try_new("req-none").unwrap(),
+            project_id: registered.project_id.clone(),
+            task_id: registered.id.clone(),
+            expected_revision: registered.revision,
+            summary: "done".to_string(),
+            artifact_ids: Vec::new(),
+        };
+        let error = derive_claim(&registered, &request)
+            .expect_err("the claim producer refuses the same way");
+        assert!(format!("{error:#}").contains("source tree"));
+    }
+
+    /// The include-aware, raw-bytes digest: identical bytes digest identically,
+    /// and a reordering of repeated keys — which the old sorted listing erased —
+    /// is a difference.
+    #[test]
+    fn test_shared_config_digest_is_stable_and_order_sensitive() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let config = repo.join(".git").join("config");
+        let original = std::fs::read_to_string(&config).unwrap();
+        let first = "[filter \"a\"]\n\tsmudge = cat\n";
+        let second = "[filter \"a\"]\n\tsmudge = tac\n";
+
+        std::fs::write(&config, format!("{original}{first}{second}")).unwrap();
+        let before = shared_repository_config_digest(&repo, None).unwrap();
+        assert!(before.is_current_scheme());
+        assert_eq!(
+            shared_repository_config_digest(&repo, None).unwrap(),
+            before
+        );
+
+        std::fs::write(&config, format!("{original}{second}{first}")).unwrap();
+        let after = shared_repository_config_digest(&repo, None).unwrap();
+        assert_ne!(
+            before.repository_config, after.repository_config,
+            "reordering repeated keys must change the digest"
+        );
+        assert_eq!(
+            before.first_difference(&after),
+            Some(impulse_ops::governed_task::SharedConfigComponent::RepositoryConfig)
+        );
+    }
+
+    #[test]
+    fn test_shared_config_digest_covers_included_files() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let config = repo.join(".git").join("config");
+        let included = repo.join(".git").join("included.config");
+        std::fs::write(&included, "[user]\n\temail = before@example.invalid\n").unwrap();
+        let original = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            format!("{original}[include]\n\tpath = included.config\n"),
+        )
+        .unwrap();
+        let before = shared_repository_config_digest(&repo, None).unwrap();
+
+        std::fs::write(&included, "[user]\n\temail = after@example.invalid\n").unwrap();
+        let after = shared_repository_config_digest(&repo, None).unwrap();
+        assert_ne!(before.repository_config, after.repository_config);
+
+        // Deleting an included file is a change too: absence is pinned.
+        std::fs::remove_file(&included).unwrap();
+        let removed = shared_repository_config_digest(&repo, None).unwrap();
+        assert_ne!(after.repository_config, removed.repository_config);
+    }
+
+    #[test]
+    fn test_shared_config_digest_fails_on_a_directory_that_is_not_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = shared_repository_config_digest(dir.path(), None)
+            .expect_err("a directory with no .git cannot be pinned");
+        assert!(format!("{error:#}").contains(".git"));
+    }
+
+    #[test]
+    fn test_config_include_paths_reads_both_forms_and_ignores_other_sections() {
+        let base = Path::new("/repo/.git");
+        let parsed = config_include_paths(
+            b"[core]\n\tpath = ignored\n[include]\n\tpath = one.config ; trailing\n[includeIf \"gitdir:/x/\"]\n\tpath = \"two.config\"\n",
+            base,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                PathBuf::from("/repo/.git/one.config"),
+                PathBuf::from("/repo/.git/two.config"),
+            ]
+        );
+        // An absolute include is taken as-is.
+        assert_eq!(
+            config_include_paths(b"[include]\n\tpath = /abs/other.config\n", base).unwrap(),
+            vec![PathBuf::from("/abs/other.config")]
+        );
+        assert!(config_include_paths(&[0xff, 0xfe], base)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// The head reader used when promotion refuses to spawn Git: it must agree
+    /// with Git for a loose ref, a packed ref, and a detached HEAD.
+    #[test]
+    fn test_read_head_oid_without_git_matches_git_for_every_ref_shape() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let expected = oid(&repo);
+        assert_eq!(read_head_oid_without_git(&repo).unwrap(), expected);
+
+        run(&repo, &["pack-refs", "--all"]);
+        assert_eq!(read_head_oid_without_git(&repo).unwrap(), expected);
+
+        run(&repo, &["checkout", "--detach", "--quiet", "HEAD"]);
+        assert_eq!(read_head_oid_without_git(&repo).unwrap(), expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Review round 1 on PR #53 (2026-09-12)
+    // -----------------------------------------------------------------------
+
+    /// A `filter.evil` driver whose `clean` side writes a marker. `clean` runs
+    /// when Git compares working-tree content against the index, which a bare
+    /// `git status` does for any file whose stat data changed.
+    fn evil_clean_command(marker: &Path) -> String {
+        format!("sh -c 'echo CLEAN_FIRED >> {}; cat'", marker.display())
+    }
+
+    /// Make Git re-read a file's content on the next status, so a `clean` filter
+    /// assigned to it actually runs.
+    fn invalidate_stat_cache(path: &Path) {
+        let contents = std::fs::read(path).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// Stage a task, let the Builder plant a `clean` driver in the *shared*
+    /// `.git/config` plus a committed `.gitattributes`, and commit. Returns the
+    /// task with its staged record attached, the marker path, and the staged
+    /// root, with the marker proven armed and then reset.
+    fn staged_task_with_a_planted_clean_driver(
+        repo: &Path,
+        initial: &str,
+    ) -> (GovernedTaskRun, PathBuf, PathBuf) {
+        let mut registered = task(repo);
+        registered.world_scope = WorldScope::StagedAuthoritative;
+        registered.initial_subject_revision = Some(initial.to_string());
+        registered.claims.clear();
+        registered.verifications.clear();
+        registered.supervisor_verdicts.clear();
+        registered.review_state = GovernedReviewState::AwaitingClaim;
+
+        let staged = materialize_staged_worktree(&registered).unwrap();
+        with_staged_record(&mut registered, &staged, initial);
+        let staged_root = PathBuf::from(&staged.root);
+        let marker = repo.join(".git").join("clean-filter-ran.txt");
+
+        run(
+            &staged_root,
+            &["config", "filter.evil.clean", &evil_clean_command(&marker)],
+        );
+        run(&staged_root, &["config", "filter.evil.smudge", "cat"]);
+        std::fs::write(staged_root.join(".gitattributes"), "* filter=evil\n").unwrap();
+        run(&staged_root, &["add", ".gitattributes"]);
+        std::fs::write(staged_root.join("feature.txt"), "builder work\n").unwrap();
+        run(&staged_root, &["add", "feature.txt"]);
+        run(&staged_root, &["commit", "--quiet", "-m", "builder work"]);
+
+        // Negative control: a bare status in the staged worktree fires it, so
+        // the assertions below are about the gate and not about a driver that
+        // would never have run.
+        invalidate_stat_cache(&staged_root.join("feature.txt"));
+        run(&staged_root, &["status", "--porcelain"]);
+        assert!(
+            marker.exists(),
+            "the planted clean driver is not armed; this test would pass vacuously"
+        );
+        std::fs::remove_file(&marker).unwrap();
+        invalidate_stat_cache(&staged_root.join("feature.txt"));
+
+        (registered, marker, staged_root)
+    }
+
+    fn claim_request(task: &GovernedTaskRun, request_id: &str) -> GovernedClaimRequest {
+        GovernedClaimRequest {
+            request_id: impulse_ops::governed_task::GovernedRequestId::try_new(request_id).unwrap(),
+            project_id: task.project_id.clone(),
+            task_id: task.id.clone(),
+            expected_revision: task.revision,
+            summary: "done".to_string(),
+            artifact_ids: Vec::new(),
+        }
+    }
+
+    /// Round-1 P1: the claim producer spawned Git against the staged tree with
+    /// no pin comparison at all, so a Builder-planted `clean` driver executed
+    /// during `governed-claim` — before any operator saw the run.
+    #[test]
+    fn test_derive_claim_refuses_a_staged_worktree_whose_shared_config_changed() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let initial = oid(&repo);
+        let (task, marker, staged_root) = staged_task_with_a_planted_clean_driver(&repo, &initial);
+
+        let outcome = derive_claim(&task, &claim_request(&task, "req-refuse"));
+
+        // Asserted first and on purpose: without the gate the producer
+        // *succeeds* — the planted `clean` filter is a passthrough, so the tree
+        // still reads clean — while having executed the Builder's script. The
+        // marker, not the error, is what proves nothing ran.
+        assert!(
+            !marker.exists(),
+            "the planted driver executed inside the claim producer: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+        let error = outcome.expect_err("the claim producer must refuse before it runs Git");
+        assert_eq!(
+            error.downcast_ref::<StagedConfigRefusal>(),
+            Some(&StagedConfigRefusal::Changed {
+                task_id: task.id.as_str().to_string(),
+                component: SharedConfigComponent::RepositoryConfig,
+            }),
+            "a typed refusal, not an opaque Git failure"
+        );
+        // Nothing about the Builder's work was destroyed.
+        assert!(staged_root.join("feature.txt").is_file());
+    }
+
+    /// The same gate on the verification path, which runs Git in the staged tree
+    /// and materializes a detached worktree from it.
+    #[tokio::test]
+    async fn test_run_verification_refuses_a_staged_worktree_whose_shared_config_changed() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let initial = oid(&repo);
+        let (mut task, marker, staged_root) =
+            staged_task_with_a_planted_clean_driver(&repo, &initial);
+        let builder_commit = oid(&staged_root);
+        task.claims.push(WorkerCompletionClaim {
+            id: GovernedRecordId::try_new("claim-planted").unwrap(),
+            actor: GovernedActor {
+                kind: GovernedActorKind::Worker,
+                id: "worker-1".to_string(),
+            },
+            summary: "done".to_string(),
+            subject_revision: builder_commit,
+            artifact_ids: Vec::new(),
+            diff_ref: None,
+            loop_report_digest: None,
+            loop_report_version: None,
+            submitted_at: "2026-09-12T00:00:01Z".to_string(),
+            based_on_revision: task.revision,
+        });
+        task.review_state = GovernedReviewState::AwaitingVerification;
+
+        let outcome = run_verification(&task).await;
+
+        // Asserted first, for the same reason as the claim test above.
+        assert!(
+            !marker.exists(),
+            "the planted driver executed inside the verification producer: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+        let error = outcome.expect_err("the verification producer must refuse before it runs Git");
+        assert!(error
+            .downcast_ref::<StagedConfigRefusal>()
+            .is_some_and(|refusal| matches!(
+                refusal,
+                StagedConfigRefusal::Changed {
+                    component: SharedConfigComponent::RepositoryConfig,
+                    ..
+                }
+            )));
+    }
+
+    /// An unpinned staged worktree is refused by the producers too: there is
+    /// nothing to compare, so there is no basis for running Git in it.
+    #[test]
+    fn test_derive_claim_refuses_an_unpinned_staged_worktree() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let initial = oid(&repo);
+        let (mut task, _marker, _staged_root) =
+            staged_task_with_a_planted_clean_driver(&repo, &initial);
+        if let Some(record) = task.staged_worktree.as_mut() {
+            record.shared_config_digest = SharedRepositoryConfigPin::Unknown;
+        }
+
+        let error = derive_claim(&task, &claim_request(&task, "req-unpinned"))
+            .expect_err("an unpinned staged worktree is not a tree to run Git in");
+        assert_eq!(
+            error.downcast_ref::<StagedConfigRefusal>(),
+            Some(&StagedConfigRefusal::Unpinned {
+                task_id: task.id.as_str().to_string()
+            })
+        );
+    }
+
+    /// Global and system configuration are suppressed for every producer
+    /// invocation. The env scrub keeps `HOME`, so without this a
+    /// `filter.<name>.clean` in the operator's own `~/.gitconfig` would execute
+    /// inside a daemon-owned producer.
+    #[test]
+    fn test_producer_git_invocations_suppress_global_and_system_config() {
+        let command = hook_free_git(Path::new("/tmp"));
+        let overrides: Vec<(String, Option<String>)> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().to_string(),
+                    value.map(|value| value.to_string_lossy().to_string()),
+                )
+            })
+            .collect();
+        for key in ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"] {
+            assert_eq!(
+                overrides
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .and_then(|(_, value)| value.as_deref()),
+                Some("/dev/null"),
+                "{key} must be suppressed for every producer Git invocation"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Review round 3 on PR #53 (2026-09-12)
+    // -----------------------------------------------------------------------
+
+    /// Round-3 P1: a probe that never reported an exit status was read as a
+    /// decision the process never made. `merge-base --is-ancestor` is the worst
+    /// case — its non-zero exit means *the subject is not descended from the
+    /// registered OID*, a governance finding — and a timed-out child is killed
+    /// and reaped, so it comes back as simply "not success". Under load that
+    /// reported a violation that never happened.
+    ///
+    /// A zero deadline makes this deterministic because the bounded runner
+    /// treats it as already expired: the child is killed and reaped without
+    /// being polled. Until 2026-09-27 the runner polled first and this test
+    /// relied on no child being able to exit between `spawn` and that poll. On
+    /// a loaded CI runner one did, and the probe came back as a success.
+    #[test]
+    fn test_a_timed_out_ancestry_probe_is_not_reported_as_a_governance_finding() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let initial = oid(&repo);
+        // Sanity: with the real timeout this observation succeeds, so the
+        // failure below is the deadline and nothing else.
+        assert_eq!(
+            observe_clean_git_subject(&repo, Some(&initial)).unwrap(),
+            initial
+        );
+
+        let error =
+            observe_clean_git_subject_with_ancestry_timeout(&repo, Some(&initial), Duration::ZERO)
+                .expect_err("a probe that never reported a status is not an observation");
+
+        let message = format!("{error:#}");
+        assert!(
+            !message.contains("not descended"),
+            "a timed-out probe must not be reported as a governance violation: {message}"
+        );
+        assert_eq!(
+            error.downcast_ref::<GitProbeFailure>(),
+            Some(&GitProbeFailure::TimedOut {
+                command: "git merge-base --is-ancestor".to_string()
+            }),
+            "and it must be typed, so a caller can tell 'unknown' from 'violated'"
+        );
+    }
+
+    /// The race the zero-deadline contract removes. `true` exits within a
+    /// millisecond or two of `spawn`, so a runner that polls before it checks
+    /// the deadline returns that exit status whenever its thread loses the CPU
+    /// in between. Repeated, because one pass proves little about a race.
+    #[test]
+    fn test_run_bounded_process_zero_deadline_always_times_out() {
+        for attempt in 0..100 {
+            let mut command = std::process::Command::new("true");
+            let output = run_bounded_process(&mut command, "true", Duration::ZERO)
+                .expect("spawning `true` must succeed");
+            assert!(
+                output.timed_out,
+                "attempt {attempt}: a zero deadline reported a completed child (status {:?})",
+                output.status
+            );
+        }
+    }
+
+    /// Any non-zero deadline keeps the poll-first order: a child that finished
+    /// is reported as finished, with its own exit status.
+    #[test]
+    fn test_run_bounded_process_nonzero_deadline_reports_the_exit_status() {
+        for (program, succeeds) in [("true", true), ("false", false)] {
+            let mut command = std::process::Command::new(program);
+            let output = run_bounded_process(&mut command, program, Duration::from_secs(30))
+                .expect("spawning must succeed");
+            assert!(
+                !output.timed_out,
+                "`{program}` finished well inside its deadline"
+            );
+            let status = output.status.expect("a finished child has a status");
+            assert_eq!(status.success(), succeeds, "`{program}` exit status");
+        }
+    }
+
+    /// A child that outlives a real deadline is killed at it, not waited for.
+    #[test]
+    fn test_run_bounded_process_kills_a_child_that_outlives_its_deadline() {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        let started = Instant::now();
+        let output = run_bounded_process(&mut command, "sleep 30", Duration::from_millis(50))
+            .expect("spawning `sleep` must succeed");
+        assert!(output.timed_out);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the runner waited {:?} for a child it should have killed at 50 ms",
+            started.elapsed()
+        );
+    }
+
+    /// Error path: a program that cannot be spawned is an error naming the
+    /// command, neither a timeout nor a status.
+    #[test]
+    fn test_run_bounded_process_spawn_failure_names_the_command() {
+        let mut command =
+            std::process::Command::new("/nonexistent/impulse-test-program-that-does-not-exist");
+        let error = run_bounded_process(&mut command, "missing program", Duration::from_secs(1))
+            .err()
+            .expect("a missing program cannot be spawned");
+        assert!(
+            format!("{error:#}").contains("failed to spawn missing program"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// Round-3 P1: a single non-UTF-8 byte anywhere in `.git/config` used to
+    /// make the include walk give up on the whole file, so every include
+    /// directive went unpinned while Git went on honoring them. An included file
+    /// defining a filter could then change after materialization with the
+    /// recorded and observed digests still equal.
+    #[test]
+    fn test_a_non_utf8_byte_does_not_hide_include_directives() {
+        let base = Path::new("/repo/.git");
+        // A Latin-1 byte in a comment, then a perfectly ordinary include.
+        let mut bytes = b"# caf".to_vec();
+        bytes.push(0xe9);
+        bytes.extend_from_slice(b"\n[include]\n\tpath = included.config\n");
+
+        assert_eq!(
+            config_include_paths(&bytes, base).unwrap(),
+            vec![PathBuf::from("/repo/.git/included.config")],
+            "a byte the decoder rejects must not hide an include Git honors"
+        );
+    }
+
+    /// The same, end to end: the digest must actually cover the included file's
+    /// contents when the including config is not valid UTF-8.
+    #[test]
+    fn test_the_digest_covers_includes_of_a_non_utf8_config() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let config = repo.join(".git").join("config");
+        let included = repo.join(".git").join("included.config");
+        std::fs::write(&included, "[user]\n\temail = before@example.invalid\n").unwrap();
+        let mut bytes = std::fs::read(&config).unwrap();
+        bytes.extend_from_slice(b"# caf");
+        bytes.push(0xe9);
+        bytes.extend_from_slice(b"\n[include]\n\tpath = included.config\n");
+        std::fs::write(&config, &bytes).unwrap();
+        assert!(std::str::from_utf8(&std::fs::read(&config).unwrap()).is_err());
+
+        let before = shared_repository_config_digest(&repo, None).unwrap();
+        std::fs::write(&included, "[user]\n\temail = after@example.invalid\n").unwrap();
+        let after = shared_repository_config_digest(&repo, None).unwrap();
+
+        assert_ne!(
+            before.repository_config, after.repository_config,
+            "the included file must be inside the pin even when the including config is not UTF-8"
+        );
+    }
+
+    /// A path whose bytes are not UTF-8 is carried through exactly, because that
+    /// is the file Git opens. Lossy decoding would digest a *different* file —
+    /// or nothing — and report it as pinned.
+    ///
+    /// Asserted at the parser rather than end to end: the filesystem this runs
+    /// on (APFS) refuses to create a filename that is not valid UTF-8, so the
+    /// byte-exactness has to be proven where it is decided.
+    #[cfg(unix)]
+    #[test]
+    fn test_an_include_path_with_non_utf8_bytes_is_carried_through_exactly() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let base = Path::new("/repo/.git");
+        let mut name = b"inc-".to_vec();
+        name.push(0xff);
+        name.extend_from_slice(b".config");
+        let mut config = b"[include]\n\tpath = ".to_vec();
+        config.extend_from_slice(&name);
+        config.push(b'\n');
+
+        let parsed = config_include_paths(&config, base).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].file_name().map(OsStr::as_bytes),
+            Some(name.as_slice()),
+            "the include path must be the exact bytes Git would open"
+        );
+        assert_eq!(parsed[0].parent(), Some(base));
+    }
+
+    /// Round-3 P2: a pin that cannot be computed after `git worktree add` used
+    /// to leave the checkout and its administrative entry behind, so every retry
+    /// died at the "already exists" check — reporting a leftover the *first*
+    /// attempt had created.
+    #[test]
+    fn test_a_failed_pin_removes_the_worktree_it_had_already_created() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let mut registered = task(&repo);
+        registered.world_scope = WorldScope::StagedAuthoritative;
+        registered.initial_subject_revision = Some(oid(&repo));
+        let root = registered.expected_staged_worktree_root().unwrap();
+
+        // More include directives than this walk will follow. Git is perfectly
+        // happy with them -- they are one level deep and simply absent, which it
+        // ignores -- so every Git call still succeeds and the pin is what fails,
+        // *after* the worktree has been created. That ordering is the point.
+        let config = repo.join(".git").join("config");
+        let original = std::fs::read_to_string(&config).unwrap();
+        let mut oversized = original.clone();
+        for index in 0..=MAX_CONFIG_INCLUDE_FILES {
+            oversized.push_str(&format!("[include]\n\tpath = absent-{index}.config\n"));
+        }
+        std::fs::write(&config, &oversized).unwrap();
+        // Git still reads this repository without complaint.
+        assert_eq!(
+            oid(&repo),
+            registered.initial_subject_revision.clone().unwrap()
+        );
+
+        let error = materialize_staged_worktree(&registered)
+            .expect_err("an include chain over the cap must fail the pin");
+        assert!(format!("{error:#}").contains("included files"), "{error:#}");
+
+        assert!(
+            !root.exists(),
+            "the failed materialization must not leave its checkout behind"
+        );
+        let listed = successful_git_text(&repo, &["worktree", "list"], "worktree list").unwrap();
+        assert!(
+            !listed.contains(root.to_str().unwrap()),
+            "nor its administrative entry: {listed}"
+        );
+
+        // And a retry succeeds once the cause is removed.
+        std::fs::write(&config, &original).unwrap();
+        let staged = materialize_staged_worktree(&registered)
+            .expect("the retry must not trip over the first attempt's leftovers");
+        assert_eq!(PathBuf::from(&staged.root), root);
+    }
+
+    /// The classifier itself, over every shape `run_bounded_process` can return.
+    #[test]
+    fn test_git_completed_successfully_separates_unknown_from_failed() {
+        fn output(
+            status: Option<std::process::ExitStatus>,
+            timed_out: bool,
+        ) -> BoundedProcessOutput {
+            BoundedProcessOutput {
+                status,
+                stdout: Vec::new(),
+                stdout_truncated: false,
+                _stderr: Vec::new(),
+                _stderr_truncated: false,
+                timed_out,
+            }
+        }
+        let success = std::process::Command::new("true").status().unwrap();
+        let failure = std::process::Command::new("false").status().unwrap();
+        assert!(success.success());
+        assert!(!failure.success());
+
+        assert!(git_completed_successfully(&output(Some(success), false), "git probe").unwrap());
+        assert!(!git_completed_successfully(&output(Some(failure), false), "git probe").unwrap());
+
+        // Timed out, whatever status the reap produced.
+        for status in [None, Some(success), Some(failure)] {
+            let error = git_completed_successfully(&output(status, true), "git probe")
+                .expect_err("a timed-out probe is not an observation");
+            assert_eq!(
+                error.downcast_ref::<GitProbeFailure>(),
+                Some(&GitProbeFailure::TimedOut {
+                    command: "git probe".to_string()
+                })
+            );
+        }
+        // Killed without reporting a status, and without the timeout flag.
+        let error = git_completed_successfully(&output(None, false), "git probe")
+            .expect_err("a killed probe is not an observation");
+        assert_eq!(
+            error.downcast_ref::<GitProbeFailure>(),
+            Some(&GitProbeFailure::Killed {
+                command: "git probe".to_string()
+            })
+        );
+        assert!(format!("{error}").contains("not a finding"));
+    }
+
+    /// Review round 2 on PR #53: a comment line ending in a backslash must not
+    /// swallow the line after it. Git's continuation lives inside value parsing,
+    /// so `# hidden \` leaves the following `[include]` header in force — and a
+    /// line-level join would hide that header from this walk, leaving its target
+    /// unpinned while Git still honored it.
+    #[test]
+    fn test_config_include_paths_are_not_hidden_by_a_continued_comment() {
+        let base = Path::new("/repo/.git");
+        let bytes = b"# hidden \\\n[include]\n\tpath = evil.inc\n";
+        assert_eq!(
+            config_include_paths(bytes, base).unwrap(),
+            vec![PathBuf::from("/repo/.git/evil.inc")],
+            "a comment must not swallow an include header Git honors"
+        );
+        // A comment also ends a continuation in progress rather than joining it.
+        assert_eq!(
+            join_continued_lines(b"path = a\\\n; note\n[include]"),
+            vec![
+                b"path = a".to_vec(),
+                b"; note".to_vec(),
+                b"[include]".to_vec()
+            ]
+        );
+    }
+
+    /// Review round 2 on PR #53: each submodule is a repository with a
+    /// configuration file of its own, and a `filter.<name>.clean` defined there
+    /// fires on the enclosing worktree's `git status`. Pinning that set means
+    /// walking a tree whose shape is Git's to change, so the staged scope
+    /// refuses submodule repositories outright rather than claiming a coverage
+    /// it does not have.
+    #[test]
+    fn test_materialize_refuses_a_repository_with_submodule_configuration() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let mut registered = task(&repo);
+        registered.world_scope = WorldScope::StagedAuthoritative;
+        registered.initial_subject_revision = Some(oid(&repo));
+        std::fs::write(
+            repo.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ../sub\n",
+        )
+        .unwrap();
+
+        let error = materialize_staged_worktree(&registered)
+            .expect_err("a submodule repository is not a staged world this scope can pin");
+        assert_eq!(
+            error.downcast_ref::<StagedConfigRefusal>().map(|refusal| {
+                matches!(refusal, StagedConfigRefusal::UnsupportedSubmodules { .. })
+            }),
+            Some(true)
+        );
+        assert!(error.to_string().contains("submodule"));
+        // Nothing was created: the refusal precedes every side effect.
+        assert!(!registered.expected_staged_worktree_root().unwrap().exists());
+    }
+
+    /// The same refusal reaches the producers that run Git in an already-staged
+    /// worktree, so a `.gitmodules` introduced mid-run cannot slip past.
+    #[test]
+    fn test_producers_refuse_a_submodule_repository_introduced_mid_run() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        let initial = oid(&repo);
+        let mut registered = task(&repo);
+        registered.world_scope = WorldScope::StagedAuthoritative;
+        registered.initial_subject_revision = Some(initial.clone());
+        registered.claims.clear();
+        registered.verifications.clear();
+        registered.supervisor_verdicts.clear();
+        registered.review_state = GovernedReviewState::AwaitingClaim;
+        let staged = materialize_staged_worktree(&registered).unwrap();
+        with_staged_record(&mut registered, &staged, &initial);
+
+        // The Builder introduces one inside its own worktree.
+        std::fs::write(
+            PathBuf::from(&staged.root).join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ../sub\n",
+        )
+        .unwrap();
+
+        let error = derive_claim(&registered, &claim_request(&registered, "req-submodule"))
+            .expect_err("a submodule repository is refused on every producer path");
+        assert!(error
+            .downcast_ref::<StagedConfigRefusal>()
+            .is_some_and(|refusal| matches!(
+                refusal,
+                StagedConfigRefusal::UnsupportedSubmodules { .. }
+            )));
+    }
+
+    /// Git honors a backslash line continuation in a configuration value, so the
+    /// include walk has to as well, or a continued `include.path` leaves its
+    /// target unpinned.
+    #[test]
+    fn test_config_include_paths_honors_backslash_line_continuation() {
+        let base = Path::new("/repo/.git");
+        assert_eq!(
+            config_include_paths(b"[include]\n\tpath = one\\\n.config\n", base).unwrap(),
+            vec![PathBuf::from("/repo/.git/one.config")]
+        );
+        // An even number of trailing backslashes is an escaped backslash, not a
+        // continuation.
+        assert_eq!(
+            join_continued_lines(b"a\\\\\nb"),
+            vec![b"a\\\\".to_vec(), b"b".to_vec()]
+        );
+    }
+
+    #[test]
+    fn test_read_head_oid_without_git_errors_on_an_unresolvable_ref() {
+        let dir = init_repo();
+        let repo = dir.path().canonicalize().unwrap();
+        std::fs::write(repo.join(".git").join("HEAD"), "ref: refs/heads/missing\n").unwrap();
+        let error = read_head_oid_without_git(&repo)
+            .expect_err("an unresolvable ref must not be guessed at");
+        assert!(format!("{error:#}").contains("refs/heads/missing"));
+    }
+}
+
+/// Property-based / fuzz-style tests over the parsers in this module that
+/// adversarial review kept re-finding bugs in during 2026-09: the shared Git
+/// config include-chain parser, the porcelain `-z` status classifier, and
+/// the no-Git HEAD reader. See
+/// `docs/superpowers/specs/2026-09-12-governed-parser-property-tests.md` for
+/// the invariant table, oracle, and known-miss list this module implements.
+///
+/// Case count follows proptest's own `PROPTEST_CASES` env override (default
+/// 256 per test). For a deeper local run:
+/// `PROPTEST_CASES=2000 cargo test --lib -- proptests`.
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    // ---------------------------------------------------------------
+    // 1. Config parser: panic safety on arbitrary bytes.
+    // ---------------------------------------------------------------
+
+    proptest! {
+        #[test]
+        fn config_include_paths_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let base = Path::new("/base/.git");
+            let _ = config_include_paths(&bytes, base);
+        }
+
+        #[test]
+        fn join_continued_lines_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let _ = join_continued_lines(&bytes);
+        }
+
+        #[test]
+        fn config_value_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let _ = config_value(&bytes);
+        }
+
+        #[test]
+        fn expand_config_path_never_panics(
+            value in proptest::collection::vec(any::<u8>(), 0..512),
+            base in "[a-zA-Z0-9/._-]{0,64}",
+        ) {
+            let _ = expand_config_path(&value, Path::new(&base));
+        }
+
+        /// `config_include_paths` is `Result`-typed for portability (a
+        /// non-UTF-8 include path cannot become a `PathBuf` without
+        /// guessing on a platform where paths are not bytes -- see
+        /// `path_from_config_bytes`'s `#[cfg(not(unix))]` arm), but on this
+        /// platform (unix: an `OsStr` *is* bytes, so `path_from_config_bytes`
+        /// never fails) that error path is unreachable. So here,
+        /// unconditionally, arbitrary bytes never produce `Err` -- the only
+        /// documented failure case is compiled out entirely on unix, not
+        /// merely untriggered by this generator.
+        #[test]
+        #[cfg(unix)]
+        fn config_include_paths_is_infallible_on_unix_for_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096),
+        ) {
+            let base = Path::new("/base/.git");
+            prop_assert!(
+                config_include_paths(&bytes, base).is_ok(),
+                "config_include_paths returned Err on unix, where path_from_config_bytes cannot fail"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 1b. `join_continued_lines`: comments never continue, and an escaped
+    // trailing backslash (`c:\\`, an EVEN count) is preserved rather than
+    // treated as a continuation. Generated over an alternating mix of
+    // "plain", "continuing" (odd trailing backslashes), "escaped" (even
+    // trailing backslashes), and "comment" lines so the interaction between
+    // them -- not just each case alone -- is exercised.
+    // ---------------------------------------------------------------
+
+    #[derive(Clone, Debug)]
+    enum LineKind {
+        Plain(String),
+        Continuing(String),
+        EscapedBackslash(String),
+        Comment(String),
+    }
+
+    fn line_kind_strategy() -> impl Strategy<Value = LineKind> {
+        let body = "[a-zA-Z0-9 ]{0,12}";
+        prop_oneof![
+            body.prop_map(LineKind::Plain),
+            body.prop_map(LineKind::Continuing),
+            body.prop_map(LineKind::EscapedBackslash),
+            body.prop_map(LineKind::Comment),
+        ]
+    }
+
+    fn render_line(kind: &LineKind) -> String {
+        match kind {
+            LineKind::Plain(body) => body.clone(),
+            // Odd trailing backslash count: a real continuation.
+            LineKind::Continuing(body) => format!("{body}\\"),
+            // Even trailing backslash count: an escaped backslash, not a
+            // continuation -- covers the `path = c:\\` case from the spec.
+            LineKind::EscapedBackslash(body) => format!("{body}\\\\"),
+            LineKind::Comment(body) => format!("# {body}"),
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn join_continued_lines_never_continues_past_a_comment(
+            lines in proptest::collection::vec(line_kind_strategy(), 0..12),
+        ) {
+            let text = lines.iter().map(render_line).collect::<Vec<_>>().join("\n");
+            let joined = join_continued_lines(text.as_bytes());
+
+            // Invariant 1: every comment line in the input survives as its
+            // own joined line, verbatim -- it is never swallowed into a
+            // preceding continuation, and it never absorbs what follows.
+            for kind in &lines {
+                if let LineKind::Comment(_) = kind {
+                    let rendered = render_line(kind);
+                    let rendered_bytes = rendered.as_bytes();
+                    prop_assert!(
+                        joined.iter().any(|line| line.as_slice() == rendered_bytes),
+                        "comment line {rendered:?} did not survive verbatim in {joined:?}"
+                    );
+                }
+            }
+
+            // Invariant 2: an even-backslash-count line is never merged with
+            // its neighbor -- it always ends a joined line (or is a joined
+            // line unto itself), the same as a `Plain` line.
+            for kind in &lines {
+                if let LineKind::EscapedBackslash(body) = kind {
+                    let rendered = render_line(kind);
+                    let rendered_bytes = rendered.as_bytes();
+                    let contains_whole = joined
+                        .iter()
+                        .any(|line| line.ends_with(rendered_bytes) || line.as_slice() == rendered_bytes);
+                    prop_assert!(
+                        contains_whole,
+                        "escaped-backslash line {rendered:?} lost its trailing `\\\\` in {joined:?} (body {body:?})"
+                    );
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 2. Config include closure: differential against real `git config
+    // --list --show-origin` for one level of `[include]` entries spanning
+    // relative, nested-relative, and absolute paths, with quoting and
+    // backslash continuation.
+    // ---------------------------------------------------------------
+
+    #[derive(Clone, Debug)]
+    enum IncludeStyle {
+        Relative,
+        NestedRelative,
+        Absolute,
+        QuotedRelative,
+        ContinuedRelative,
+    }
+
+    fn include_style_strategy() -> impl Strategy<Value = IncludeStyle> {
+        prop_oneof![
+            Just(IncludeStyle::Relative),
+            Just(IncludeStyle::NestedRelative),
+            Just(IncludeStyle::Absolute),
+            Just(IncludeStyle::QuotedRelative),
+            Just(IncludeStyle::ContinuedRelative),
+        ]
+    }
+
+    /// Every leaf file gets exactly one key so it always contributes a line
+    /// to `git config --list --show-origin` -- an empty included file would
+    /// vanish from that oracle even though it was genuinely read, which
+    /// would make an equal-closure assertion meaningless.
+    fn write_leaf(dir: &Path, stem: &str, index: usize) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("{stem}.include"));
+        std::fs::write(&path, format!("[leaf]\n\tk{index} = v{index}\n")).unwrap();
+        path
+    }
+
+    fn git_show_origin_files(root: &Path, home: &Path) -> BTreeSet<PathBuf> {
+        let output = std::process::Command::new("git")
+            .arg("config")
+            .arg("--file")
+            .arg(root)
+            .args(["--list", "--show-origin", "--includes"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", home)
+            .output()
+            .expect("failed to run git config --show-origin");
+        assert!(
+            output.status.success(),
+            "git config --show-origin failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let field = line.split('\t').next()?;
+                let path = field.strip_prefix("file:")?;
+                Path::new(path).canonicalize().ok()
+            })
+            .collect()
+    }
+
+    fn our_include_closure(root: &Path) -> BTreeSet<PathBuf> {
+        let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut queue = vec![root.to_path_buf()];
+        while let Some(path) = queue.pop() {
+            let Ok(canon) = path.canonicalize() else {
+                continue;
+            };
+            if !visited.insert(canon) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let includes = config_include_paths(&bytes, parent).expect(
+                "generated config bytes are well-formed and unix path conversion cannot fail",
+            );
+            for include in includes {
+                queue.push(include);
+            }
+        }
+        visited
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        #[test]
+        fn config_include_closure_matches_git_show_origin(
+            styles in proptest::collection::vec(include_style_strategy(), 1..4),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("gitconfig");
+            let mut body = String::from("[core]\n\tbare = false\n");
+            for (index, style) in styles.iter().enumerate() {
+                let stem = format!("inc{index}");
+                let (value_line, _leaf_path) = match style {
+                    IncludeStyle::Relative => {
+                        let leaf = write_leaf(dir.path(), &stem, index);
+                        (format!("\tpath = {}.include\n", stem), leaf)
+                    }
+                    IncludeStyle::NestedRelative => {
+                        let nested_dir = dir.path().join("nested").join(&stem);
+                        let leaf = write_leaf(&nested_dir, "leaf", index);
+                        (format!("\tpath = nested/{stem}/leaf.include\n"), leaf)
+                    }
+                    IncludeStyle::Absolute => {
+                        let abs_dir = dir.path().join("abs");
+                        let leaf = write_leaf(&abs_dir, &stem, index);
+                        (format!("\tpath = {}\n", leaf.display()), leaf)
+                    }
+                    IncludeStyle::QuotedRelative => {
+                        let leaf = write_leaf(dir.path(), &stem, index);
+                        (format!("\tpath = \"{}.include\"\n", stem), leaf)
+                    }
+                    IncludeStyle::ContinuedRelative => {
+                        let leaf = write_leaf(dir.path(), &stem, index);
+                        // Split the value across a backslash-continued line;
+                        // this is a real Git continuation, not an escape,
+                        // because the trailing backslash count is odd (one).
+                        (format!("\tpath = {stem}\\\n.include\n"), leaf)
+                    }
+                };
+                body.push_str("[include]\n");
+                body.push_str(&value_line);
+            }
+            std::fs::write(&root, &body).unwrap();
+
+            let ours = our_include_closure(&root);
+            let git = git_show_origin_files(&root, dir.path());
+
+            prop_assert_eq!(
+                ours, git,
+                "include closure diverged from `git config --list --show-origin` for:\n{}",
+                body
+            );
+        }
+    }
+
+    // `includeIf` conditions are deliberately never evaluated by
+    // `config_include_paths` (documented on the function itself): the gate
+    // is about detecting *change*, not about replicating Git's condition
+    // evaluation, so a currently-false `includeIf` still pins its target.
+    // This is therefore a documented divergence from Git's own behavior
+    // (Git only reads a conditional include when its condition holds), not
+    // covered by the differential oracle above -- recorded here as an
+    // explicit invariant instead of a silent gap.
+    proptest! {
+        #[test]
+        fn config_include_treats_includeif_like_include_regardless_of_condition(
+            condition in "[a-zA-Z0-9_*/:. -]{0,40}",
+        ) {
+            let bytes = format!(
+                "[includeIf \"{condition}\"]\n\tpath = always-pinned.include\n"
+            );
+            let base = Path::new("/repo/.git");
+            let includes = config_include_paths(bytes.as_bytes(), base)
+                .expect("generated config bytes are well-formed and unix path conversion cannot fail");
+            prop_assert_eq!(includes, vec![base.join("always-pinned.include")]);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 3. Porcelain `-z` status classification.
+    // ---------------------------------------------------------------
+
+    fn xy_strategy() -> impl Strategy<Value = [u8; 2]> {
+        // The real alphabet porcelain v1 uses for the XY pair, plus a few
+        // bytes that are not valid XY codes at all -- the classifier must
+        // not panic or crash on either.
+        let alphabet: &[u8] = b" MADRCU?!";
+        (
+            proptest::sample::select(alphabet),
+            proptest::sample::select(alphabet),
+        )
+            .prop_map(|(x, y)| [x, y])
+    }
+
+    fn path_bytes_strategy() -> impl Strategy<Value = Vec<u8>> {
+        // Unicode-ish path text plus a NUL-free slice of arbitrary bytes, so
+        // both "normal" and adversarial path bytes are covered. `-z` records
+        // are NUL-delimited, so a well-formed record body never itself
+        // contains a NUL -- generated separately from arbitrary bytes with
+        // NULs filtered out below.
+        prop_oneof![
+            "[a-zA-Z0-9/_.\\-]{0,40}".prop_map(|s| s.into_bytes()),
+            proptest::collection::vec(any::<u8>(), 0..40)
+                .prop_map(|bytes| bytes.into_iter().filter(|b| *b != 0).collect()),
+        ]
+    }
+
+    #[derive(Clone, Debug)]
+    enum RecordSpec {
+        Untracked(Vec<u8>),
+        Ordinary {
+            xy: [u8; 2],
+            path: Vec<u8>,
+        },
+        Rename {
+            xy: [u8; 2],
+            path: Vec<u8>,
+            orig: Vec<u8>,
+        },
+    }
+
+    fn record_strategy() -> impl Strategy<Value = RecordSpec> {
+        prop_oneof![
+            path_bytes_strategy().prop_map(RecordSpec::Untracked),
+            (xy_strategy(), path_bytes_strategy())
+                .prop_map(|(xy, path)| RecordSpec::Ordinary { xy, path }),
+            (xy_strategy(), path_bytes_strategy(), path_bytes_strategy())
+                .prop_map(|(xy, path, orig)| RecordSpec::Rename { xy, path, orig }),
+        ]
+    }
+
+    /// Renders one `-z` record's raw bytes: `"?? "` + path for an untracked
+    /// entry, `XY ` + path for an ordinary entry, and `XY ` + path + NUL +
+    /// origPath for a rename/copy, matching porcelain v1's two-NUL-separated
+    /// rename shape. Returns every record produced (renames render as two).
+    fn render_record(spec: &RecordSpec) -> Vec<Vec<u8>> {
+        match spec {
+            RecordSpec::Untracked(path) => {
+                let mut record = b"?? ".to_vec();
+                record.extend_from_slice(path);
+                vec![record]
+            }
+            RecordSpec::Ordinary { xy, path } => {
+                let mut record = xy.to_vec();
+                record.push(b' ');
+                record.extend_from_slice(path);
+                vec![record]
+            }
+            RecordSpec::Rename { xy, path, orig } => {
+                let mut first = xy.to_vec();
+                first.push(b' ');
+                first.extend_from_slice(path);
+                vec![first, orig.clone()]
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn status_contains_subject_change_never_panics(
+            bytes in proptest::collection::vec(any::<u8>(), 0..2048),
+        ) {
+            let _ = status_contains_subject_change(&bytes);
+        }
+
+        /// Invariant: every record that is not an untracked (`?? `) record
+        /// is always treated as a subject change, whatever its XY code or
+        /// path bytes -- tracked/staged mutations are never exempt.
+        #[test]
+        fn status_contains_subject_change_true_for_any_tracked_record(
+            xy in xy_strategy(),
+            path in path_bytes_strategy(),
+        ) {
+            prop_assume!(xy != *b"??");
+            let mut status = xy.to_vec();
+            status.push(b' ');
+            status.extend_from_slice(&path);
+            status.push(0);
+            prop_assert!(status_contains_subject_change(&status));
+        }
+
+        /// Invariant: an untracked record for a path outside the exact
+        /// `.impulse/...` exemption list is always a subject change. Covers
+        /// the two named attack shapes directly: a suffix appended to an
+        /// exempt name (`.impulse/MEMORY_CANDIDATES.json.evil`) and the
+        /// exemption spelling nested under an unrelated directory
+        /// (`x/.impulse/...`) -- exemptions are root-anchored.
+        #[test]
+        fn status_contains_subject_change_untracked_exemption_is_root_anchored(
+            suffix in "[a-zA-Z0-9._-]{1,20}",
+            prefix in "[a-zA-Z0-9_-]{1,10}",
+        ) {
+            let exempt_names: &[&str] = &[
+                ".impulse/GOVERNED_TASKS.json",
+                ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.json",
+                ".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.lock",
+                ".impulse/sockets/impulse.pid",
+                ".impulse/PRODUCER_RESERVATIONS.json",
+                ".impulse/MEMORY_CANDIDATES.json",
+            ];
+            for exempt in exempt_names {
+                // Appending a suffix to an exempt name must never still be
+                // exempt (it is not an exact match and not a recognized
+                // `.tmp.`/`worktrees/` prefix family).
+                let evil = format!("{exempt}{suffix}");
+                let mut status = format!("?? {evil}").into_bytes();
+                status.push(0);
+                prop_assert!(
+                    status_contains_subject_change(&status),
+                    "suffix-appended exempt path {evil:?} was wrongly exempted"
+                );
+
+                // Nesting the exact exempt spelling under an unrelated
+                // directory must never be exempt either -- exemptions are
+                // root-anchored, not a bare filename match.
+                let nested = format!("{prefix}/{exempt}");
+                let mut status = format!("?? {nested}").into_bytes();
+                status.push(0);
+                prop_assert!(
+                    status_contains_subject_change(&status),
+                    "non-root-anchored exempt path {nested:?} was wrongly exempted"
+                );
+            }
+        }
+
+        /// Cross-check against [`render_record`]/[`record_strategy`]: an
+        /// untracked record is exempt if and only if
+        /// `is_untracked_impulse_runtime_artifact` says so directly, and any
+        /// non-`??` record (ordinary or the first half of a rename) is
+        /// always a change -- proving the two functions agree on every
+        /// generated record shape, including renames with two NUL-separated
+        /// paths.
+        #[test]
+        fn status_contains_subject_change_agrees_with_the_untracked_predicate(
+            specs in proptest::collection::vec(record_strategy(), 0..8),
+        ) {
+            let mut status = Vec::new();
+            let mut expect_change = false;
+            for spec in &specs {
+                for record in render_record(spec) {
+                    status.extend_from_slice(&record);
+                    status.push(0);
+                }
+                match spec {
+                    RecordSpec::Untracked(path) => {
+                        expect_change |= !is_untracked_impulse_runtime_artifact(path);
+                    }
+                    // Ordinary and rename records are always a change: the
+                    // rename's second (orig-path) record carries no XY
+                    // prefix at all, so it too falls into the `None` arm of
+                    // `status_contains_subject_change`'s match and is always
+                    // treated as a change.
+                    RecordSpec::Ordinary { .. } | RecordSpec::Rename { .. } => {
+                        expect_change = true;
+                    }
+                }
+            }
+            prop_assert_eq!(status_contains_subject_change(&status), expect_change);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 4. `read_head_oid_without_git`: differential against
+    // `git rev-parse HEAD` across generated repository ref shapes.
+    // ---------------------------------------------------------------
+
+    fn git_rev_parse_head(repo: &Path) -> Result<String, ()> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "--verify", "HEAD"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", repo)
+            .output()
+            .expect("failed to run git rev-parse");
+        if output.status.success() {
+            Ok(String::from_utf8(output.stdout).unwrap().trim().to_string())
+        } else {
+            Err(())
+        }
+    }
+
+    fn git_run(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", repo)
+            .output()
+            .expect("failed to run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn fresh_repo(branch: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git_run(dir.path(), &["init", "--quiet", "-b", branch]);
+        git_run(dir.path(), &["config", "user.email", "test@example.com"]);
+        git_run(dir.path(), &["config", "user.name", "Test"]);
+        dir
+    }
+
+    #[derive(Clone, Debug)]
+    enum RefShape {
+        Loose,
+        PackedOnly,
+        LooseAndPacked,
+        Detached,
+        SymbolicToMissing,
+    }
+
+    fn ref_shape_strategy() -> impl Strategy<Value = RefShape> {
+        prop_oneof![
+            Just(RefShape::Loose),
+            Just(RefShape::PackedOnly),
+            Just(RefShape::LooseAndPacked),
+            Just(RefShape::Detached),
+            Just(RefShape::SymbolicToMissing),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(40))]
+        #[test]
+        fn read_head_oid_without_git_matches_git_rev_parse_for_generated_shapes(
+            branch in "[a-z][a-z0-9_-]{0,10}",
+            commits in 1..4usize,
+            shape in ref_shape_strategy(),
+        ) {
+            let dir = fresh_repo(&branch);
+            for index in 0..commits {
+                std::fs::write(dir.path().join("f.txt"), format!("{index}\n")).unwrap();
+                git_run(dir.path(), &["add", "f.txt"]);
+                git_run(dir.path(), &["commit", "--quiet", "-m", &format!("commit {index}")]);
+            }
+
+            match shape {
+                RefShape::Loose => {}
+                RefShape::PackedOnly => {
+                    git_run(dir.path(), &["pack-refs", "--all"]);
+                    let loose = dir.path().join(".git/refs/heads").join(&branch);
+                    let _ = std::fs::remove_file(loose);
+                }
+                RefShape::LooseAndPacked => {
+                    git_run(dir.path(), &["pack-refs", "--all"]);
+                    // Loose ref is regenerated by `pack-refs` leaving the
+                    // loose file in place only if HEAD moves again; force
+                    // both to exist by re-writing the branch ref.
+                    let oid = git_rev_parse_head(dir.path()).unwrap();
+                    git_run(dir.path(), &["update-ref", &format!("refs/heads/{branch}"), &oid]);
+                }
+                RefShape::Detached => {
+                    let oid = git_rev_parse_head(dir.path()).unwrap();
+                    git_run(dir.path(), &["checkout", "--quiet", &oid]);
+                }
+                RefShape::SymbolicToMissing => {
+                    std::fs::write(
+                        dir.path().join(".git/HEAD"),
+                        "ref: refs/heads/does-not-exist\n",
+                    )
+                    .unwrap();
+                }
+            }
+
+            let repo = dir.path().canonicalize().unwrap();
+            let ours = read_head_oid_without_git(&repo);
+            let git = git_rev_parse_head(&repo);
+
+            match (ours, git) {
+                (Ok(ours), Ok(git)) => prop_assert_eq!(ours, git),
+                (Err(_), Err(_)) => {}
+                (ours, git) => prop_assert!(
+                    false,
+                    "read_head_oid_without_git and `git rev-parse HEAD` disagreed on success: \
+                     ours={ours:?} git={git:?} shape={shape:?}"
+                ),
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // 5. `validate_oid` / `validate_path_segment`: regex-oracle equivalence.
+    // ---------------------------------------------------------------
+
+    fn oid_oracle(s: &str) -> bool {
+        matches!(s.len(), 40 | 64)
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    fn path_segment_oracle(s: &str) -> bool {
+        if s.is_empty() || s.len() > 128 || s == "." || s == ".." || s.starts_with('.') {
+            return false;
+        }
+        s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }
+
+    proptest! {
+        #[test]
+        fn validate_oid_matches_regex_oracle(
+            s in prop_oneof![
+                // Realistic near-misses: right alphabet, wrong length.
+                "[0-9a-f]{0,80}",
+                // Wrong alphabet (uppercase hex, arbitrary ASCII/Unicode).
+                ".{0,80}",
+            ],
+        ) {
+            prop_assert_eq!(validate_oid(&s).is_ok(), oid_oracle(&s));
+        }
+
+        #[test]
+        fn validate_path_segment_matches_regex_oracle(
+            s in prop_oneof![
+                "[a-zA-Z0-9_-]{0,140}",
+                "\\.[a-zA-Z0-9_-]{0,20}",
+                ".{0,140}",
+            ],
+        ) {
+            let result = impulse_ops::governed_task::validate_path_segment("field", &s);
+            prop_assert_eq!(result.is_ok(), path_segment_oracle(&s));
+        }
     }
 }

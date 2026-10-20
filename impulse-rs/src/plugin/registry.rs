@@ -213,12 +213,9 @@ pub fn init_global_registry() -> &'static PluginRegistry {
             }
 
             fn formats(&self) -> &[OfficeFormat] {
-                &[
-                    OfficeFormat::Docx,
-                    OfficeFormat::Xlsx,
-                    OfficeFormat::Xls,
-                    OfficeFormat::Csv,
-                ]
+                // Legacy `.xls` is not listed: `office::parse_document`
+                // refuses it, since it cannot be read under the office bounds.
+                &[OfficeFormat::Docx, OfficeFormat::Xlsx, OfficeFormat::Csv]
             }
 
             fn extract(&self, path: &std::path::Path) -> PluginResult<PluginOutput> {
@@ -271,12 +268,10 @@ pub fn init_global_registry() -> &'static PluginRegistry {
             }
         }
 
-        for format in [
-            OfficeFormat::Docx,
-            OfficeFormat::Xlsx,
-            OfficeFormat::Xls,
-            OfficeFormat::Csv,
-        ] {
+        // Registered for the formats the provider declares, so the
+        // registration and the declaration cannot drift apart.
+        let provider = OfficeContextProvider::new();
+        for &format in provider.formats() {
             if let Err(err) =
                 registry.register_context_provider(format, Arc::new(OfficeContextProvider::new()))
             {

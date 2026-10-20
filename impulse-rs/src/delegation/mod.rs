@@ -13,4 +13,6 @@ pub mod types;
 
 pub use detector::{detect_delegation, detect_delegation_natural};
 pub use tracker::DelegationTracker;
-pub use types::{DelegationSpec, DelegationState, TrackedDelegation, MAX_DELEGATION_DEPTH};
+pub use types::{
+    DelegationError, DelegationSpec, DelegationState, TrackedDelegation, MAX_DELEGATION_DEPTH,
+};

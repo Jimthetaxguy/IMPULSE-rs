@@ -8,8 +8,8 @@ type: reference
 category: architecture
 audience: builder
 tags: [decisions, adr, architecture]
-updated: 2026-08-17
-last_updated: 2026-08-17
+updated: 2026-09-26
+last_updated: 2026-09-26
 ---
 
 # Architecture Decision Records
@@ -42,6 +42,15 @@ registry-backed runtime identity, daemon truth, or the current Now/Next/Later ro
 | [0013](0013-deterministic-accepted-run-memory-candidates.md) | Deterministic accepted-run memory candidates | **Accepted** | Owner-only pending review projection and explicit no-promotion boundary | 2026-07-15 | -- |
 | [0014](0014-work-item-and-comparative-settlement.md) | WorkItem identity and comparative settlement | **Proposed** | Proposed planning identity, fan-out effect bound, and four-part settlement record | 2026-08-10 | -- |
 | [0015](0015-harness-owned-step-model.md) | Harness-owned step model choice | **Accepted** | Pure Impulse-owned per-step policy; applications retain inference and semantic authority | 2026-08-17 | -- |
+| [0016](0016-governed-harness-evolution-plane.md) | Governed harness evolution plane | **Proposed** | Typed harness-patch candidates in an owner-only review ledger, review- or sandbox-gated evaluation, and no automatic promotion; draft | 2026-08-26 | -- |
+| [0017](0017-canonical-loop-contract.md) | Canonical loop contract | **Proposed** | Typed loop budgets, breaker-evaluated stop conditions, and termination evidence for Ion tool loops; 0016 reserved by the drafted harness evolution plane | 2026-09-01 | -- |
+| [0018](0018-socket-actor-provenance.md) | Socket actor provenance | **Proposed** | Peer credentials plus a per-run operator capability classify every daemon connection, so only an operator surface can mint `accepted` | 2026-09-02 | -- |
+| [0019](0019-builder-staged-worktree-world-scope.md) | Builder staged-worktree world scope | **Proposed** | Declared `WorldScope`, a disposable staged Builder worktree, fast-forward-only promotion after operator acceptance, mediated (never structural) `filesystem.scoped` reporting, and the governed Builder loop binding; 0018 reserved by the socket actor-provenance lane | 2026-09-02 | -- |
+| [0020](0020-scoped-memory-promotion-and-dismissal.md) | Scoped memory promotion and dismissal | **Proposed** | Operator-class promote/dismiss with receipts, an append-only hash-chained `MEMORY.jsonl`, a separate regenerated `GENOME_PROJECTION.md` that never rewrites the hand-curated `GENOME.md`, a status-preserving derivation migration, and promoted-only retrieval indexing | 2026-09-12 | -- |
+| [0021](0021-monty-sandbox-for-calculator-and-python-exec.md) | Monty sandbox for calculator and python_exec | **Proposed** | `calculator`, `python_exec`, `calc`, and `exec` run Python in the in-process Monty interpreter with no filesystem, network, process, or host-function access; typed `fault` classes; MSRV 1.96; `monty-pool` crash isolation deferred | 2026-09-26 | -- |
+| [0022](0022-typed-model-endpoints.md) | Typed model endpoints (protocol, not vendor) | **Proposed** | Endpoints are typed `{protocol, base_url, auth-by-env-name, model, max_output_tokens, capabilities}` values in named `config.json` profiles selected per role (ion, photon, orchestrator); stage 2 adds the `ModelProvider` trait, capability checks, one `EndpointPolicy` for retry/fallback/local-first routing, and Ion on endpoints | 2026-10-03 | -- |
+| [0023](0023-sqlite-blackboard-off-context-state.md) | SQLite blackboard for off-context agent state | **Proposed** | Tool results over 4 KiB go to `.impulse/blackboard.db` and the model gets a reference it pages with `blackboard_fetch`; long governed claim summaries spill to a `blackboard:` artifact; Ion gains `blackboard_store`, `blackboard_fetch`, `search_tools`; orchestrator surface fixed at five tools | 2026-10-03 | -- |
+| [0024](0024-orchestration-hierarchy.md) | Orchestration hierarchy (super orchestrator, workspace orchestrators, workers) | **Proposed** | A long-running super orchestrator and persistent per-workspace orchestrators delegate to tool-using workers; only bounded `AgentReport`s travel up and `Brief`s travel down; the cockpit shows full output from the blackboard and artifact store instead of any orchestrator's context; approval stays with the operator at every level | 2026-10-04 | -- |
 
 ## ADR Format
 

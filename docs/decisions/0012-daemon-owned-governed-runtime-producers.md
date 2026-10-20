@@ -2,6 +2,7 @@
 title: "ADR-0012: Daemon-Owned Governed Runtime Producers"
 status: accepted
 created: 2026-07-13
+updated: 2026-09-12
 deciders: [Impulse Maintainers]
 ---
 
@@ -166,6 +167,127 @@ This decision is represented only when tests prove:
 10. the docs keep memory promotion, strong local actor authentication, generalized profiles, and
    external-runtime parity explicit as follow-ups.
 
+## Amendment (2026-09-02): durable producer reservations
+
+The Consequences section above names an open gap: persisted receipts and the per-task daemon lock
+deduplicate replay and concurrent requests, but a daemon exit between a producer side effect and
+its durable receipt could still repeat that side effect after restart.
+
+The state layer half of that gap is now closed. `impulse-rs/src/state/producer_reservation.rs`
+adds a durable, atomic journal (`.impulse/PRODUCER_RESERVATIONS.json`, distinct from
+`GOVERNED_TASKS.json`) that records the *intent* to run a producer side effect before it starts.
+It carries a whole-file SHA-256 digest checked at every load, which is corruption/truncation
+detection, not tamper resistance (an unkeyed hash cannot stop an adversary who can already write
+the file — it exists to catch an accidental partial write, not a deliberate one), matching the
+guarantee the basis and memory-candidate ledgers already accept:
+
+- `State::reserve(task_id, revision, request_id, producer)` fails closed with a typed
+  `DuplicateOpenReservation` error if an open reservation at or after `revision` already exists for
+  the same task and producer, so a request replayed while the original side effect is genuinely
+  still in flight cannot start a second, competing run. An open reservation strictly behind the
+  incoming revision is closed as `NeedsRerun` instead of blocking — it cannot be a live attempt, since
+  the caller's higher revision proves the task has moved on. This does not fully close a same-day
+  adversarial-review finding: an in-process panic (not a process exit) leaves a reservation open
+  with no `State::new` reconcile to clear it, and two attempts at the *exact same* revision still
+  conflict until either a real process restart or future operator tooling; the revision-scoped
+  check narrows this to that one residual case rather than eliminating it, chosen over an explicit
+  operator-facing `clear_stale_reservation` API because it needs no new plumbing. See the design
+  spec's "Revision-scoped duplicate check" section.
+- `State::release(id, receipt_ref)` closes a reservation once its side effect and governed-task
+  mutation are both durably recorded. `reserve`, `release`, and reconcile's internal close-as-
+  needs-rerun step all clone the in-memory ledger, mutate the clone, persist the clone, and only
+  then swap it into the live state — the same discipline `mutate_governed_task` and the
+  memory-candidate ledger already use — so a transient persist failure (a momentarily unwritable
+  `.impulse/`, a full disk) leaves the live ledger exactly as it was, never a phantom reservation
+  the caller can neither find nor release. An earlier version of this journal mutated the live
+  ledger before the fallible persist with no rollback; fixed in adversarial review before this PR
+  merged.
+- A reservation still open when the process reloads was interrupted before a receipt existed.
+  `State::new` reconciles it to `NeedsRerun` and records a note on the owning governed task's own
+  event chain (a new, purely additive `GovernedTaskEventKind::ProducerReservationInterrupted` /
+  `GovernedTaskMutation::NoteProducerReservationInterrupted` pair in
+  `impulse-ops/src/governed_task.rs`), so the operator surface can show it without inventing a
+  second source of truth.
+- `producer_reservation::with_reservation` is a ready-to-adopt async wrapper: reserve, run a closure
+  that performs the side effect *and* persists its governed-task mutation, then release with the
+  resulting receipt reference. Releasing before the mutation is persisted would reopen the gap this
+  journal exists to close, so the helper's closure contract requires both steps together. It has no
+  `catch_unwind` and is not panic-safe: a panic inside the closure leaves the reservation open
+  (same as a crash) but propagates through `with_reservation` rather than being caught and
+  released, so the handler-wiring lane must treat an in-process panic exactly like a process crash,
+  not as a normal `Err` return.
+
+**Not yet done — handler wiring remains follow-up work**, tracked as the next lane in
+`docs/plans/2026-09-02-impulse-next-stages.md`'s Stage 3: `RunGovernedVerification` and
+`RunGovernedSupervisorReview` in `src/daemon/handlers.rs` do not yet call `with_reservation` around
+`governed_producers::run_verification`/the Supervisor review turn. Until that wiring lands, the gap
+this amendment describes is observable (an interrupted reservation is now durably visible and
+annotated) but not yet load-bearing (a replayed request after a crash still reruns the side effect,
+exactly as before). See the design spec for the exact adoption shape.
+
+Design spec: [`../superpowers/specs/2026-09-02-producer-reservation-journal.md`](../superpowers/specs/2026-09-02-producer-reservation-journal.md).
+
+### Handler wiring landed (2026-09-12)
+
+The amendment above closed the state-layer half and said the gap was "observable but not yet
+load-bearing". It is load-bearing now. What changed, and what is therefore true of a running daemon:
+
+- **Three producers reserve.** `RunGovernedVerification`, `RunGovernedSupervisorReview`, and the new
+  `PromoteGovernedOutcome` endpoint each run their external side effect *and* persist the
+  governed-task mutation that records it inside one `with_reservation` closure
+  (`src/daemon/governed_wiring.rs`). Releasing between the two would reopen exactly the window the
+  journal exists to close, so the helper does not offer that shape and neither does this wiring.
+  `ProducerKind::Promotion` stops being reserved-for-later and becomes live.
+- **`acquire_governed_producer_lock` stays, demoted to what it always was.** It keeps two concurrent
+  in-process requests from both reaching `reserve()`, which the durable journal would then have to
+  refuse. It is an in-memory optimization, not the crash-safety boundary.
+- **A crash is now distinguishable from ordinary work at the wire.** A reservation left open by an
+  interrupted process is reconciled to `needs_rerun` at the next `State::new`, noted on the owning
+  task's own event chain, and reported to the caller whose request id took it through
+  `pending_rerun_reason` on the producer acknowledgement (protocol v9). The rerun proceeds — the
+  field explains why work is being redone, it does not block it. A request arriving while a
+  same-revision reservation is genuinely still open is refused with the journal's typed
+  `DuplicateOpenReservation`.
+- **The replay path deliberately does not reserve.** When the existing receipt check recognizes a
+  request id, the recorded evidence is replayed verbatim and no side effect runs, so there is
+  nothing to reserve. That is the case the spec's acceptance criterion names as "a replayed request
+  does not re-run cargo".
+- **Replay must be checked before a side effect, not only before a receipt.** Staged materialization
+  is the case that makes this concrete: it creates its checkout *before* the ledger write, so a
+  retry that is not recognized first reaches the producer and fails on a staged path occupied by
+  its own earlier attempt — telling the operator to delete what is in fact a live Builder's
+  checkout. Every producer that mutates the world before it writes its receipt must consult the
+  ledger's receipts first. The three reserved producers get this from
+  `require_producer_request_state`; registration now does it explicitly.
+- **A panic is treated as a crash, not as an error.** `with_reservation` has no `catch_unwind`; the
+  wiring adds none. A panic inside a producer closure leaves the reservation open and propagates,
+  and is closed either by a real process restart's reconcile or by the revision-scoped duplicate
+  check once the task's revision next advances.
+
+**Discard is deliberately *not* reserved, and that is a documented gap, not an omission.**
+`DiscardGovernedStagedWorktree` removes a checkout and then records
+`DiscardStagedWorktree`, which flips the staged record's `status` to `discarded` and appends an
+event. That is a governed-task mutation, so the crash window is real: a daemon that exits between
+the removal and the receipt leaves a record whose `status` is still `active` pointing at a path that
+no longer exists. Two things bound it. The side effect is idempotent on retry — `discard_staged_worktree`
+treats an already-removed checkout as a no-op and the endpoint's replay branch answers from the
+receipt — so an operator who re-issues the request reaches a correct terminal state. And the stale
+record is inert rather than dangerous: `active_staged_worktree()` would hand a launch a missing
+path, but nothing re-launches a task that has already reached a discardable state. It is still
+wrong, and the fix is the same shape as the other three producers: a fourth
+`ProducerKind::Discard` and a `with_reservation` wrap. That needs an added variant in
+`src/state/producer_reservation.rs`, which the daemon-wiring lane does not own, so it is recorded
+here and carried on that lane's handoff list rather than hand-rolled.
+
+**One consequence worth recording because it was not obvious.** Adopting the journal made the
+daemon write `.impulse/PRODUCER_RESERVATIONS.json` on a governed path for the first time. In a
+project whose `.impulse` namespace is not gitignored, that file made the canonical worktree read as
+dirty the moment a verification reserved, which broke every later claim, registration, and
+promotion in the same workspace. The file is now both exempted in
+`governed_producers::is_untracked_impulse_runtime_artifact` and added to the ignore list
+`impulse init` writes. `MEMORY_CANDIDATES.json` has the same shape of gap — gitignored by `init` but
+not exempted — and is left to the lane that owns `governed_producers.rs`.
+
 ## Related Documents
 
 - [`0010-product-role-launch-contract.md`](0010-product-role-launch-contract.md)
@@ -174,3 +296,4 @@ This decision is represented only when tests prove:
 - [`../spec/RUST-CANONICAL-CONTRACT.md`](../spec/RUST-CANONICAL-CONTRACT.md)
 - [`../spec/TEST-TRACEABILITY.md`](../spec/TEST-TRACEABILITY.md)
 - [`../superpowers/plans/2026-07-13-governed-runtime-producers.md`](../superpowers/plans/2026-07-13-governed-runtime-producers.md)
+- [`../superpowers/specs/2026-09-02-producer-reservation-journal.md`](../superpowers/specs/2026-09-02-producer-reservation-journal.md)

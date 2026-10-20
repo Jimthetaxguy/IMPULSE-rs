@@ -219,7 +219,7 @@ cargo run -- agent-discover --json   # Print manifest as JSON (pipe to agent)
 cargo run -- agent-discover --summary # Brief overview of capabilities
 
 # ImpulseAgent (LLM coordination)
-cargo run -- agent-configure --provider anthropic --api-key $ANTHROPIC_API_KEY
+cargo run -- agent-configure --provider anthropic   # key comes from ANTHROPIC_API_KEY
 cargo run -- agent-configure --harness claude-code
 cargo run -- agent-status [--json]
 cargo run -- agent-query "Review cross-pane activity" [--json]
@@ -279,6 +279,7 @@ cargo run -- config <key> --value <val>  # Set value
 # Guardrails
 cargo run -- guard --action "git push --force" --target bash --json
 cargo run -- guard --list
+cargo run -- guard --hook < pre-tool-use.json   # Claude Code PreToolUse hook: exit 2 blocks
 cargo run -- guard --enable <rule-id>
 cargo run -- guard --disable <rule-id>
 
@@ -427,13 +428,14 @@ DynamicTool trait (async, Send+Sync)
     ├── ToolRegistry (register, get, list, execute)
     │       └── Capability enforcement (deny-by-default)
     │
-    ├── Built-in tools (19 wrappers, zero code duplication)
+    ├── Built-in tools (zero code duplication; document_extract, a stub whose
+    │       default path always errored, was deleted 2026-09-12 — read
+    │       Office documents via Ion's document_read instead)
     │       ├── Analysis: benchmark, genome_read, memory_search, session_query
     │       ├── System: build_health, clean_all, config_get, health_check,
     │       │           sccache_setup, sccache_status, steward_status, sweep,
     │       │           system_info, tool_availability, wipe
-    │       ├── Utility: calculator, file_read, python_exec
-    │       └── Document: document_extract
+    │       └── Utility: calculator, file_read, python_exec
     │
     └── CLI commands
             ├── tooling-list      — List available tools
@@ -489,7 +491,7 @@ It operates in two modes:
 
 ```bash
 # Configure with API provider
-impulse-rs agent-configure --provider anthropic --api-key $ANTHROPIC_API_KEY
+impulse-rs agent-configure --provider anthropic   # key comes from ANTHROPIC_API_KEY
 
 # Configure with CLI harness
 impulse-rs agent-configure --harness claude-code
@@ -688,7 +690,7 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 | **Now**    | Tool/model/credential management                                       | Rust        | **Complete** |
 | **Now**    | System utilities (calc, exec, health, system)                          | Rust        | **Complete** |
 | **Next**   | Retrieval + review-first context injection (feature-flagged, additive) | Rust+Python | **Complete** |
-| **Next**   | Monty integration (computed routing, dynamic injection, KDB, SWARM)   | Rust+Python | **Complete** |
+| **Next**   | Monty: `src/monty/` PyO3 module is an unbuilt stub (`monty-support` never built by CI); sandboxed Python for calc/exec lives in `tools/python.rs` (ADR-0021) | Rust | **Partial** |
 | **Later**  | Desktop bundle                                                         | Dioxus Desktop | **Open**  |
 | **Later**  | DataFusion analytics (optional)                                        | Rust        | **Open**     |
 | **Future** | Agent VCS + dashboard                                                  | +Rust       | Vision       |
@@ -710,7 +712,10 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 - Retrieval index (`retrieval.db`) with FTS5 keyword search
 - Feature-flagged semantic path with fallback-safe behavior
 - Review-first context injection on daemon chat and direct orchestration
-- Monty Python interpreter integration (computed routing, dynamic injection, KDB, SWARM)
+- `src/monty/` routing, injection, KDB, and SWARM run as keyword heuristics in plain Rust; the PyO3
+  `monty-support` path is an unbuilt stub, not a completed integration
+- Sandboxed Python for `calc`, `exec`, `calculator`, and `python_exec` uses the in-process `monty`
+  crate with no filesystem, network, or process access (ADR-0021)
 
 **Later (Coordination UX):**
 - Advanced coordination UX and agent dashboarding

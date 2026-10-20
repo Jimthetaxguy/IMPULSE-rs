@@ -89,7 +89,11 @@ impl TerminalRenderer {
     ) -> egui::Response {
         self.ensure_metrics(ui);
 
-        // Shift viewport into scrollback if needed.
+        // Shift viewport into scrollback if needed, at most one screen:
+        // vt100 0.15 underflows past that. The panel's stored offset can
+        // exceed the height, because the panel shrinks the terminal while
+        // its scroll badge shows.
+        let scroll_offset = scroll_offset.min(usize::from(parser.screen().size().0));
         if scroll_offset > 0 {
             parser.set_scrollback(scroll_offset);
         }
@@ -184,7 +188,7 @@ impl TerminalRenderer {
                             egui::pos2(x_start, underline_y),
                             egui::pos2(x_end, underline_y),
                         ],
-                        egui::Stroke::new(1.0, run.fg),
+                        egui::Stroke::new(1.0_f32, run.fg),
                     );
                 }
             }

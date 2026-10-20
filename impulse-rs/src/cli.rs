@@ -95,6 +95,10 @@ pub enum VoiceCommands {
         /// Port for tcp / webhook (default: 8787)
         #[arg(long, default_value_t = 8787)]
         port: u16,
+        /// Serve the webhook without IMPULSE_VOICE_WEBHOOK_SECRET; anyone who
+        /// can reach the port can call its tools. For local testing only.
+        #[arg(long)]
+        allow_unauthenticated: bool,
     },
 }
 
@@ -431,7 +435,7 @@ pub enum Commands {
         #[arg(long)]
         path: Option<PathBuf>,
     },
-    // Build hygiene: workspace-wide cargo clean
+    // Build hygiene: remove every discovered project's target/
     CleanAll {
         /// Only show what would be cleaned (default: true)
         #[arg(long)]
@@ -564,6 +568,10 @@ pub enum Commands {
         /// Output results as JSON (matches daemon IPC format)
         #[arg(long)]
         json: bool,
+        /// Run as a Claude Code PreToolUse hook: read the tool call from
+        /// stdin and exit 2 to block it (Claude Code's only blocking code)
+        #[arg(long)]
+        hook: bool,
     },
     /// Semantic diff between two Git refs using the `sem` tool
     SemDiff {
@@ -697,6 +705,57 @@ pub enum Commands {
         project_id: Option<String>,
         #[arg(long)]
         task_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Internal: renders one PDF's text layer, bounded, in this isolated
+    /// process, and prints it as JSON to stdout. Spawned only by ion's
+    /// `document_read` tool (`ion_repl::tool_document::run_pdf_extraction_child`,
+    /// review round 1 P0-1/P0-2) as a crash- and memory-isolated child --
+    /// never invoked directly by a person. Not a public interface: its
+    /// arguments and output shape may change without notice.
+    #[command(hide = true)]
+    InternalPdfText {
+        /// Path to the PDF to render.
+        path: PathBuf,
+        /// Cumulative character budget across every rendered page.
+        #[arg(long)]
+        max_chars: usize,
+        /// Refuse the PDF above this many pages.
+        #[arg(long)]
+        max_pages: usize,
+        /// Memory-watchdog ceiling in bytes (review round 3, F2). Defaults
+        /// to the production ceiling
+        /// (`ion_repl::tool_document::PDF_CHILD_MEMORY_LIMIT_BYTES`) when
+        /// omitted; overridable only so integration tests can prove the
+        /// watchdog actually fires using a small fixture against a small
+        /// ceiling, rather than needing a genuinely gigabyte-scale bomb in
+        /// the default test suite. `RLIMIT_AS` (set by the parent,
+        /// independent of this flag) is unaffected by this override.
+        #[arg(long)]
+        memory_limit_bytes: Option<u64>,
+    },
+    /// Fast-forward the canonical branch onto an accepted staged outcome (ADR-0019).
+    ///
+    /// Operator-class only. A blocked promotion is reported, not an error: the
+    /// run stays accepted and the staged worktree stays active.
+    GovernedPromote {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reclaim a finished staged worktree (ADR-0019). Operator-class only.
+    GovernedDiscard {
+        #[arg(long)]
+        project_id: Option<String>,
+        #[arg(long)]
+        task_id: Option<String>,
+        /// Why the checkout is being reclaimed; recorded on the discard event.
+        #[arg(long, default_value = "operator reclaimed the staged worktree")]
+        reason: String,
         #[arg(long)]
         json: bool,
     },
