@@ -12,7 +12,9 @@ pub fn build_init_message(
 ) -> String {
     let version = env!("CARGO_PKG_VERSION");
     let session_line = session_id
-        .map(|id| format!("Session: {} | ", &id[..id.len().min(8)]))
+        // A session id may be any non-control text, and slicing it at byte
+        // 8 panicked inside a multi-byte character.
+        .map(|id| format!("Session: {} | ", id.chars().take(8).collect::<String>()))
         .unwrap_or_default();
     let cross_pane = format_cross_pane_section(cross_pane_insights);
 

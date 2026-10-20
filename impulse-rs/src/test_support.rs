@@ -104,6 +104,35 @@ pub(crate) fn impulse_home_env_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Holds [`impulse_home_env_lock`] with `IMPULSE_HOME` unset, restoring the
+/// previous value on drop. For tests whose paths derive from
+/// `ReplContext::sandbox_tool_context().impulse_dir` (the blackboard), which
+/// would otherwise race tests that set `IMPULSE_HOME` and resolve to another
+/// directory between two calls.
+pub(crate) struct ImpulseHomeUnset {
+    previous: Option<std::ffi::OsString>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+pub(crate) fn impulse_home_unset() -> ImpulseHomeUnset {
+    let guard = impulse_home_env_lock();
+    let previous = std::env::var_os("IMPULSE_HOME");
+    std::env::remove_var("IMPULSE_HOME");
+    ImpulseHomeUnset {
+        previous,
+        _guard: guard,
+    }
+}
+
+impl Drop for ImpulseHomeUnset {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var("IMPULSE_HOME", value),
+            None => std::env::remove_var("IMPULSE_HOME"),
+        }
+    }
+}
+
 /// Acquire the process-wide lock guarding test mutation of governed-launch
 /// env (`IMPULSE_PROJECT_ID`, `IMPULSE_GOVERNED_TASK_ID`). Claim-confirmation
 /// prelude tests read those vars; they must not race other lib tests.

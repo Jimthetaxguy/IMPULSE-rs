@@ -121,13 +121,7 @@ pub async fn handle_tooling_run(
 
     let (config, registry) = load_tool_registry(state, impulse_dir)?;
     let params_value: serde_json::Value = if let Some(ref p) = params {
-        match serde_json::from_str(p) {
-            Ok(value) => value,
-            Err(e) => {
-                eprintln!("Invalid JSON params: {}", e);
-                return Ok(());
-            }
-        }
+        serde_json::from_str(p).map_err(|e| anyhow::anyhow!("Invalid JSON params: {e}"))?
     } else {
         serde_json::json!({})
     };
@@ -140,7 +134,21 @@ pub async fn handle_tooling_run(
         get_session_id(None),
     );
 
-    match registry.execute(&tool_id, params_value, &ctx).await {
+    // Tools run in their own process group, which the terminal's Ctrl-C
+    // does not reach; cancelling the call here drops it, and that kills
+    // the tool's whole group.
+    // If the handler cannot be installed, Ctrl-C simply never fires here; an
+    // error must not read as an interruption and stop every call.
+    let interrupted = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    let outcome = tokio::select! {
+        outcome = registry.execute(&tool_id, params_value, &ctx) => outcome,
+        () = interrupted => anyhow::bail!("Interrupted; {tool_id} was stopped"),
+    };
+    match outcome {
         Ok(result) => {
             if json {
                 print_json(&serde_json::json!({
@@ -165,9 +173,7 @@ pub async fn handle_tooling_run(
                 }
             }
         }
-        Err(e) => {
-            eprintln!("Tool execution failed: {}", e);
-        }
+        Err(e) => anyhow::bail!("Tool execution failed: {e}"),
     }
     Ok(())
 }
@@ -187,9 +193,7 @@ pub fn handle_tooling_schema(
             println!("# Impulse Dynamic Tools\n");
             println!("{}", registry.schema_markdown());
         }
-        _ => {
-            eprintln!("Unknown format: {} (use: json, markdown)", format);
-        }
+        _ => anyhow::bail!("Unknown format: {format} (use: json, markdown)"),
     }
     Ok(())
 }

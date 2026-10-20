@@ -171,18 +171,29 @@ pub fn sanitize_id(input: &str) -> String {
     }
 }
 
+static TEMP_FILE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn atomic_write_path(path: &Path, content: &[u8]) -> Result<(), OpsError> {
     let parent = path
         .parent()
         .ok_or_else(|| OpsError::MissingParent(path.to_path_buf()))?;
     std::fs::create_dir_all(parent)?;
+    // The target's name, the pid and a per-process sequence number make the
+    // temp name unique. It used to be the pid and the clock alone, shared by
+    // every file in the directory, and macOS clock nanoseconds are whole
+    // microseconds: two artifacts saved in one microsecond shared a temp
+    // file, so one could be renamed into place under the other's name.
     let tmp_path = parent.join(format!(
-        ".tmp.{}.{}",
+        ".{}.tmp.{}.{}.{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("write"),
         std::process::id(),
+        TEMP_FILE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_nanos()
+            .subsec_nanos()
     ));
     let mut file = File::create(&tmp_path)?;
     file.write_all(content)?;
@@ -977,6 +988,45 @@ mod tests {
             sanitize_id(" Claude Code / Agent #1 "),
             "claude-code-agent-1"
         );
+    }
+
+    #[test]
+    fn test_atomic_write_path_keeps_concurrent_files_apart() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let handles: Vec<_> = (0..4)
+            .map(|thread| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    (0..200)
+                        .filter_map(|i| {
+                            let name = format!("{thread}-{i}.json");
+                            atomic_write_path(&dir.join(&name), name.as_bytes()).err()
+                        })
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let failures: Vec<String> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} failed: {:?}",
+            failures.len(),
+            failures.first()
+        );
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.starts_with('.'), "temp file left: {name}");
+            assert_eq!(std::fs::read_to_string(entry.path()).unwrap(), name);
+            seen += 1;
+        }
+        assert_eq!(seen, 800);
     }
 
     #[test]

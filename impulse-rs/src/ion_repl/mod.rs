@@ -17,10 +17,14 @@ pub mod chat;
 pub mod history;
 pub mod registry;
 pub mod router;
+pub mod tool_blackboard;
 pub mod tool_bridge;
 pub mod tool_claim;
 #[cfg(feature = "office-support")]
 pub mod tool_document;
+#[cfg(feature = "photon-subagent")]
+pub mod tool_photon;
+pub mod tool_search;
 pub mod tool_verify;
 pub mod tools;
 
@@ -58,6 +62,11 @@ pub struct ReplContext {
     /// Additional read-only roots granted this session via `/allow <path>`.
     /// Never consulted for writes -- see the struct doc comment.
     pub allowed_read_roots: Vec<std::path::PathBuf>,
+    /// Spill policy for oversized tool results (ADR-0023). `None` disables
+    /// spilling. That is the default, so a context built in a test never
+    /// writes a blackboard database into the process's working directory;
+    /// [`ReplSession::new`] loads the project's policy.
+    pub blackboard: Option<crate::blackboard::BlackboardConfig>,
 }
 
 impl ReplContext {
@@ -72,6 +81,14 @@ impl ReplContext {
         } else {
             self.repo_root.clone()
         }
+    }
+
+    /// Directory holding this session's `blackboard.db`: the same `.impulse`
+    /// the memory tools default to (`IMPULSE_HOME` when explicitly set, else
+    /// `<repo_root>/.impulse`), so Ion, the daemon, and other agents in the
+    /// project share one blackboard.
+    pub fn blackboard_dir(&self) -> std::path::PathBuf {
+        self.sandbox_tool_context().impulse_dir
     }
 
     /// The sandboxed `ToolContext` every bridged tool
@@ -324,15 +341,26 @@ impl ReplSession {
             );
         }
         let repo_root = std::env::current_dir().unwrap_or_default();
+        let mut context = ReplContext {
+            repo_root,
+            ..ReplContext::default()
+        };
+        // A bad blackboard section is reported, and the defaults apply: with
+        // spilling off, one large tool result would flood the context, which
+        // is worse than the default threshold.
+        let blackboard =
+            crate::blackboard::load_config(&context.blackboard_dir()).unwrap_or_else(|err| {
+                eprintln!("Note: using default blackboard settings ({err:#})");
+                crate::blackboard::BlackboardConfig::default()
+            });
+        context.blackboard = Some(blackboard);
+        let impulse_dir = context.sandbox_tool_context().impulse_dir;
         Ok(Self {
             editor,
             history_path,
-            context: ReplContext {
-                repo_root,
-                ..ReplContext::default()
-            },
+            context,
             tools: ReplToolRegistry::with_defaults(),
-            chat: ChatState::from_env(),
+            chat: ChatState::from_config_or_env(&impulse_dir),
         })
     }
 
@@ -937,6 +965,7 @@ mod tests {
         let ctx = ReplContext {
             repo_root: std::path::PathBuf::from("/tmp/some-repo"),
             allowed_read_roots: vec![std::path::PathBuf::from("/tmp/granted")],
+            blackboard: None,
         };
         let tool_ctx = ctx.sandbox_tool_context();
 
@@ -981,6 +1010,7 @@ mod tests {
         let ctx = ReplContext {
             repo_root: repo_root.path().to_path_buf(),
             allowed_read_roots: Vec::new(),
+            blackboard: None,
         };
         let tool_ctx = ctx.sandbox_tool_context();
 
@@ -1022,6 +1052,7 @@ mod tests {
         let ctx = ReplContext {
             repo_root: repo_root.path().to_path_buf(),
             allowed_read_roots: Vec::new(),
+            blackboard: None,
         };
         let tool_ctx = ctx.sandbox_tool_context();
 
@@ -1066,6 +1097,7 @@ mod tests {
         let ctx = ReplContext {
             repo_root: repo_root.path().to_path_buf(),
             allowed_read_roots: Vec::new(),
+            blackboard: None,
         };
         let tool_ctx = ctx.sandbox_tool_context();
 
@@ -1087,6 +1119,7 @@ mod tests {
         let ctx = ReplContext {
             repo_root: repo_root.path().to_path_buf(),
             allowed_read_roots: Vec::new(),
+            blackboard: None,
         };
         let tool_ctx = ctx.sandbox_tool_context();
 

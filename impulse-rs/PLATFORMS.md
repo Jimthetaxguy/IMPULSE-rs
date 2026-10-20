@@ -29,7 +29,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Install at least one AI agent CLI
 npm install -g @anthropic-ai/claude-code    # Claude Code
-pip install opencode                         # OpenCode
+npm install -g opencode-ai                   # OpenCode
 npm install -g @openai/codex                 # Codex (optional)
 ```
 
@@ -91,7 +91,7 @@ sudo apt-get install build-essential pkg-config libssl-dev
 
 # AI agent CLIs
 npm install -g @anthropic-ai/claude-code    # Claude Code
-pip install opencode                         # OpenCode
+npm install -g opencode-ai                   # OpenCode
 npm install -g @openai/codex                 # Codex (optional)
 ```
 

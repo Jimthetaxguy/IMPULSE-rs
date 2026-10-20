@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::RwLock;
 
 use crate::storage::Storage;
 
@@ -59,6 +59,10 @@ pub struct State {
         HashMap<impulse_ops::governed_task::GovernedTaskId, Arc<tokio::sync::Mutex<()>>>,
     >,
     live_state: RwLock<LiveState>,
+    /// Sessions whose history `end_session` is writing. They stay in
+    /// `live_state` until it is written; the mark lets only one end record a
+    /// session.
+    ending_sessions: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Set on every mutation, cleared after a sync. A lock-free `AtomicBool`
     /// so `mark_dirty` (sync, called from async mutators) and the `Drop` flush
     /// can never silently fail to set/read it under lock contention — a dropped
@@ -78,7 +82,7 @@ impl std::fmt::Debug for State {
 impl Drop for State {
     fn drop(&mut self) {
         if self.dirty.load(Ordering::Acquire) {
-            if let Ok(state) = self.live_state.try_read() {
+            if let Ok(state) = self.live_state.read() {
                 if let Err(err) = self.storage.write_json(LIVE_STATE_FILE, &*state) {
                     tracing::error!("failed to persist live state on drop: {}", err);
                 }
@@ -115,6 +119,7 @@ impl State {
             producer_reservations,
             governed_producer_locks: tokio::sync::Mutex::new(HashMap::new()),
             live_state: RwLock::new(live_state),
+            ending_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
             dirty: AtomicBool::new(false),
             config: RwLock::new(config),
         };
@@ -122,7 +127,12 @@ impl State {
         // Must follow candidate reconciliation: the log is cross-checked against
         // the reconciled review statuses, not the pre-migration ones.
         state.reconcile_promoted_memory_log()?;
-        state.reconcile_producer_reservations()?;
+        // Producer reservations are deliberately not reconciled here. Every
+        // direct-mode command (including the hooks that fire on each agent
+        // tool call) builds a `State`, and a reservation that is open on disk
+        // may belong to a daemon that is still running its side effect. Only
+        // the daemon reconciles, once it owns the socket; see
+        // `State::reconcile_producer_reservations`.
         Ok(state)
     }
 
@@ -156,7 +166,7 @@ impl State {
     }
 
     pub async fn sync_immediate(&self) -> Result<()> {
-        let state = self.live_state.try_read().map(|s| s.clone())?;
+        let state = self.live_state.read().map_err(lock_err)?.clone();
         self.storage
             .write_json(LIVE_STATE_FILE, &state)
             .context("Failed to write live state to disk")?;
@@ -174,7 +184,7 @@ impl State {
         let session = Session::new(name, platform);
 
         {
-            let mut state = self.live_state.try_write().map_err(lock_err)?;
+            let mut state = self.live_state.write().map_err(lock_err)?;
             state.add_session(session.clone());
         }
 
@@ -191,35 +201,60 @@ impl State {
         session_id: &str,
         summary: String,
     ) -> Result<Option<HistoryEntry>> {
-        let history_entry = {
-            let mut state = self.live_state.try_write().map_err(lock_err)?;
-
-            if let Some(session) = state.get_session_mut(session_id) {
-                session.set_status(SessionStatus::Completed);
-
-                let entry = HistoryEntry {
-                    session_id: session.id.clone(),
-                    session_name: session.name.clone(),
-                    platform: session.platform,
-                    started_at: session.created_at,
-                    ended_at: Utc::now(),
-                    summary,
-                    files_touched: session.active_files.clone(),
-                    tools_used: session.recent_tools.clone(),
-                };
-
-                state.remove_session(session_id);
-                Some(entry)
-            } else {
-                None
+        // Mark the session as ending under the lock, then write its history
+        // without the lock: the append syncs to disk, and holding the state's
+        // write lock across that made every state reader wait on the disk.
+        // The session stays in place until its history is written, so a save
+        // meanwhile still includes it and a failed append (disk full,
+        // unwritable file) loses nothing; taking it out early lost it when
+        // another session's save landed before the failure put it back. The
+        // mark lets only one of two concurrent ends record it.
+        let claimed = {
+            let state = self.live_state.read().map_err(lock_err)?;
+            match state.get_session(session_id) {
+                Some(session) => {
+                    if !self
+                        .ending_sessions
+                        .lock()
+                        .map_err(lock_err)?
+                        .insert(session_id.to_string())
+                    {
+                        anyhow::bail!("Session {session_id} is already being ended");
+                    }
+                    Some(HistoryEntry {
+                        session_id: session.id.clone(),
+                        session_name: session.name.clone(),
+                        platform: session.platform,
+                        started_at: session.created_at,
+                        ended_at: Utc::now(),
+                        summary,
+                        files_touched: session.active_files.clone(),
+                        tools_used: session.recent_tools.clone(),
+                    })
+                }
+                None => None,
             }
         };
-
-        if let Some(ref entry) = history_entry {
-            self.storage
-                .append_jsonl(HISTORY_FILE, entry)
-                .context("Failed to append session to history log")?;
-        }
+        let history_entry = match claimed {
+            Some(entry) => {
+                let appended = self.storage.append_jsonl(HISTORY_FILE, &entry);
+                // Remove the session before clearing the mark, so a concurrent
+                // end never finds it unmarked after its history was written.
+                if appended.is_ok() {
+                    self.live_state
+                        .write()
+                        .map_err(lock_err)?
+                        .remove_session(session_id);
+                }
+                self.ending_sessions
+                    .lock()
+                    .map_err(lock_err)?
+                    .remove(session_id);
+                appended.context("Failed to append session to history log")?;
+                Some(entry)
+            }
+            None => None,
+        };
 
         self.mark_dirty();
         self.sync_immediate()
@@ -246,7 +281,7 @@ impl State {
     ) -> Result<Vec<String>> {
         let state = self
             .live_state
-            .try_read()
+            .read()
             .map_err(|_| anyhow::anyhow!("Failed to acquire read lock on live state"))?;
 
         let mut conflicting = Vec::new();
@@ -315,7 +350,19 @@ impl State {
     {
         let mut updated = false;
         {
-            let mut state = self.live_state.try_write().map_err(lock_err)?;
+            let mut state = self.live_state.write().map_err(lock_err)?;
+            // An ending session's history entry is already built; an update
+            // now would report success and then vanish with the session.
+            // Checked under the write lock, which excludes the claim in
+            // `end_session`.
+            if self
+                .ending_sessions
+                .lock()
+                .map_err(lock_err)?
+                .contains(session_id)
+            {
+                anyhow::bail!("Session {session_id} is being ended");
+            }
             if let Some(session) = state.get_session_mut(session_id) {
                 f(session);
                 updated = true;
@@ -332,12 +379,12 @@ impl State {
     }
 
     pub async fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
-        let state = self.live_state.try_read().map_err(lock_err)?;
+        let state = self.live_state.read().map_err(lock_err)?;
         Ok(state.get_session(session_id).cloned())
     }
 
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
-        let state = self.live_state.try_read().map_err(lock_err)?;
+        let state = self.live_state.read().map_err(lock_err)?;
         Ok(state.list_sessions().into_iter().cloned().collect())
     }
 
@@ -351,13 +398,13 @@ impl State {
 
     /// Get a config value by key
     pub fn get_config(&self, key: &str) -> Result<Option<String>> {
-        let config = self.config.try_read().map_err(lock_err)?;
+        let config = self.config.read().map_err(lock_err)?;
         Ok(config.get(key))
     }
 
     /// Set a config value by key
     pub fn set_config(&self, key: &str, value: &str) -> Result<bool> {
-        let mut config = self.config.try_write().map_err(lock_err)?;
+        let mut config = self.config.write().map_err(lock_err)?;
         let result = config.set(key, value);
         if result {
             self.storage
@@ -369,18 +416,18 @@ impl State {
 
     /// List all config values
     pub fn list_config(&self) -> Result<Vec<(String, String)>> {
-        let config = self.config.try_read().map_err(lock_err)?;
+        let config = self.config.read().map_err(lock_err)?;
         Ok(config.list())
     }
 
     pub fn config_snapshot(&self) -> Result<Config> {
-        let config = self.config.try_read().map_err(lock_err)?;
+        let config = self.config.read().map_err(lock_err)?;
         Ok(config.clone())
     }
 
     /// Update guardrail rules in config and persist to disk
     pub fn update_guardrail_rules(&self, rules: Vec<crate::guardrail::GuardRule>) -> Result<()> {
-        let mut config = self.config.try_write().map_err(lock_err)?;
+        let mut config = self.config.write().map_err(lock_err)?;
         config.guardrails.rules = rules;
         self.storage
             .write_json(CONFIG_FILE, &*config)
@@ -392,7 +439,7 @@ impl State {
         &self,
         policy: impulse_ops::SupervisorPermissionPolicy,
     ) -> Result<()> {
-        let mut config = self.config.try_write().map_err(lock_err)?;
+        let mut config = self.config.write().map_err(lock_err)?;
         let mut normalized = policy;
         normalized.normalize();
         config.impulse_agent_permissions = normalized;
@@ -402,34 +449,12 @@ impl State {
         Ok(())
     }
 
+    /// Conflict analytics, built from the audit trail conflict detection
+    /// appends to (`CONFLICTS.jsonl`). This used to read a separate
+    /// `CONFLICTS.json` that only test code wrote, so `analytics conflicts`
+    /// always reported none.
     pub fn get_conflict_analytics(&self) -> Result<ConflictHistory> {
-        self.storage
-            .read_json("CONFLICTS.json")
-            .context("Failed to read conflict analytics from disk")
-    }
-
-    pub fn record_conflict(&self, file_path: &str, sessions: Vec<String>) -> Result<()> {
-        let mut history: ConflictHistory = self
-            .storage
-            .read_json("CONFLICTS.json")
-            .context("Failed to read conflict history from disk")?;
-        history.record_conflict(file_path, sessions);
-        self.storage
-            .write_json("CONFLICTS.json", &history)
-            .context("Failed to persist conflict history to disk")?;
-        Ok(())
-    }
-
-    pub fn record_conflict_resolution(&self, file_path: &str, resolution: &str) -> Result<()> {
-        let mut history: ConflictHistory = self
-            .storage
-            .read_json("CONFLICTS.json")
-            .context("Failed to read conflict history for resolution update")?;
-        history.record_resolution(file_path, resolution);
-        self.storage
-            .write_json("CONFLICTS.json", &history)
-            .context("Failed to persist conflict resolution to disk")?;
-        Ok(())
+        Ok(ConflictHistory::from_events(&self.get_conflict_history()?))
     }
 }
 
@@ -448,25 +473,34 @@ impl ConflictHistory {
         }
     }
 
-    pub fn record_conflict(&mut self, file_path: &str, detected_sessions: Vec<String>) {
-        if let Some(entry) = self
-            .conflict_history
-            .iter_mut()
-            .find(|e| e.file_path == file_path)
-        {
-            entry.detection_count += 1;
-            entry.last_detected = Utc::now();
-            entry.involved_sessions = detected_sessions;
-        } else {
-            self.conflict_history.push(ConflictEntry {
-                file_path: file_path.to_string(),
-                detection_count: 1,
-                first_detected: Utc::now(),
-                last_detected: Utc::now(),
-                involved_sessions: detected_sessions,
-                resolution: None,
-                resolved_at: None,
-            });
+    /// One entry per detection event, with the sessions involved (the one
+    /// that hit the conflict and those it conflicted with). The analytics
+    /// count entries, so totals, per-day counts and the most common files are
+    /// all counts of detections; grouping by file first made three
+    /// detections on one file count as one. Nothing records resolutions
+    /// yet, so every entry is unresolved.
+    pub fn from_events(events: &[ConflictEvent]) -> Self {
+        Self {
+            conflict_history: events
+                .iter()
+                .map(|event| {
+                    let mut involved_sessions = vec![event.session_id.clone()];
+                    for session in &event.conflicting_sessions {
+                        if !involved_sessions.contains(session) {
+                            involved_sessions.push(session.clone());
+                        }
+                    }
+                    ConflictEntry {
+                        file_path: event.file_path.clone(),
+                        detection_count: 1,
+                        first_detected: event.detected_at,
+                        last_detected: event.detected_at,
+                        involved_sessions,
+                        resolution: None,
+                        resolved_at: None,
+                    }
+                })
+                .collect(),
         }
     }
 
@@ -599,6 +633,139 @@ impl ConflictAnalytics {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Review P2: try-locks on the Tokio RwLocks failed any call that
+    /// overlapped another, which the daemon's concurrent connections do.
+    #[test]
+    fn test_reads_and_writes_wait_for_a_held_lock_instead_of_failing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = std::sync::Arc::new(State::new(dir.path().to_path_buf()).unwrap());
+        // `set_config` writes the config lock; holding it for reading makes
+        // the writer wait (the try-lock version failed at once).
+        let held = state.config.read().unwrap();
+        let writer = std::sync::Arc::clone(&state);
+        let handle = std::thread::spawn(move || writer.set_config("log_level", "debug"));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        drop(held);
+        assert!(handle.join().unwrap().unwrap());
+        assert_eq!(
+            state.get_config("log_level").unwrap().as_deref(),
+            Some("debug")
+        );
+    }
+
+    /// Recorded review item: the state's write lock was held across the
+    /// history append and its fsync, so every state reader waited on the
+    /// disk. A FIFO stands in for a slow disk: nobody reads it, so a history
+    /// line larger than its buffer leaves the append waiting in `write`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_end_session_does_not_hold_the_state_lock_while_writing_history() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(State::new(dir.path().to_path_buf()).unwrap());
+        let ending = state.create_session("s".to_string(), None).await.unwrap();
+        let other = state.create_session("t".to_string(), None).await.unwrap();
+        let fifo = dir.path().join(HISTORY_FILE);
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed");
+
+        let ender = Arc::clone(&state);
+        let ending_id = ending.id.clone();
+        let summary = "x".repeat(1024 * 1024);
+        let end = tokio::spawn(async move { ender.end_session(&ending.id, summary).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!end.is_finished(), "the append did not wait on the FIFO");
+
+        // Round 4 (reviewer A): the session was taken out while its history
+        // was written, so a save meanwhile dropped it, and a failed append
+        // then lost it for good. It stays saved, and a second end is refused.
+        // Checked after the FIFO is drained: a failed assertion here would
+        // leave the writer blocked and the test hanging.
+        let saved = state.sync_immediate().await.is_ok()
+            && std::fs::read_to_string(dir.path().join(LIVE_STATE_FILE))
+                .is_ok_and(|saved| saved.contains(&ending_id));
+        let second_end_refused = state
+            .end_session(&ending_id, "again".to_string())
+            .await
+            .is_err();
+        // Round 5 (reviewer A): tracking then reported success and was lost.
+        let tracking_refused = state.track_file(&ending_id, "late.rs").await.is_err();
+
+        // Read another session from a plain thread: a held std lock would
+        // block it, and a runtime thread blocked that way could not time out.
+        let (sent, received) = std::sync::mpsc::channel();
+        let reader = Arc::clone(&state);
+        let other_id = other.id.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let found = runtime.block_on(reader.get_session(&other_id));
+            let _ = sent.send(found.map(|session| session.is_some()).ok());
+        });
+        let readable = received.recv_timeout(std::time::Duration::from_secs(2));
+
+        // Drain the FIFO without ever blocking, so the writer finishes and the
+        // test cannot hang whatever the outcome.
+        let mut drain = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        let started = std::time::Instant::now();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match std::io::Read::read(&mut drain, &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if end.is_finished() || started.elapsed() > std::time::Duration::from_secs(10) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("draining the FIFO: {error}"),
+            }
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), end).await;
+
+        assert_eq!(
+            readable,
+            Ok(Some(true)),
+            "state blocked while history was written"
+        );
+        assert!(saved, "a save during the end dropped the session");
+        assert!(second_end_refused, "a second end was not refused");
+        assert!(tracking_refused, "tracking an ending session was accepted");
+    }
+
+    /// Review P2: the session was removed before its history was appended,
+    /// so a failed append lost both.
+    #[tokio::test]
+    async fn test_end_session_keeps_the_session_when_history_cannot_be_written() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = State::new(dir.path().to_path_buf()).unwrap();
+        let session = state.create_session("s".to_string(), None).await.unwrap();
+        std::fs::create_dir_all(dir.path().join(HISTORY_FILE)).unwrap();
+
+        assert!(state
+            .end_session(&session.id, "done".to_string())
+            .await
+            .is_err());
+        assert!(state.get_session(&session.id).await.unwrap().is_some());
+
+        std::fs::remove_dir(dir.path().join(HISTORY_FILE)).unwrap();
+        assert!(state
+            .end_session(&session.id, "done".to_string())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(state.get_session(&session.id).await.unwrap().is_none());
+    }
 
     #[test]
     fn test_config_default() {
@@ -1017,34 +1184,56 @@ mod tests {
         assert!(history.conflict_history.is_empty());
     }
 
-    #[test]
-    fn test_conflict_history_record_conflict() {
-        let mut history = ConflictHistory::new();
-        history.record_conflict(
-            "src/main.rs",
-            vec!["session1".to_string(), "session2".to_string()],
-        );
+    fn conflict_event(file_path: &str, session_id: &str, at: &str) -> ConflictEvent {
+        ConflictEvent {
+            file_path: file_path.to_string(),
+            session_id: session_id.to_string(),
+            conflicting_sessions: vec!["other".to_string()],
+            detected_at: DateTime::parse_from_rfc3339(at)
+                .unwrap()
+                .with_timezone(&Utc),
+        }
+    }
 
-        assert_eq!(history.conflict_history.len(), 1);
-        assert_eq!(history.conflict_history[0].file_path, "src/main.rs");
-        assert_eq!(history.conflict_history[0].detection_count, 1);
-        assert_eq!(history.conflict_history[0].involved_sessions.len(), 2);
+    /// Refutation review of 1c74f05: grouping by file counted three
+    /// detections on one file as one conflict.
+    #[test]
+    fn test_conflict_analytics_count_detections() {
+        let history = ConflictHistory::from_events(&[
+            conflict_event("src/main.rs", "s2", "2026-10-02T10:00:00Z"),
+            conflict_event("src/lib.rs", "s1", "2026-10-03T10:00:00Z"),
+            conflict_event("src/main.rs", "s1", "2026-10-01T10:00:00Z"),
+        ]);
+
+        assert_eq!(history.conflict_history.len(), 3);
+        assert_eq!(
+            history.conflict_history[0].involved_sessions,
+            ["s2", "other"]
+        );
+        assert!(history.conflict_history[0].resolution.is_none());
+        let analytics = history.get_analytics();
+        assert_eq!(analytics.total_conflicts, 3);
+        assert_eq!(
+            analytics.most_common_files[0],
+            ("src/main.rs".to_string(), 2)
+        );
+        assert_eq!(analytics.conflicts_by_day.len(), 3);
     }
 
     #[test]
-    fn test_conflict_history_record_conflict_increments_count() {
-        let mut history = ConflictHistory::new();
-        history.record_conflict("src/main.rs", vec!["session1".to_string()]);
-        history.record_conflict("src/main.rs", vec!["session2".to_string()]);
-
-        assert_eq!(history.conflict_history.len(), 1);
-        assert_eq!(history.conflict_history[0].detection_count, 2);
+    fn test_conflict_history_from_no_events_is_empty() {
+        assert!(ConflictHistory::from_events(&[])
+            .conflict_history
+            .is_empty());
     }
 
     #[test]
     fn test_conflict_history_record_resolution() {
-        let mut history = ConflictHistory::new();
-        history.record_conflict("src/main.rs", vec!["session1".to_string()]);
+        let mut history = ConflictHistory::from_events(&[conflict_event(
+            "src/main.rs",
+            "session1",
+            "2026-10-01T10:00:00Z",
+        )]);
         history.record_resolution("src/main.rs", "merge");
 
         assert_eq!(

@@ -7,13 +7,12 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::process::Command;
 
-use crate::build_hygiene::discovery::discover_rust_projects;
-use crate::build_hygiene::{format_bytes, CleanResult};
+use crate::build_hygiene::{format_bytes, projects_to_clean, CleanResult};
 
 /// Run cargo-clean-all or equivalent across discovered projects.
 ///
-/// If cargo-clean-all is not installed, falls back to running `cargo clean`
-/// individually in each discovered project.
+/// If cargo-clean-all is not installed, falls back to removing each
+/// discovered project's own `target/` directory, as `cargo clean` would.
 pub fn clean_all_projects(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> {
     let has_clean_all = crate::build_hygiene::is_cargo_tool_installed("clean-all");
 
@@ -94,16 +93,21 @@ fn clean_all_with_tool(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> 
     })
 }
 
-/// Fallback: discover projects manually and run cargo clean in each
+/// Fallback: remove each discovered project's own `target/`. This used to
+/// run `cargo clean`, which asks cargo where the build output lives: with a
+/// global `build.target-dir` or `build.build-dir` that is a directory every
+/// project shares, and it was deleted once per project; a relative scan path
+/// also made `--target-dir` point nowhere. `projects_to_clean` keeps only a
+/// `target/` that is a real directory carrying cargo's `CACHEDIR.TAG`.
 fn clean_all_manual(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> {
-    let projects = discover_rust_projects(paths);
+    let (projects, skipped) = projects_to_clean(paths);
 
     if projects.is_empty() {
         return Ok(CleanResult {
             bytes_freed: 0,
             files_removed: 0,
             projects_cleaned: 0,
-            errors: vec![],
+            errors: skipped,
             was_dry_run: dry_run,
             summary: "No Rust projects found to clean.".to_string(),
         });
@@ -119,36 +123,18 @@ fn clean_all_manual(paths: &[PathBuf], dry_run: bool) -> Result<CleanResult> {
 
     let mut total_freed: u64 = 0;
     let mut cleaned: u32 = 0;
-    let mut errors: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = skipped;
 
     for project in &projects {
         let before_size = project.target_size_bytes;
 
-        let output = Command::new("cargo")
-            .arg("clean")
-            .current_dir(&project.path)
-            .output();
-
-        match output {
-            Ok(o) if o.status.success() => {
+        let target_dir = project.path.join("target");
+        match std::fs::remove_dir_all(&target_dir) {
+            Ok(()) => {
                 total_freed += before_size;
                 cleaned += 1;
             }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                errors.push(format!(
-                    "cargo clean failed in {}: {}",
-                    project.path.display(),
-                    stderr.trim()
-                ));
-            }
-            Err(e) => {
-                errors.push(format!(
-                    "Failed to run cargo clean in {}: {}",
-                    project.path.display(),
-                    e
-                ));
-            }
+            Err(e) => errors.push(format!("Failed to remove {}: {e}", target_dir.display())),
         }
     }
 
@@ -205,6 +191,65 @@ fn parse_clean_all_output(output: &str) -> (u64, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn tag(target: &Path) {
+        std::fs::write(
+            target.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+    }
+
+    /// Round 6 (reviewer C): `cargo clean` also removed cargo's configured
+    /// `build.build-dir`, possibly shared, and a relative scan path made it
+    /// clean nothing while reporting bytes freed. The fallback now removes
+    /// the project's own tagged `target/` and leaves an untagged one alone.
+    #[test]
+    fn test_clean_all_manual_removes_only_a_tagged_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["tagged", "untagged"] {
+            let project = tmp.path().join(name);
+            std::fs::create_dir_all(project.join("target")).unwrap();
+            std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+            std::fs::write(project.join("target/artifact"), b"data").unwrap();
+        }
+        tag(&tmp.path().join("tagged/target"));
+
+        let result = clean_all_manual(&[tmp.path().to_path_buf()], false).unwrap();
+        assert!(!tmp.path().join("tagged/target").exists());
+        assert!(tmp.path().join("untagged/target/artifact").exists());
+        assert_eq!(result.projects_cleaned, 1);
+        assert!(
+            result.errors.iter().any(|e| e.contains("CACHEDIR.TAG")),
+            "{:?}",
+            result.errors
+        );
+    }
+
+    /// Round 5 (reviewer C): a `target` that links outside the root was
+    /// cleaned through the link.
+    #[cfg(unix)]
+    #[test]
+    fn test_clean_all_manual_skips_a_project_whose_target_is_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside-target");
+        std::fs::create_dir_all(root.join("p")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep.bin"), b"keep").unwrap();
+        std::fs::write(root.join("p/Cargo.toml"), "[package]\nname = \"p\"\n").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("p/target")).unwrap();
+
+        let result = clean_all_manual(std::slice::from_ref(&root), false).unwrap();
+        assert!(outside.join("keep.bin").exists());
+        assert_eq!(result.projects_cleaned, 0);
+        assert!(
+            result.errors.iter().any(|e| e.contains("symbolic link")),
+            "{:?}",
+            result.errors
+        );
+    }
     use std::fs;
 
     #[test]
@@ -222,6 +267,7 @@ mod tests {
         fs::create_dir_all(proj.join("target")).unwrap();
         fs::write(proj.join("Cargo.toml"), "[package]\nname=\"t\"").unwrap();
         fs::write(proj.join("target/artifact"), "data").unwrap();
+        tag(&proj.join("target"));
 
         let result = clean_all_manual(&[tmp.path().to_path_buf()], true).unwrap();
         assert!(result.was_dry_run);

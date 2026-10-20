@@ -860,7 +860,13 @@ fn is_untracked_impulse_runtime_artifact(path: &[u8]) -> bool {
             // promotion, which is only reachable *after* an approval, failed on
             // a tree the daemon had dirtied itself.
             | b".impulse/MEMORY_CANDIDATES.json"
+            // ADR-0023's blackboard. Ion opens it inside whatever worktree it
+            // runs in, including a staged Builder worktree, the moment a tool
+            // result spills; an ungitignored `.impulse` would then report the
+            // very tree the Builder is about to claim as dirty.
+            | b".impulse/blackboard.db"
     ) || path.starts_with(b".impulse/GOVERNED_TASKS.tmp.")
+        || path.starts_with(b".impulse/blackboard.db-")
         || path.starts_with(b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-")
         || path.starts_with(b".impulse/PRODUCER_RESERVATIONS.tmp.")
         || path.starts_with(b".impulse/MEMORY_CANDIDATES.tmp.")
@@ -2432,6 +2438,53 @@ fn observe_head_oid(workspace: &Path) -> Result<String> {
 /// then writes, leaving a window for a concurrent commit. Returns `false` when
 /// the swap lost, which the caller reports as a blocked promotion rather than
 /// an error.
+/// The reflog message the compare-and-swap writes, naming the exact move.
+/// A retried promotion looks for it to tell its own landed swap apart from
+/// a branch that merely sits at the accepted commit.
+fn promotion_reflog_message(initial_revision: &str, accepted_revision: &str) -> String {
+    format!("impulse governed promotion {initial_revision}..{accepted_revision}")
+}
+
+/// Whether `branch_ref`'s recent reflog shows this promotion moving it from
+/// `initial_revision` to `accepted_revision`, with nothing moving it off the
+/// accepted commit since. No reflog, or a probe that fails, is no evidence.
+fn branch_carries_this_promotion(
+    workspace: &Path,
+    branch_ref: &str,
+    initial_revision: &str,
+    accepted_revision: &str,
+) -> Result<bool> {
+    let mut command = hook_free_git(workspace);
+    command
+        .args(["reflog", "show", "-n", "20", "--format=%H%x09%gs"])
+        .arg(branch_ref);
+    let output = run_bounded_process(
+        &mut command,
+        "governed outcome promotion reflog check",
+        GIT_PROBE_TIMEOUT,
+    )?;
+    if !git_completed_successfully(&output, "git reflog show")? {
+        return Ok(false);
+    }
+    if output.stdout_truncated {
+        anyhow::bail!("promotion reflog check exceeded the bounded Git output limit");
+    }
+    let entries = String::from_utf8(output.stdout).context("branch reflog is not valid UTF-8")?;
+    let expected = promotion_reflog_message(initial_revision, accepted_revision);
+    // Newest first: every entry down to ours must leave the branch at the
+    // accepted commit (a later `reset` to the same commit does).
+    for entry in entries.lines() {
+        let (revision, subject) = entry.split_once('\t').unwrap_or((entry, ""));
+        if revision != accepted_revision {
+            return Ok(false);
+        }
+        if subject == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn compare_and_swap_canonical_branch(
     workspace: &Path,
     branch_ref: &str,
@@ -2441,8 +2494,16 @@ fn compare_and_swap_canonical_branch(
     validate_oid(expected_revision)?;
     validate_oid(accepted_revision)?;
     let mut command = hook_free_git(workspace);
+    // `--create-reflog` writes the entry even where `core.logAllRefUpdates`
+    // is off, so a retry can always find it.
     command
         .arg("update-ref")
+        .arg("--create-reflog")
+        .arg("-m")
+        .arg(promotion_reflog_message(
+            expected_revision,
+            accepted_revision,
+        ))
         .arg(branch_ref)
         .arg(accepted_revision)
         .arg(expected_revision);
@@ -2590,6 +2651,26 @@ pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromot
             PromotionBlockedReason::DetachedHead,
         ));
     };
+    // A retry after the branch already advanced -- the swap landed, then the
+    // receipt failed or the daemon died before recording it, or the worktree
+    // sync failed and was redone by hand as its error asks -- finds the clean
+    // canonical branch at the accepted commit. When the branch's reflog shows
+    // this promotion's own swap, that is its effect, not a concurrent move;
+    // reporting it as `CanonicalHeadMoved` left the run unpromotable. A branch
+    // that only happens to sit there (say, one checked out at the accepted
+    // commit to inspect it) has no such entry and is still reported as moved.
+    if canonical_head == accepted_revision
+        && branch_carries_this_promotion(&workspace, &branch_ref, &initial, &accepted_revision)?
+    {
+        return Ok(GovernedPromotionInput {
+            actor: staged_system_actor(),
+            accepted_revision: accepted_revision.clone(),
+            initial_subject_revision: initial,
+            outcome: GovernedPromotionOutcome::Promoted {
+                promoted_revision: accepted_revision,
+            },
+        });
+    }
     if canonical_head != initial {
         return Ok(blocked(
             canonical_head,
@@ -2836,6 +2917,41 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("dirty"));
+    }
+
+    /// ADR-0023: a real blackboard (database plus its WAL and shared-memory
+    /// sidecars) in an ungitignored `.impulse` leaves the subject clean.
+    #[test]
+    fn clean_git_subject_exempts_the_blackboard_database_and_sidecars() {
+        let repo = init_repo();
+        let initial = observe_clean_git_subject(repo.path(), None).unwrap();
+        let impulse = repo.path().join(".impulse");
+        let board = crate::blackboard::Blackboard::open(&impulse).unwrap();
+        board
+            .put(crate::blackboard::NewEntry {
+                task_id: "spill:bash_exec:1",
+                payload: b"output",
+                content_type: "text/plain",
+                ttl_seconds: None,
+                metadata: serde_json::Value::Null,
+            })
+            .unwrap();
+        // Keep the connection open so the WAL sidecars exist during the check.
+        assert!(impulse.join("blackboard.db").exists());
+        assert_eq!(
+            observe_clean_git_subject(repo.path(), Some(&initial)).unwrap(),
+            initial
+        );
+        assert!(is_untracked_impulse_runtime_artifact(
+            b".impulse/blackboard.db-wal"
+        ));
+        assert!(is_untracked_impulse_runtime_artifact(
+            b".impulse/blackboard.db-shm"
+        ));
+        assert!(!is_untracked_impulse_runtime_artifact(
+            b".impulse/blackboard.dbx"
+        ));
+        drop(board);
     }
 
     /// ADR-0020 rule 3a. `.impulse/MEMORY.jsonl` and `.impulse/GENOME_PROJECTION.md`

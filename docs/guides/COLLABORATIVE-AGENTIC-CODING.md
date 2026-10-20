@@ -1,8 +1,8 @@
 ---
 title: Collaborative Agentic Coding Guide
 description: Repo-local rules for parallel coding agents, worktree lanes, handoffs, and verification.
-version: '1.0'
-updated: 2026-05-21
+version: '1.1'
+updated: 2026-10-04
 type: guide
 category: development
 phase: all
@@ -47,6 +47,7 @@ Before mutating code or docs, every agent must:
    - `git status --short`
    - `git branch --show-current`
    - `git worktree list`
+   - `git fetch`, then how far the branch is ahead of or behind `origin/main`
 3. Identify lane facts:
    - owner
    - role
@@ -195,15 +196,29 @@ Every handoff must include:
 
 Before claiming a lane is complete, run the verification commands named in the spec or work card.
 
-For Rust workspace changes, the default gate is:
+For Rust workspace changes, the default gate is the one in
+[`CLAUDE.md`](../../CLAUDE.md), which is stricter than CI (it lints tests too):
 
 ```bash
 cd impulse-rs
-cargo check --workspace
+cargo build --workspace
 cargo test --workspace
-cargo clippy --workspace -- -D warnings
-cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 ```
+
+CI also builds and tests with `--no-default-features`. When a change touches feature-gated code, also
+run `cargo clippy --workspace --all-targets --no-default-features -- -D warnings`.
+
+Record the passed, ignored, and failed totals from the test run in the PR or handoff; a remembered
+count goes stale.
+
+Parallel lanes should not share a cargo target directory. Set `CARGO_TARGET_DIR` per lane (for example
+`~/.cargo-target-lanes/<lane-slug>`): a shared one lets one lane's stale build artifacts fail
+another lane's gate.
+
+A behavior fix comes with a regression test, and the test is shown to fail with the fix reverted, so it
+cannot pass without the fix.
 
 For documentation contract changes, run:
 
@@ -213,6 +228,19 @@ python3 docs/validate_docs.py --all
 ```
 
 If verification fails, record the failure and either fix it within the owned scope or hand it off with exact commands and output summary.
+
+---
+
+## Review Before Ready
+
+A lane's PR is marked ready only after a refutation round:
+- Read-only reviewers try to break every claim in the PR with real reproductions. Each works in its
+  own source export with its own build cache.
+- They report each finding as CONFIRMED or SUSPECTED.
+- Fixes go back through the gate, followed by a narrower verification round. Repeat until a round finds
+  nothing at P2 or above. Fixes to earlier findings regularly introduce new ones.
+- A fix to a concurrency or recovery path needs a cross-process or end-to-end probe, not only a unit
+  test of the function it changed.
 
 ---
 

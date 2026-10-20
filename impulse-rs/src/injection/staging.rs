@@ -1,8 +1,8 @@
 use anyhow::Result;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::injection::types::{InjectionBundle, StageResult};
@@ -166,9 +166,7 @@ pub fn stage_bundle(base_path: &Path, bundle: &InjectionBundle) -> Result<StageR
             bundle_size: bundle.snippets.len(),
             artifact_path: prior.artifact_path.clone(),
         };
-        let mut file = OpenOptions::new().create(true).append(true).open(&log)?;
-        writeln!(file, "{}", serde_json::to_string(&dedupe_entry)?)?;
-        file.sync_all()?;
+        Storage::append_jsonl_path(&log, &dedupe_entry)?;
 
         return Ok(StageResult {
             status: "deduped".to_string(),
@@ -200,9 +198,7 @@ pub fn stage_bundle(base_path: &Path, bundle: &InjectionBundle) -> Result<StageR
         artifact_path: Some(artifact_path.to_string_lossy().to_string()),
     };
 
-    let mut file = OpenOptions::new().create(true).append(true).open(&log)?;
-    writeln!(file, "{}", serde_json::to_string(&entry)?)?;
-    file.sync_all()?;
+    Storage::append_jsonl_path(&log, &entry)?;
 
     Ok(StageResult {
         status: "staged".to_string(),

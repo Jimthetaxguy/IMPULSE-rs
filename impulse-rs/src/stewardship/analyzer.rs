@@ -46,63 +46,69 @@ pub fn quick_estimate_from_file(
 }
 
 /// Parse a single JSONL line into a TranscriptMessage (if it's a user/assistant message)
+///
+/// Claude Code writes `{"type": "assistant", "message": {"role": ..., "content": ...}}`;
+/// the content used to be read only from the top level, which no real
+/// transcript line has, so `steward analyze` and `compact` saw zero messages.
+/// The top-level form is still accepted. User lines can carry `tool_result`
+/// blocks, so both roles count every block kind.
 fn parse_transcript_entry(line: &str) -> Option<TranscriptMessage> {
     let value: serde_json::Value = serde_json::from_str(line).ok()?;
-    let msg_type = value.get("type")?.as_str()?;
-
-    match msg_type {
-        "user" => {
-            let content = value.get("content")?;
-            let text = extract_text_content(content);
-            let char_count = text.len();
-            Some(TranscriptMessage {
-                role: "user".to_string(),
-                text_content: text,
-                tool_uses: Vec::new(),
-                tool_results: Vec::new(),
-                char_count,
-                estimated_tokens: estimate_tokens_from_len(char_count),
-            })
-        }
-        "assistant" => {
-            let content = value.get("content")?;
-            let (text, tool_uses, tool_results) = extract_assistant_content(content);
-            let char_count = text.len()
-                + tool_uses.iter().map(|t| t.input_chars).sum::<usize>()
-                + tool_results.iter().map(|t| t.content_chars).sum::<usize>();
-            Some(TranscriptMessage {
-                role: "assistant".to_string(),
-                text_content: text,
-                tool_uses,
-                tool_results,
-                char_count,
-                estimated_tokens: estimate_tokens_from_len(char_count),
-            })
-        }
-        _ => None, // Skip file-history-snapshot, summary, etc.
-    }
+    let role = match value.get("type")?.as_str()? {
+        "user" => "user",
+        "assistant" => "assistant",
+        _ => return None, // Skip file-history-snapshot, summary, etc.
+    };
+    let content = value
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .or_else(|| value.get("content"))?;
+    let (text, tool_uses, tool_results) = extract_assistant_content(content);
+    let char_count = text.len()
+        + tool_uses.iter().map(|t| t.input_chars).sum::<usize>()
+        + tool_results.iter().map(|t| t.content_chars).sum::<usize>();
+    Some(TranscriptMessage {
+        role: role.to_string(),
+        text_content: text,
+        tool_uses,
+        tool_results,
+        char_count,
+        estimated_tokens: estimate_tokens_from_len(char_count),
+    })
 }
 
-/// Extract text from user content (can be string or array)
-fn extract_text_content(content: &serde_json::Value) -> String {
-    match content {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(arr) => arr
-            .iter()
-            .filter_map(|item| {
-                if item.get("type")?.as_str()? == "text" {
-                    item.get("text")?.as_str().map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+/// The longest prefix of `text` that is at most `max` bytes and ends on a
+/// char boundary, so previews never split a multi-byte character.
+fn prefix_on_char_boundary(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
     }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
-/// Extract text, tool uses, and tool results from assistant content
+/// `index` moved down to the nearest char boundary.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// `file_path` from a tool input that is an object or a JSON string of one.
+fn tool_input_file_path(input: Option<&serde_json::Value>) -> Option<String> {
+    let value = match input? {
+        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s).ok()?,
+        other => other.clone(),
+    };
+    value.get("file_path")?.as_str().map(str::to_string)
+}
+
+/// Extract text, tool uses, and tool results from a message's content (either role)
 fn extract_assistant_content(
     content: &serde_json::Value,
 ) -> (String, Vec<ToolUse>, Vec<ParsedToolResult>) {
@@ -136,12 +142,12 @@ fn extract_assistant_content(
                         None => String::new(),
                     };
                     let input_chars = input_str.len();
-                    let preview_len = input_str.len().min(200);
                     tool_uses.push(ToolUse {
                         id,
                         name,
-                        input_preview: input_str[..preview_len].to_string(),
+                        input_preview: prefix_on_char_boundary(&input_str, 200).to_string(),
                         input_chars,
+                        file_path: tool_input_file_path(item.get("input")),
                     });
                 }
                 "tool_result" => {
@@ -238,12 +244,17 @@ fn extract_decisions(messages: &[TranscriptMessage]) -> Vec<ExtractedDecision> {
         if msg.role != "assistant" {
             continue;
         }
-        let text_lower = msg.text_content.to_lowercase();
+        // ASCII lowercasing keeps every byte offset the same as in the
+        // original text (the patterns are ASCII); `to_lowercase` can change
+        // lengths, and the offsets below index the original.
+        let text_lower = msg.text_content.to_ascii_lowercase();
         for pattern in &decision_patterns {
             if let Some(pos) = text_lower.find(pattern) {
-                // Extract surrounding context (up to 200 chars around the match)
-                let start = pos.saturating_sub(50);
-                let end = (pos + 200).min(msg.text_content.len());
+                // Extract surrounding context (up to 200 bytes around the
+                // match), on char boundaries so curly quotes, dashes, or CJK
+                // near the match cannot make the slice panic.
+                let start = floor_char_boundary(&msg.text_content, pos.saturating_sub(50));
+                let end = floor_char_boundary(&msg.text_content, pos + 200);
                 let context = msg.text_content[start..end].to_string();
                 // Extract the decision sentence
                 let sentence_start = msg.text_content[..pos]
@@ -282,12 +293,19 @@ fn extract_files_touched(messages: &[TranscriptMessage]) -> Vec<String> {
     for msg in messages {
         for tool in &msg.tool_uses {
             if file_tools.contains(&tool.name.as_str()) {
-                // Try to extract file_path from input preview
-                if let Some(input) = parse_tool_input(&tool.input_preview) {
-                    if let Some(path) = input.get("file_path").and_then(|v| v.as_str()) {
-                        if seen.insert(path.to_string()) {
-                            files.push(path.to_string());
-                        }
+                // The path read from the full input; the preview is only a
+                // fallback, since a preview of a larger input is cut JSON.
+                let path = tool.file_path.clone().or_else(|| {
+                    parse_tool_input(&tool.input_preview).and_then(|input| {
+                        input
+                            .get("file_path")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                    })
+                });
+                if let Some(path) = path {
+                    if seen.insert(path.clone()) {
+                        files.push(path);
                     }
                 }
             }
@@ -348,7 +366,7 @@ fn find_duplicate_regions(messages: &[TranscriptMessage]) -> Vec<DuplicateRegion
             let key = format!(
                 "{}:{}",
                 tool.name,
-                &tool.input_preview[..tool.input_preview.len().min(100)]
+                prefix_on_char_boundary(&tool.input_preview, 100)
             );
             consecutive.entry(key).or_default().push(idx);
         }
@@ -368,7 +386,7 @@ fn find_duplicate_regions(messages: &[TranscriptMessage]) -> Vec<DuplicateRegion
                 occurrences: indices.len(),
                 indices: indices.clone(),
                 estimated_tokens,
-                input_preview: preview[..preview.len().min(100)].to_string(),
+                input_preview: prefix_on_char_boundary(&preview, 100).to_string(),
             });
         }
     }
@@ -578,6 +596,7 @@ mod tests {
                 input_preview: r#"{"file_path":"src/main.rs","content":"fn main() {}"}"#
                     .to_string(),
                 input_chars: 56,
+                file_path: None,
             }],
             tool_results: vec![],
             char_count: 56,
@@ -586,6 +605,73 @@ mod tests {
 
         let files = extract_files_touched(&messages);
         assert_eq!(files, vec!["src/main.rs".to_string()]);
+    }
+
+    /// Review P2: real Claude Code lines nest content under `message`, and
+    /// none of them parsed.
+    #[test]
+    fn test_analyze_session_reads_real_claude_code_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("real.jsonl");
+        let content = format!(
+            "{}\n{}\n{}\n",
+            r#"{"type":"user","message":{"role":"user","content":"Fix the auth bug"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I decided to use JWT tokens for this."},{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/auth.rs"}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"fn main() {}"}]}}"#
+        );
+        std::fs::write(&path, content).unwrap();
+
+        let analysis = analyze_session(&path, "s", "p", &Config::default()).unwrap();
+        assert_eq!(analysis.message_count, 3);
+        assert_eq!(analysis.decisions.len(), 1);
+        assert_eq!(analysis.files_touched, vec!["src/auth.rs".to_string()]);
+    }
+
+    /// Review P2: byte slicing panicked when a cut landed inside a
+    /// multi-byte character.
+    #[test]
+    fn test_parsing_and_decisions_survive_multibyte_text() {
+        let input = format!(r#"{{"file_path":"a.rs","note":"{}é"}}"#, "x".repeat(190));
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "id": "t", "name": "Write",
+                                     "input": serde_json::from_str::<serde_json::Value>(&input).unwrap()}]}
+        })
+        .to_string();
+        let msg = parse_transcript_entry(&line).unwrap();
+        assert!(msg.tool_uses[0].input_preview.len() <= 200);
+
+        let text = format!(
+            "{}’ I decided to go with {}’ done.",
+            "a".repeat(48),
+            "b".repeat(150)
+        );
+        let messages = vec![TranscriptMessage {
+            role: "assistant".to_string(),
+            text_content: text.clone(),
+            tool_uses: vec![],
+            tool_results: vec![],
+            char_count: text.len(),
+            estimated_tokens: 1,
+        }];
+        assert_eq!(extract_decisions(&messages).len(), 1);
+    }
+
+    /// Review P2: paths came from re-parsing a 200-byte preview, so any
+    /// Write with real content was missed.
+    #[test]
+    fn test_files_touched_includes_writes_with_large_content() {
+        let line = serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "id": "t", "name": "Write",
+                                     "input": {"file_path": "src/big.rs", "content": "x".repeat(500)}}]}
+        })
+        .to_string();
+        let msg = parse_transcript_entry(&line).unwrap();
+        assert_eq!(
+            extract_files_touched(&[msg]),
+            vec!["src/big.rs".to_string()]
+        );
     }
 
     #[test]

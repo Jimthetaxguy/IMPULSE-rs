@@ -95,6 +95,10 @@ pub enum VoiceCommands {
         /// Port for tcp / webhook (default: 8787)
         #[arg(long, default_value_t = 8787)]
         port: u16,
+        /// Serve the webhook without IMPULSE_VOICE_WEBHOOK_SECRET; anyone who
+        /// can reach the port can call its tools. For local testing only.
+        #[arg(long)]
+        allow_unauthenticated: bool,
     },
 }
 
@@ -431,7 +435,7 @@ pub enum Commands {
         #[arg(long)]
         path: Option<PathBuf>,
     },
-    // Build hygiene: workspace-wide cargo clean
+    // Build hygiene: remove every discovered project's target/
     CleanAll {
         /// Only show what would be cleaned (default: true)
         #[arg(long)]
@@ -564,6 +568,10 @@ pub enum Commands {
         /// Output results as JSON (matches daemon IPC format)
         #[arg(long)]
         json: bool,
+        /// Run as a Claude Code PreToolUse hook: read the tool call from
+        /// stdin and exit 2 to block it (Claude Code's only blocking code)
+        #[arg(long)]
+        hook: bool,
     },
     /// Semantic diff between two Git refs using the `sem` tool
     SemDiff {

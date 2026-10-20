@@ -212,8 +212,15 @@ impl DynamicTool for GenomeReadTool {
             })));
         }
 
-        let content = std::fs::read_to_string(&genome_path)
+        let raw = std::fs::read_to_string(&genome_path)
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read GENOME.md: {}", e)))?;
+        // `add-decision` and `init` store the genome as JSON; read that as
+        // the Markdown it renders to, so sections such as `decisions` are
+        // found. A hand-written Markdown genome is read as it is.
+        let content = match serde_json::from_str::<crate::memory::Genome>(&raw) {
+            Ok(genome) => genome.to_markdown(),
+            Err(_) => raw,
+        };
 
         // If section filter specified, extract just that section
         if let Some(section) = section_filter {
@@ -693,5 +700,35 @@ mod tests {
         assert_eq!(result.output["truncated"], true);
         let returned = result.output["content"].as_str().unwrap();
         assert!(returned.chars().count() <= DEFAULT_MAX_CHARS);
+    }
+
+    /// Review finding: GENOME.md is stored as JSON, but this tool looked for
+    /// Markdown `## ` sections in it, so every section (decisions included)
+    /// was reported missing.
+    #[tokio::test]
+    async fn test_execute_reads_sections_of_a_json_genome() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut genome = crate::memory::Genome::new();
+        genome.add_decision(
+            "Use tabs".to_string(),
+            Some("house style".to_string()),
+            Vec::new(),
+        );
+        std::fs::write(
+            dir.path().join("GENOME.md"),
+            serde_json::to_string_pretty(&genome).unwrap(),
+        )
+        .unwrap();
+        let ctx = ToolContext {
+            impulse_dir: dir.path().to_path_buf(),
+            ..ToolContext::with_all_capabilities()
+        };
+        let result = GenomeReadTool
+            .execute(serde_json::json!({"section": "decisions"}), &ctx)
+            .await
+            .unwrap();
+        let content = result.output["content"].as_str().expect("section found");
+        assert!(content.contains("Use tabs"), "{content}");
+        assert!(content.contains("house style"), "{content}");
     }
 }

@@ -908,8 +908,31 @@ fn sync_legacy_injection_artifacts(base_path: &Path, project: &ProjectSummary) -
                 "source": "context/injections",
             }),
         };
-        impulse_ops::save_artifact(base_path, &artifact)
+        save_unless_unchanged(base_path, &artifact)
             .with_context(|| format!("Failed to save legacy injection artifact {}", stem))?;
+    }
+    Ok(())
+}
+
+/// Writes a mirrored artifact only when its content changed. Snapshots run
+/// on every 2 s poll, and rewriting the envelope each time reset an artifact
+/// the operator had acknowledged or applied back to Staged or Ready, so the
+/// review never cleared and Apply could repeat; it also rewrote and fsynced
+/// every mirrored file on every poll. Changed content is new material to
+/// review, so it is written fresh.
+fn save_unless_unchanged(base_path: &Path, artifact: &ArtifactEnvelope) -> Result<()> {
+    let path = impulse_ops::artifact_file_path(
+        base_path,
+        &artifact.project_id,
+        &artifact.agent_id,
+        &artifact.id,
+    );
+    let unchanged = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ArtifactEnvelope>(&bytes).ok())
+        .is_some_and(|stored| stored.payload == artifact.payload);
+    if !unchanged {
+        impulse_ops::save_artifact(base_path, artifact).context("Failed to save artifact")?;
     }
     Ok(())
 }
@@ -956,8 +979,7 @@ fn sync_live_insights_artifact(base_path: &Path, project: &ProjectSummary) -> Re
             "source": "LIVE_INSIGHTS.jsonl",
         }),
     };
-    impulse_ops::save_artifact(base_path, &artifact)
-        .context("Failed to save live insights artifact")?;
+    save_unless_unchanged(base_path, &artifact).context("Failed to save live insights artifact")?;
     Ok(())
 }
 
@@ -1003,6 +1025,51 @@ mod tests {
             .artifacts
             .iter()
             .any(|artifact| artifact.kind == "injection_review"));
+    }
+
+    /// Review P2: each snapshot rebuilt the mirrored artifact as Staged, so
+    /// an acknowledgement was undone by the next 2 s poll.
+    #[tokio::test]
+    async fn test_acknowledged_mirrored_artifact_stays_acknowledged() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir_all(temp.path().join("context/injections")).unwrap();
+        let injection = temp.path().join("context/injections/inject-001.md");
+        std::fs::write(&injection, "# Injection Bundle\n\n- Query: auth\n").unwrap();
+        let shared =
+            std::sync::Arc::new(crate::state::State::new(temp.path().to_path_buf()).unwrap());
+
+        let snapshot = build_snapshot(&shared, &[]).await.unwrap();
+        let artifact = snapshot
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "injection_review")
+            .unwrap()
+            .clone();
+        run_artifact_action(
+            temp.path(),
+            &artifact.project_id,
+            &artifact.id,
+            "acknowledge",
+            &serde_json::Value::Null,
+        )
+        .unwrap();
+
+        let again = build_snapshot(&shared, &[]).await.unwrap();
+        let status = |snapshot: &ProjectOpsSnapshot| {
+            snapshot
+                .artifacts
+                .iter()
+                .find(|candidate| candidate.id == artifact.id)
+                .unwrap()
+                .status
+                .clone()
+        };
+        assert_eq!(status(&again), ArtifactStatus::Acknowledged);
+
+        // New content is new material to review.
+        std::fs::write(&injection, "# Injection Bundle\n\n- Query: billing\n").unwrap();
+        let changed = build_snapshot(&shared, &[]).await.unwrap();
+        assert_eq!(status(&changed), ArtifactStatus::Staged);
     }
 
     #[tokio::test]

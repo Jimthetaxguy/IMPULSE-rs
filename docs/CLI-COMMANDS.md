@@ -12,7 +12,7 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 
 | Command | Direct | With `--daemon` | Description |
 |---------|--------|--------|-------------|
-| `daemon` | Yes | IPC status only | Run the foreground daemon listener; `--daemon daemon --stop` does not terminate it |
+| `daemon` | Yes | IPC status only | Run the foreground daemon listener. `daemon --stop` fails with an explanation: the protocol has no stop request, so end the daemon process itself |
 | `run` | Yes | — | Launch the 10-tab ratatui workbench |
 | `session-start` | Yes | IPC | Begin a new session (`--name`, `--platform`, `--inject-mode`) |
 | `session-end` | Yes | IPC | End session (`--session-id`, `--summary`, `--verify`, `--sem-diff-base`) |
@@ -41,8 +41,8 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 | `sync-context` | Yes | — | Synchronize context across sessions (`--session-id`, `--inject-mode`) |
 | `compute-injection` | Yes | — | Compute dynamic injection selection (`--query`, `--limit`) |
 | `verify` | Yes | Local | Run project verification checks |
-| `search-history` | Yes | — | Search session history (`--query`, `--mode`, `--backend`, `--limit`) |
-| `search-genome` | Yes | — | Search genome decisions (`--query`, `--mode`, `--backend`, `--limit`) |
+| `search-history` | Yes | — | Search session history (`--query`, `--mode`, `--backend`, `--limit`; `--offset`/`--page` page through the first 1000 matches, `--total` counts them; `--explain`, `--json`) |
+| `search-genome` | Yes | — | Search genome decisions (`--query`, `--mode`, `--backend`, `--limit`; `--offset`/`--page` page through the first 1000 matches, `--total` counts them; `--explain`, `--json`) |
 | `index-memory` | Yes | — | Index memory for search (`--scope`, `--rebuild`) |
 | `retrieval-status` | Yes | — | Show retrieval index status (`--check`, `--json`) |
 | `tools` | Yes | — | Manage installed tools (`list`/`init`/`update`/`check`, `--tool`, `--dry-run`) |
@@ -59,7 +59,7 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 | `summary` | Yes | — | Quick summary |
 | `sweep` | Yes | — | Sweep stale build artifacts (`--dry-run`, `--path`, `--days`) |
 | `wipe` | Yes | — | Aggressive wipe of target/ dirs (`--dry-run`, `--path`) |
-| `clean-all` | Yes | — | Workspace-wide cargo clean (`--dry-run`) |
+| `clean-all` | Yes | — | Remove every discovered project's `target/` (`--dry-run`) |
 | `sccache-setup` | Yes | — | Setup sccache compilation cache (`--check`, `--json`) |
 | `build-health` | Yes | — | Disk usage report for build artifacts (`--json`) |
 | `tooling-list` | Yes | — | List dynamic tools (`--category`, `--json`) |
@@ -69,7 +69,7 @@ locally. `—` means the dispatcher prints a direct-mode instruction instead of 
 | `tooling-validate` | Yes | — | Validate manifest-defined tools (`--json`) |
 | `tooling-reload` | Yes | — | Reload runtime tooling (`--json`) |
 | `mcp serve` | Yes | — | Serve registry-backed MCP interface (`--transport`, `--port`) |
-| `agent-configure` | Yes | — | Configure Impulse Agent (`--provider`, `--api-key`, `--harness`) |
+| `agent-configure` | Yes | — | Configure Impulse Agent (`--provider`, `--model`, `--harness`); the API key comes from the environment (`--api-key` is refused because config.json never stores it) |
 | `agent-status` | Yes | — | Show agent status (`--json`) |
 | `agent-query` | Yes | — | Query the agent (`--prompt`, `--json`) |
 | `guard` | Yes | — | Evaluate guardrail rules (`--action`, `--target`, `--list`, `--enable`) |

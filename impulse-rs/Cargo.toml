@@ -47,12 +47,16 @@ ratatui = "0.28"
 crossterm = "0.28"
 
 # HTTP/API calls
-reqwest = { version = "0.12", features = ["json", "blocking"] }
+reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# Model provider streams and middleware (ADR-0022 stage 2). Both were already
+# in the lockfile through other dependencies.
+futures = "0.3"
+tower = { version = "0.5", features = ["limit", "util"] }
 rusqlite = { version = "0.32", features = ["bundled", "load_extension"] }
 sha2 = "0.10"
 impulse-ops = { path = "impulse-ops" }
@@ -147,6 +151,11 @@ weezl = { version = "0.1", optional = true }
 monty = "1.0.0"
 monty-types = { version = "1.0.0", features = ["tzdb"] }
 
+# Read-only coding agent behind Ion's disposable `photon` tool
+# (docs/superpowers/specs/2026-10-02-ion-photon-subagent-design.md). Pinned to a
+# reviewed commit; the library is used as-is, never through its CLI or TOML config.
+min-agent = { git = "https://github.com/Jimthetaxguy/min-agent-rs", rev = "56411f07e3d8593297176c88fd908f0bfe361c57", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -157,12 +166,14 @@ security-framework = "=3.6.0"
 security-framework-sys = "=2.17.0"
 
 [features]
-default = ["office-support"]
+default = ["office-support", "photon-subagent"]
 # Monty support enables computed routing and dynamic context injection
 # Requires: pip install pydantic-monty
 monty-support = ["dep:pyo3"]
 # DataFusion support enables advanced analytics and aggregation
 datafusion-support = ["dep:datafusion"]
+# Photon enables Ion's disposable read-only subagent tool (min-agent)
+photon-subagent = ["dep:min-agent"]
 # Office support enables document parsing and generation
 # Supports: Excel (.xlsx), Word (.docx), CSV; ion's document_read additionally reads
 # PDF (text layer), txt, and md under this same feature.

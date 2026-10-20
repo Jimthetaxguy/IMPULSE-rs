@@ -247,7 +247,7 @@ pub(crate) fn render_stats_panel(
                 Span::styled("● ", Style::default().fg(status_color)),
                 Span::raw(format!("{} ", time)),
                 Span::styled(
-                    &session.name[..session.name.len().min(20)],
+                    crate::ui::visualization::prefix_on_char_boundary(&session.name, 20),
                     Style::default().fg(COLOR_TEXT_BRIGHT),
                 ),
             ]));
