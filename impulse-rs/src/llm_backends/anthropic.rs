@@ -198,13 +198,15 @@ fn percent_decodes_to_utf8(text: &str) -> bool {
 }
 
 /// The Anthropic API origin Ion's own provider resolves when no explicit base
-/// URL is configured: `ANTHROPIC_BASE_URL` if it carries an `http(s)` scheme,
-/// otherwise the canonical default. Shared with the `photon` subagent so a
-/// local proxy or eval harness intercepts both the parent and its photons.
+/// URL is configured. A usable `ANTHROPIC_BASE_URL` wins; an unusable one is
+/// an error, never a fall back to the canonical default. Shared with the
+/// `photon` subagent so a local proxy or eval harness intercepts both the
+/// parent and its photons.
 #[cfg(feature = "photon-subagent")]
-pub(crate) fn anthropic_api_origin() -> String {
+pub(crate) fn anthropic_api_origin() -> Result<String, &'static str> {
     let from_env = std::env::var(ANTHROPIC_BASE_URL_ENV).ok();
     select_base_url(None, from_env.as_deref(), ANTHROPIC_DEFAULT_BASE_URL)
+        .map_err(|(_, reason)| reason)
 }
 
 /// How a resolved origin relates to the provider's canonical default.
@@ -2190,11 +2192,17 @@ mod tests {
     fn test_anthropic_api_origin_follows_env_and_rejects_schemeless_override() {
         let _guard = env_guard();
         std::env::remove_var(ANTHROPIC_BASE_URL_ENV);
-        assert_eq!(anthropic_api_origin(), "https://api.anthropic.com");
+        assert_eq!(
+            anthropic_api_origin(),
+            Ok("https://api.anthropic.com".to_string())
+        );
         std::env::set_var(ANTHROPIC_BASE_URL_ENV, "http://127.0.0.1:4010/");
-        assert_eq!(anthropic_api_origin(), "http://127.0.0.1:4010");
+        assert_eq!(
+            anthropic_api_origin(),
+            Ok("http://127.0.0.1:4010".to_string())
+        );
         std::env::set_var(ANTHROPIC_BASE_URL_ENV, "api.anthropic.test");
-        assert_eq!(anthropic_api_origin(), "https://api.anthropic.com");
+        assert_eq!(anthropic_api_origin(), Err("it is not an absolute URL"));
         std::env::remove_var(ANTHROPIC_BASE_URL_ENV);
     }
 
