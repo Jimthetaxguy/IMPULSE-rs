@@ -185,6 +185,7 @@ impl GovernedTaskGateway for TestGovernedGateway {
             staged_worktree: None,
             promotions: vec![],
             execution_state: GovernedExecutionState::Registered,
+            exit_kind: Default::default(),
             review_state: GovernedReviewState::AwaitingClaim,
             claims: Vec::new(),
             verifications: Vec::new(),
@@ -212,7 +213,10 @@ impl GovernedTaskGateway for TestGovernedGateway {
         task.execution_state = match request.mutation {
             GovernedTaskMutation::MarkRunning { .. } => GovernedExecutionState::Running,
             GovernedTaskMutation::MarkLaunchFailed { .. } => GovernedExecutionState::LaunchFailed,
-            GovernedTaskMutation::MarkRuntimeExited { .. } => GovernedExecutionState::RuntimeExited,
+            GovernedTaskMutation::MarkRuntimeExited { exit_kind, .. } => {
+                task.exit_kind = exit_kind;
+                GovernedExecutionState::RuntimeExited
+            }
             _ => return Err("unsupported test mutation".to_string()),
         };
         task.revision += 1;

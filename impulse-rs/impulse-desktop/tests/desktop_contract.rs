@@ -3327,6 +3327,7 @@ fn staged_governed_task() -> impulse_ops::governed_task::GovernedTaskRun {
         }),
         promotions: vec![],
         execution_state: gt::GovernedExecutionState::RuntimeExited,
+        exit_kind: Default::default(),
         review_state: gt::GovernedReviewState::Accepted,
         claims: vec![],
         verifications: vec![],
