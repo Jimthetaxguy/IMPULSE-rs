@@ -262,6 +262,32 @@ struct EmbedRequest<'a> {
 struct EmbedResponse {
     vectors: Vec<Vec<f32>>,
     dim: usize,
+    #[serde(default)]
+    backend: Option<String>,
+}
+
+const FAKE_EMBED_BACKEND: &str = "deterministic-sha256-fallback";
+
+fn reject_or_warn_fake_embedding_backend(backend: Option<&str>) -> Result<(), EmbeddingError> {
+    if backend != Some(FAKE_EMBED_BACKEND) {
+        return Ok(());
+    }
+    if std::env::var("IMPULSE_EMBED_ALLOW_FAKE")
+        .ok()
+        .is_some_and(|value| value == "1")
+    {
+        tracing::warn!(
+            backend = FAKE_EMBED_BACKEND,
+            "semantic embeddings degraded to deterministic SHA-256 vectors; search quality is not semantic"
+        );
+        return Ok(());
+    }
+    Err(EmbeddingError {
+        kind: EmbeddingFailureKind::InvalidOutput,
+        message: format!(
+            "embedding script used {FAKE_EMBED_BACKEND}; install sentence-transformers or set IMPULSE_EMBED_ALLOW_FAKE=1 for development-only fallback"
+        ),
+    })
 }
 
 fn resolve_script_path() -> Option<PathBuf> {
@@ -392,6 +418,8 @@ fn embed_texts_with(
             kind: EmbeddingFailureKind::InvalidOutput,
             message: format!("failed to parse embedding subprocess JSON output: {}", e),
         })?;
+
+    reject_or_warn_fake_embedding_backend(response.backend.as_deref())?;
 
     if response.vectors.len() != texts.len() {
         return Err(EmbeddingError {
@@ -640,6 +668,23 @@ mod tests {
         let dim = out[0].len();
         assert!(dim > 0, "real embeddings must be non-empty");
         assert!(out.iter().all(|v| v.len() == dim), "consistent dimension");
+    }
+
+    #[test]
+    fn test_reject_fake_embedding_backend_without_allow_env() {
+        let _guard = retrieval_embedding_env_lock();
+        std::env::remove_var("IMPULSE_EMBED_ALLOW_FAKE");
+        let err = reject_or_warn_fake_embedding_backend(Some(FAKE_EMBED_BACKEND)).unwrap_err();
+        assert_eq!(err.kind, EmbeddingFailureKind::InvalidOutput);
+        assert!(err.message.contains(FAKE_EMBED_BACKEND));
+    }
+
+    #[test]
+    fn test_allow_fake_embedding_backend_with_env() {
+        let _guard = retrieval_embedding_env_lock();
+        std::env::set_var("IMPULSE_EMBED_ALLOW_FAKE", "1");
+        assert!(reject_or_warn_fake_embedding_backend(Some(FAKE_EMBED_BACKEND)).is_ok());
+        std::env::remove_var("IMPULSE_EMBED_ALLOW_FAKE");
     }
 
     #[test]
