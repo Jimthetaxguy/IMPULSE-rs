@@ -10,7 +10,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::Value;
 
-use crate::handoff::{self, CheckKind, GateFailure, HandoffError, NextStep, WorkflowResult};
+use crate::handoff::{
+    self, action_schemas, CheckKind, GateFailure, HandoffError, NextStep, WorkflowResult,
+};
 use crate::tooling::error::ToolError;
 use crate::tooling::traits::*;
 
@@ -23,6 +25,8 @@ impl DynamicTool for HandoffTool {
     }
 
     fn descriptor(&self) -> ToolDescriptor {
+        let schemas = action_schemas();
+        let schema_text = serde_json::to_string(&schemas).unwrap_or_default();
         ToolDescriptor {
             id: "handoff".into(),
             name: "Handoff".into(),
@@ -30,7 +34,7 @@ impl DynamicTool for HandoffTool {
                 One action per call: record_fetch, submit, status, read, read_shared, write_shared. \
                 The result is always a state snapshot plus the allowed next step. \
                 A failed check returns state pending and accepted false with the exact failures. \
-                It is not accepted with a warning."
+                It is not accepted with a warning. Session and origin are taken from the tool context."
                 .into(),
             version: "0.1.0".into(),
             category: ToolCategory::Analysis,
@@ -45,12 +49,12 @@ impl DynamicTool for HandoffTool {
                 },
                 ToolParam {
                     name: "payload".into(),
-                    description: "Action parameters. submit: {id, from_agent, to_agent, workspace, \
-                        claims:[{id, statement, subject, source}]}. source is {kind:file, path}, \
-                        {kind:commit, hash}, or {kind:url, url}. record_fetch: {sender, url, status, \
-                        body_digest}. read_shared: {artifact_id, reader}. write_shared: \
-                        {artifact_id, writer, based_on_generation, content}."
-                        .into(),
+                    description: format!(
+                        "Action parameters. The canonical per-action JSON Schema follows the marker. \
+                        Do not send session_id, execution_origin, or recorded_via; those are stamped \
+                        from the tool context. Drifted names such as `from` are not aliases. \
+                        ACTION_SCHEMAS={schema_text}"
+                    ),
                     param_type: ParamType::Json,
                     required: true,
                     default: None,
@@ -73,7 +77,7 @@ impl DynamicTool for HandoffTool {
         let payload = params.get("payload").cloned().unwrap_or(Value::Null);
         let workspace = match workspace_from_payload(&payload) {
             Ok(path) => path,
-            Err(message) => return tool_result(refusal(message)?),
+            Err(message) => return tool_result(refusal(Some("workspace"), message)?),
         };
         if let Some(path) = &workspace {
             if !ctx.is_path_allowed(path, false) {
@@ -89,9 +93,25 @@ impl DynamicTool for HandoffTool {
         }
 
         let action = params.get("action").and_then(Value::as_str).unwrap_or("");
-        match handoff::dispatch_at(action, &payload, ledger, Utc::now(), workspace.as_deref()) {
+        let mut admission = handoff::AdmissionContext::from_tool(
+            ctx.execution_origin.as_str(),
+            ctx.session_id.as_deref(),
+        );
+        admission.fetch_max_age = handoff::parse_fetch_max_age_secs(
+            std::env::var("IMPULSE_HANDOFF_FETCH_MAX_AGE_SECS")
+                .ok()
+                .as_deref(),
+        );
+        match handoff::dispatch_for(
+            action,
+            &payload,
+            ledger,
+            Utc::now(),
+            workspace.as_deref(),
+            &admission,
+        ) {
             Ok(result) => tool_result(result),
-            Err(HandoffError::Invalid(message)) => tool_result(refusal(message)?),
+            Err(HandoffError::Invalid(message)) => tool_result(refusal(None, message)?),
             Err(error) => Err(ToolError::ExecutionFailed(error.to_string())),
         }
     }
@@ -116,12 +136,13 @@ fn workspace_from_payload(payload: &Value) -> Result<Option<PathBuf>, String> {
         })
 }
 
-fn refusal(message: String) -> Result<WorkflowResult, ToolError> {
+fn refusal(field: Option<&str>, message: String) -> Result<WorkflowResult, ToolError> {
     WorkflowResult::pending(
         serde_json::json!({"kind": "handoff_tool", "phase": "pending"}),
         vec![GateFailure {
-            target: "request".into(),
+            target: field.unwrap_or("request").to_string(),
             check: CheckKind::Request,
+            field: field.map(str::to_string),
             fix: message,
         }],
         NextStep {
@@ -450,6 +471,45 @@ mod tests {
             !external.join("HANDOFF_GATE.json").exists(),
             "IMPULSE_HOME must not receive the handoff ledger"
         );
+    }
+
+    #[tokio::test]
+    async fn test_handoff_tool_stamps_context_and_ignores_payload_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let impulse = temp.path().join(".impulse");
+        let mut ctx = context(impulse.clone());
+        ctx.session_id = Some("from-context".into());
+        ctx.execution_origin = ExecutionOrigin::Mcp;
+        let digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let result = HandoffTool
+            .execute(
+                serde_json::json!({
+                    "action": "record_fetch",
+                    "payload": {
+                        "sender": "agent-a",
+                        "url": "https://billing.example.com/docs/refunds",
+                        "status": 200,
+                        "body_digest": digest,
+                        "session_id": "from-payload",
+                        "execution_origin": "cli"
+                    }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output["state"], "recorded");
+        assert_eq!(
+            result.output["snapshot"]["recorded_via"]["session_id"],
+            "from-context"
+        );
+        assert_eq!(
+            result.output["snapshot"]["recorded_via"]["execution_origin"],
+            "mcp"
+        );
+        let ledger = std::fs::read_to_string(impulse.join("HANDOFF_GATE.json")).unwrap();
+        assert!(ledger.contains("from-context"));
+        assert!(!ledger.contains("from-payload"));
     }
 
     #[test]

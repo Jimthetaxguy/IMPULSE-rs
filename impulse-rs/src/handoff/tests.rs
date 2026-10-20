@@ -6,7 +6,11 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::json;
 use tempfile::TempDir;
 
-use super::{dispatch, CheckKind, Claim, ClaimSource, WorkflowState, HANDOFF_GATE_FILE};
+use super::{
+    action_schemas, dispatch, dispatch_for, AdmissionContext, CheckKind, Claim, ClaimSource,
+    WorkflowState, DEFAULT_FETCH_MAX_AGE_SECS, HANDOFF_GATE_FILE,
+};
+use crate::tooling::DynamicTool;
 
 const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -712,8 +716,8 @@ fn test_two_senders_record_the_same_url_and_both_submissions_are_accepted() {
     assert!(stored.contains("\"agent-a\""));
     assert!(stored.contains("\"agent-b\""));
     assert!(
-        stored.contains("\"schema_version\": 2"),
-        "fetches are keyed by sender and URL in schema 2, got {stored}"
+        stored.contains("\"schema_version\": 3"),
+        "fetches are keyed by sender and URL in schema 3, got {stored}"
     );
 }
 
@@ -768,10 +772,15 @@ fn test_version_1_ledger_migrates_a_fetch_and_still_accepts_that_sender() {
     let stored: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(impulse.join(HANDOFF_GATE_FILE)).unwrap())
             .unwrap();
-    assert_eq!(stored["schema_version"], 2);
+    assert_eq!(stored["schema_version"], 3);
     assert_eq!(
         stored["fetches"]["agent-a"]["https://billing.example.com/docs/refunds"]["sender"],
         "agent-a"
+    );
+    assert_eq!(
+        stored["fetches"]["agent-a"]["https://billing.example.com/docs/refunds"]["recorded_via"]
+            ["session_id"],
+        serde_json::Value::Null
     );
 }
 
@@ -825,7 +834,7 @@ fn test_schema_1_composite_fetch_key_migrates_by_the_record_url() {
 }
 
 #[test]
-fn test_unknown_ledger_schema_names_the_schema_2_fix() {
+fn test_unknown_ledger_schema_names_the_schema_3_fix() {
     let (_temp, impulse) = ledger_dir();
     fs::create_dir_all(&impulse).unwrap();
     fs::write(
@@ -835,11 +844,435 @@ fn test_unknown_ledger_schema_names_the_schema_2_fix() {
     .unwrap();
     let error = dispatch("status", &json!({"id": "refund-report"}), &impulse, at(0)).unwrap_err();
     let text = error.to_string();
-    assert!(text.contains("schema 2"), "got {text}");
+    assert!(text.contains("schema 3"), "got {text}");
     assert!(
-        text.contains("sender and URL") || text.contains("Delete"),
+        text.contains("sender and URL") || text.contains("Delete") || text.contains("recorded_via"),
         "the error must say how to fix a ledger this Impulse cannot read, got {text}"
     );
+}
+
+fn submit_url(
+    impulse: &Path,
+    workspace: &Path,
+    sender: &str,
+    url: &str,
+    now: DateTime<Utc>,
+    admission: &AdmissionContext,
+) -> super::WorkflowResult {
+    dispatch_for(
+        "submit",
+        &json!({
+            "id": format!("report-{sender}"),
+            "from_agent": sender,
+            "to_agent": "reviewer",
+            "workspace": workspace,
+            "claims": [{
+                "id": "refund-cap",
+                "statement": "Refunds over $50 need a second approver.",
+                "subject": "billing.example.com",
+                "source": {"kind": "url", "url": url}
+            }]
+        }),
+        impulse,
+        now,
+        None,
+        admission,
+    )
+    .expect("submit returns a workflow result")
+}
+
+fn record_fetch_detailed(
+    impulse: &Path,
+    sender: &str,
+    url: &str,
+    now: DateTime<Utc>,
+    status: u16,
+    fetched_at: Option<DateTime<Utc>>,
+    admission: &AdmissionContext,
+) -> super::WorkflowResult {
+    let mut payload = json!({
+        "sender": sender,
+        "url": url,
+        "status": status,
+        "body_digest": DIGEST,
+    });
+    if let Some(fetched_at) = fetched_at {
+        payload["fetched_at"] = json!(fetched_at.to_rfc3339());
+    }
+    dispatch_for("record_fetch", &payload, impulse, now, None, admission).expect("record fetch")
+}
+
+#[test]
+fn test_submit_refuses_url_claim_whose_recorded_fetch_was_404() {
+    let (temp, impulse) = ledger_dir();
+    let now = at(0);
+    let url = "https://billing.example.com/docs/refunds";
+    let admission = AdmissionContext::direct();
+    let recorded = record_fetch_detailed(&impulse, "agent-a", url, now, 404, None, &admission);
+    assert_eq!(recorded.state, WorkflowState::Recorded);
+    assert_eq!(recorded.snapshot["status"], 404);
+
+    let result = submit_url(&impulse, temp.path(), "agent-a", url, now, &admission);
+    assert!(!result.accepted);
+    assert_eq!(result.state, WorkflowState::Pending);
+    assert_eq!(result.failures[0].check, CheckKind::FetchUnusable);
+    assert_eq!(result.failures[0].field.as_deref(), Some("status"));
+    assert!(result.failures[0].fix.contains("404"));
+    assert!(result.failures[0].fix.contains("2xx"));
+    let stored = fs::read_to_string(impulse.join(HANDOFF_GATE_FILE)).unwrap();
+    assert!(
+        stored.contains("\"status\": 404"),
+        "the gate must keep the recorded status, got {stored}"
+    );
+}
+
+#[test]
+fn test_submit_refuses_url_claim_when_status_is_not_2xx() {
+    let url = "https://billing.example.com/docs/refunds";
+    for status in [199_u16, 300, 301, 304, 500] {
+        let (temp, impulse) = ledger_dir();
+        let now = at(0);
+        let admission = AdmissionContext::direct();
+        record_fetch_detailed(&impulse, "agent-a", url, now, status, None, &admission);
+        let result = submit_url(&impulse, temp.path(), "agent-a", url, now, &admission);
+        assert!(!result.accepted, "status {status} must not be evidence");
+        assert_eq!(result.failures[0].check, CheckKind::FetchUnusable);
+        assert_eq!(result.failures[0].field.as_deref(), Some("status"));
+        assert!(
+            result.failures[0].fix.contains(&status.to_string()),
+            "status {status}: {}",
+            result.failures[0].fix
+        );
+    }
+}
+
+#[test]
+fn test_submit_refuses_url_claim_with_future_fetched_at() {
+    let (temp, impulse) = ledger_dir();
+    let now = at(0);
+    let future = now + Duration::minutes(5);
+    let url = "https://billing.example.com/docs/refunds";
+    let admission = AdmissionContext::direct();
+    let recorded =
+        record_fetch_detailed(&impulse, "agent-a", url, now, 200, Some(future), &admission);
+    assert_eq!(recorded.state, WorkflowState::Recorded);
+    let result = submit_url(&impulse, temp.path(), "agent-a", url, now, &admission);
+    assert!(!result.accepted);
+    assert_eq!(result.failures[0].check, CheckKind::FetchUnusable);
+    assert_eq!(result.failures[0].field.as_deref(), Some("fetched_at"));
+    assert!(result.failures[0].fix.contains("fetched_at"));
+    let stored = fs::read_to_string(impulse.join(HANDOFF_GATE_FILE)).unwrap();
+    assert!(
+        stored.contains(&future.to_rfc3339()) || stored.contains("2026-06-01T12:05:00"),
+        "the gate must keep the future timestamp, got {stored}"
+    );
+}
+
+#[test]
+fn test_submit_refuses_url_claim_with_fetch_older_than_max_age() {
+    let (temp, impulse) = ledger_dir();
+    let now = at(0);
+    let stale = now - Duration::seconds(DEFAULT_FETCH_MAX_AGE_SECS + 1);
+    let url = "https://billing.example.com/docs/refunds";
+    let admission = AdmissionContext::direct();
+    record_fetch_detailed(&impulse, "agent-a", url, now, 200, Some(stale), &admission);
+    let result = submit_url(&impulse, temp.path(), "agent-a", url, now, &admission);
+    assert!(!result.accepted);
+    assert_eq!(result.state, WorkflowState::Pending);
+    assert_eq!(result.failures[0].check, CheckKind::FetchUnusable);
+    assert_eq!(result.failures[0].field.as_deref(), Some("fetched_at"));
+    assert!(result.failures[0].fix.contains("older than"));
+    assert!(result.failures[0]
+        .fix
+        .contains(&DEFAULT_FETCH_MAX_AGE_SECS.to_string()));
+}
+
+#[test]
+fn test_submit_accepts_url_claim_with_fresh_2xx_fetch() {
+    let url = "https://billing.example.com/docs/refunds";
+    let now = at(0);
+    let just_inside = now - Duration::seconds(DEFAULT_FETCH_MAX_AGE_SECS);
+    for (status, fetched_at) in [(200_u16, None), (201, None), (299, Some(just_inside))] {
+        let (temp, impulse) = ledger_dir();
+        let admission = AdmissionContext::direct();
+        record_fetch_detailed(
+            &impulse, "agent-a", url, now, status, fetched_at, &admission,
+        );
+        let result = submit_url(&impulse, temp.path(), "agent-a", url, now, &admission);
+        assert!(
+            result.accepted,
+            "status {status} at {:?} must be accepted: {:?}",
+            fetched_at, result.failures
+        );
+        assert!(result.failures.is_empty());
+    }
+}
+
+#[test]
+fn test_submit_honors_a_shorter_fetch_max_age() {
+    let (temp, impulse) = ledger_dir();
+    let now = at(0);
+    let url = "https://billing.example.com/docs/refunds";
+    let fetched_at = now - Duration::seconds(90);
+    let admission = AdmissionContext::direct().with_fetch_max_age(Duration::seconds(60));
+    record_fetch_detailed(
+        &impulse,
+        "agent-a",
+        url,
+        now,
+        200,
+        Some(fetched_at),
+        &admission,
+    );
+    let result = submit_url(&impulse, temp.path(), "agent-a", url, now, &admission);
+    assert!(!result.accepted);
+    assert_eq!(result.failures[0].field.as_deref(), Some("fetched_at"));
+    assert!(result.failures[0].fix.contains("60"));
+
+    let fresh = AdmissionContext::direct().with_fetch_max_age(Duration::seconds(120));
+    let accepted = submit_url(&impulse, temp.path(), "agent-a", url, now, &fresh);
+    assert!(accepted.accepted, "{:?}", accepted.failures);
+}
+
+#[test]
+fn test_fetch_recorded_in_another_session_does_not_resolve_claim() {
+    let (temp, impulse) = ledger_dir();
+    let now = at(0);
+    let url = "https://billing.example.com/docs/refunds";
+    let recorded_in = AdmissionContext::from_tool("daemon", Some("session-a"));
+    record_fetch_detailed(&impulse, "agent-a", url, now, 200, None, &recorded_in);
+    let other = AdmissionContext::from_tool("daemon", Some("session-b"));
+    let mut payload = json!({
+        "id": "refund-report",
+        "from_agent": "agent-a",
+        "to_agent": "agent-b",
+        "workspace": temp.path(),
+        "session_id": "session-a",
+        "execution_origin": "cli",
+        "claims": [{
+            "id": "refund-cap",
+            "statement": "Refunds over $50 need a second approver.",
+            "subject": "billing.example.com",
+            "source": {"kind": "url", "url": url}
+        }]
+    });
+    let result = dispatch_for("submit", &payload, &impulse, now, None, &other).unwrap();
+    assert!(!result.accepted);
+    assert_eq!(result.failures[0].check, CheckKind::FetchUnusable);
+    assert_eq!(result.failures[0].field.as_deref(), Some("session_id"));
+    assert!(result.failures[0].fix.contains("session-a"));
+    assert!(result.failures[0].fix.contains("session-b"));
+    payload["session_id"] = json!("session-b");
+    let still_other = dispatch_for("submit", &payload, &impulse, now, None, &other).unwrap();
+    assert!(
+        !still_other.accepted,
+        "a payload session_id must not retarget the stamp"
+    );
+
+    let same = submit_url(&impulse, temp.path(), "agent-a", url, now, &recorded_in);
+    assert!(same.accepted, "{:?}", same.failures);
+}
+
+#[test]
+fn test_ledger_row_records_execution_origin_and_session() {
+    let (_temp, impulse) = ledger_dir();
+    let now = at(0);
+    let url = "https://billing.example.com/docs/refunds";
+    let admission = AdmissionContext::from_tool("mcp", Some("sess-9"));
+    let payload = json!({
+        "sender": "agent-a",
+        "url": url,
+        "status": 200,
+        "body_digest": DIGEST,
+        "session_id": "from-payload",
+        "execution_origin": "cli",
+        "recorded_via": {"execution_origin": "cli", "session_id": "from-payload"}
+    });
+    let recorded = dispatch_for("record_fetch", &payload, &impulse, now, None, &admission).unwrap();
+    assert_eq!(recorded.state, WorkflowState::Recorded);
+    assert_eq!(recorded.snapshot["recorded_via"]["execution_origin"], "mcp");
+    assert_eq!(recorded.snapshot["recorded_via"]["session_id"], "sess-9");
+
+    let stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(impulse.join(HANDOFF_GATE_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(stored["schema_version"], 3);
+    let row = &stored["fetches"]["agent-a"][url];
+    assert_eq!(row["recorded_via"]["execution_origin"], "mcp");
+    assert_eq!(row["recorded_via"]["session_id"], "sess-9");
+    assert_ne!(row["recorded_via"]["session_id"], "from-payload");
+}
+
+#[test]
+fn test_schema_2_ledger_migrates_to_schema_3_and_stays_sessionless() {
+    let (temp, impulse) = ledger_dir();
+    fs::create_dir_all(&impulse).unwrap();
+    let url = "https://billing.example.com/docs/refunds";
+    let v2 = json!({
+        "schema_version": 2,
+        "fetches": {
+            "agent-a": {
+                url: {
+                    "url": url,
+                    "host": "billing.example.com",
+                    "status": 200,
+                    "body_digest": format!("sha256:{DIGEST}"),
+                    "fetched_at": "2026-06-01T12:00:00Z",
+                    "sender": "agent-a"
+                }
+            }
+        },
+        "handoffs": {},
+        "artifacts": {}
+    });
+    fs::write(
+        impulse.join(HANDOFF_GATE_FILE),
+        serde_json::to_vec_pretty(&v2).unwrap(),
+    )
+    .unwrap();
+
+    let sessioned = AdmissionContext::from_tool("daemon", Some("sess-9"));
+    let refused = submit_url(&impulse, temp.path(), "agent-a", url, at(0), &sessioned);
+    assert!(!refused.accepted);
+    assert_eq!(refused.failures[0].check, CheckKind::FetchUnusable);
+    assert_eq!(refused.failures[0].field.as_deref(), Some("session_id"));
+
+    let open = submit_url(
+        &impulse,
+        temp.path(),
+        "agent-a",
+        url,
+        at(0),
+        &AdmissionContext::direct(),
+    );
+    assert!(
+        open.accepted,
+        "an unstamped migrated fetch still resolves when the submit also has no session: {:?}",
+        open.failures
+    );
+    let stored: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(impulse.join(HANDOFF_GATE_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(stored["schema_version"], 3);
+    assert_eq!(
+        stored["fetches"]["agent-a"][url]["recorded_via"]["execution_origin"],
+        "unrecorded"
+    );
+    assert_eq!(
+        stored["fetches"]["agent-a"][url]["recorded_via"]["session_id"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn test_missing_from_agent_names_the_field() {
+    let (temp, impulse) = ledger_dir();
+    let result = dispatch(
+        "submit",
+        &json!({
+            "id": "refund-report",
+            "to_agent": "agent-b",
+            "workspace": temp.path(),
+            "claims": [{
+                "id": "refund-cap",
+                "statement": "Refunds over $50 need a second approver.",
+                "subject": "billing.example.com",
+                "source": {"kind": "url", "url": "https://billing.example.com/docs/refunds"}
+            }]
+        }),
+        &impulse,
+        at(0),
+    )
+    .unwrap();
+    assert!(!result.accepted);
+    assert_eq!(result.state, WorkflowState::Pending);
+    assert_eq!(result.failures[0].check, CheckKind::Request);
+    assert_eq!(result.failures[0].field.as_deref(), Some("from_agent"));
+    assert!(result.failures[0]
+        .fix
+        .contains("payload.from_agent missing"));
+    assert_eq!(result.next_step.action, "submit");
+}
+
+#[test]
+fn test_drifted_field_name_from_is_refused_with_field_hint() {
+    let (temp, impulse) = ledger_dir();
+    let result = dispatch(
+        "submit",
+        &json!({
+            "id": "refund-report",
+            "from": "agent-a",
+            "to_agent": "agent-b",
+            "workspace": temp.path(),
+            "claims": [{
+                "id": "refund-cap",
+                "statement": "Refunds over $50 need a second approver.",
+                "subject": "billing.example.com",
+                "source": {"kind": "url", "url": "https://billing.example.com/docs/refunds"}
+            }]
+        }),
+        &impulse,
+        at(0),
+    )
+    .unwrap();
+    assert!(!result.accepted);
+    assert_eq!(result.failures[0].check, CheckKind::Request);
+    assert_eq!(result.failures[0].field.as_deref(), Some("from_agent"));
+    assert!(result.failures[0].fix.contains("from_agent"));
+    assert_ne!(result.snapshot["from_agent"], "agent-a");
+    let rendered = serde_json::to_string(&result).unwrap();
+    assert!(
+        !rendered.contains("aliased") && !rendered.contains("interpreted"),
+        "the gate must not describe a rewrite, got {rendered}"
+    );
+}
+
+#[test]
+fn test_descriptor_exposes_schema_for_each_action() {
+    let schema = action_schemas();
+    let json = serde_json::to_string(&schema).unwrap();
+    let recovered: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(schema, recovered);
+    for action in [
+        "record_fetch",
+        "submit",
+        "status",
+        "read",
+        "read_shared",
+        "write_shared",
+    ] {
+        let card = &schema["actions"][action];
+        assert_eq!(card["type"], "object", "{action}");
+        assert_eq!(card["additionalProperties"], false, "{action}");
+        assert!(card["required"].is_array(), "{action}");
+        assert!(card["properties"].is_object(), "{action}");
+    }
+    let submit_required = schema["actions"]["submit"]["required"].as_array().unwrap();
+    assert!(submit_required.iter().any(|value| value == "from_agent"));
+    assert!(submit_required.iter().all(|value| value != "from"));
+    assert!(schema["actions"]["submit"]["properties"]
+        .get("from")
+        .is_none());
+    assert!(schema["actions"]["record_fetch"]["properties"]
+        .get("session_id")
+        .is_none());
+    assert!(schema["actions"]["record_fetch"]["properties"]
+        .get("execution_origin")
+        .is_none());
+
+    let descriptor = crate::tooling::builtin::HandoffTool.descriptor();
+    let payload = descriptor
+        .params
+        .iter()
+        .find(|param| param.name == "payload")
+        .expect("payload parameter");
+    let embedded = payload
+        .description
+        .split("ACTION_SCHEMAS=")
+        .nth(1)
+        .expect("descriptor publishes the per-action schema");
+    let embedded: serde_json::Value = serde_json::from_str(embedded).unwrap();
+    assert_eq!(embedded, schema);
 }
 
 fn git(repo: &Path, args: &[&str]) -> String {

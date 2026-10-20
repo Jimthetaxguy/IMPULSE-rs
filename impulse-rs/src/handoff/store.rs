@@ -8,8 +8,10 @@
 //! is old. `git` calls that run while the lock is held are killed after a
 //! fixed timeout so a slow subprocess cannot sit on the lock forever.
 //!
-//! Schema 2 keys each recorded fetch by sender and URL. A schema 1 ledger,
-//! which kept one row per URL, is rewritten to that shape on load.
+//! Schema 3 keys each recorded fetch by sender and URL and stamps
+//! `recorded_via` (execution origin and session) on fetches and handoffs.
+//! Schema 2 is that key shape without the stamp. Schema 1, which kept one
+//! row per URL, is rewritten to the schema 2 shape and then to schema 3.
 
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
@@ -27,12 +29,29 @@ use crate::storage::Storage;
 use super::types::{GateFailure, NextStep, WorkflowResult, HANDOFF_GATE_FILE, MAX_ARTIFACT_BYTES};
 use super::CheckKind;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const LOCK_WAIT_ATTEMPTS: usize = 50;
 /// How long a contending caller waits before asking the agent to retry.
 /// This is not a staleness threshold: a live owner's lock is never taken,
 /// including when the file is older than the previous 10s age check.
 const LOCK_RETRY_PAUSE: Duration = Duration::from_millis(20);
+
+/// Session and origin that recorded a row. Stamped by the caller of the
+/// gate, never copied from the JSON payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RecordedVia {
+    pub execution_origin: String,
+    pub session_id: Option<String>,
+}
+
+impl RecordedVia {
+    pub(crate) fn unrecorded() -> Self {
+        Self {
+            execution_origin: "unrecorded".to_string(),
+            session_id: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct FetchRecord {
@@ -42,6 +61,8 @@ pub(crate) struct FetchRecord {
     pub body_digest: String,
     pub fetched_at: DateTime<Utc>,
     pub sender: String,
+    #[serde(default = "RecordedVia::unrecorded")]
+    pub recorded_via: RecordedVia,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -53,6 +74,8 @@ pub(crate) struct StoredHandoff {
     pub claims: Vec<super::Claim>,
     pub phase: HandoffPhase,
     pub updated_at: DateTime<Utc>,
+    #[serde(default = "RecordedVia::unrecorded")]
+    pub recorded_via: RecordedVia,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -134,22 +157,36 @@ impl GateStore {
             ))
         })?;
         match value.get("schema_version").and_then(Value::as_u64) {
-            Some(2) => {}
-            Some(1) => migrate_v1_fetches(&mut value).map_err(|error| {
+            Some(3) => {}
+            Some(2) => migrate_v2_to_v3(&mut value).map_err(|error| {
                 super::HandoffError::Corrupt(format!(
-                    "{} is a schema 1 handoff ledger and could not be read as schema 2 ({error}). Delete it, or rewrite fetches so each record is kept for its sender and URL, then set schema_version to 2.",
+                    "{} is a schema 2 handoff ledger and could not be read as schema 3 ({error}). Delete it, or add recorded_via to each fetch and handoff, then set schema_version to 3.",
                     path.display()
                 ))
             })?,
+            Some(1) => {
+                migrate_v1_fetches(&mut value).map_err(|error| {
+                    super::HandoffError::Corrupt(format!(
+                        "{} is a schema 1 handoff ledger and could not be read as schema 3 ({error}). Delete it, or rewrite fetches so each record is kept for its sender and URL, then set schema_version to 3.",
+                        path.display()
+                    ))
+                })?;
+                migrate_v2_to_v3(&mut value).map_err(|error| {
+                    super::HandoffError::Corrupt(format!(
+                        "{} migrated from schema 1 but could not be stamped as schema 3 ({error}).",
+                        path.display()
+                    ))
+                })?;
+            }
             Some(other) => {
                 return Err(super::HandoffError::Corrupt(format!(
-                    "handoff ledger schema is {other}; this Impulse reads schema 2. Delete {} or rewrite it as schema 2 with one fetch record per sender and URL.",
+                    "handoff ledger schema is {other}; this Impulse reads schema 3. Delete {} or rewrite it as schema 3 with one fetch record per sender and URL and a recorded_via stamp.",
                     path.display()
                 )));
             }
             None => {
                 return Err(super::HandoffError::Corrupt(format!(
-                    "{} has no schema_version. This Impulse reads schema 2. Delete the file, or set schema_version to 2 after keying fetches by sender and URL.",
+                    "{} has no schema_version. This Impulse reads schema 3. Delete the file, or set schema_version to 3 after keying fetches by sender and URL and adding recorded_via.",
                     path.display()
                 )));
             }
@@ -364,8 +401,59 @@ fn migrate_v1_fetches(value: &mut Value) -> Result<(), String> {
     let Some(object) = value.as_object_mut() else {
         return Err("schema 1 ledger must be a JSON object".into());
     };
-    object.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    object.insert("schema_version".into(), json!(2));
     object.insert("fetches".into(), Value::Object(nested));
+    Ok(())
+}
+
+/// Schema 2 rows have no session stamp. Schema 3 adds `recorded_via` and
+/// leaves `session_id` null so a later sessioned submit does not inherit
+/// an unstamped fetch.
+fn migrate_v2_to_v3(value: &mut Value) -> Result<(), String> {
+    let Some(object) = value.as_object_mut() else {
+        return Err("schema 2 ledger must be a JSON object".into());
+    };
+    stamp_recorded_via(object.get_mut("fetches"), true)?;
+    stamp_recorded_via(object.get_mut("handoffs"), false)?;
+    object.insert("schema_version".into(), json!(SCHEMA_VERSION));
+    Ok(())
+}
+
+fn stamp_recorded_via(section: Option<&mut Value>, nested_by_url: bool) -> Result<(), String> {
+    let Some(section) = section else {
+        return Ok(());
+    };
+    let Some(map) = section.as_object_mut() else {
+        return Err("ledger section must be an object".into());
+    };
+    for (key, entry) in map.iter_mut() {
+        if nested_by_url {
+            let Some(by_url) = entry.as_object_mut() else {
+                return Err(format!("schema 2 fetches for `{key}` must be an object"));
+            };
+            for (url, record) in by_url.iter_mut() {
+                insert_unrecorded(record).map_err(|error| format!("fetch `{url}`: {error}"))?;
+            }
+        } else {
+            insert_unrecorded(entry).map_err(|error| format!("handoff `{key}`: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_unrecorded(value: &mut Value) -> Result<(), String> {
+    let Some(object) = value.as_object_mut() else {
+        return Err("record must be a JSON object".into());
+    };
+    if !object.contains_key("recorded_via") {
+        object.insert(
+            "recorded_via".into(),
+            json!({
+                "execution_origin": "unrecorded",
+                "session_id": null
+            }),
+        );
+    }
     Ok(())
 }
 
@@ -379,6 +467,7 @@ pub(crate) fn handoff_snapshot(handoff: &StoredHandoff) -> Value {
         "phase": handoff.phase,
         "claims": handoff.claims,
         "updated_at": handoff.updated_at,
+        "recorded_via": handoff.recorded_via,
     })
 }
 
@@ -497,6 +586,7 @@ pub(crate) fn stale_write_failure(
     GateFailure {
         target: artifact_id.to_string(),
         check: CheckKind::StaleRead,
+        field: Some("based_on_generation".to_string()),
         fix: format!(
             "refusing write of `{artifact_id}` by `{writer}`: this write is based on generation {based_on}, and {read_label}. `{}` wrote generation {} at {} ({minute_label} before this write). Re-read `{artifact_id}` and write against generation {}.",
             artifact.last_writer,
@@ -529,8 +619,9 @@ pub(crate) fn refuse_missing_artifact(
         vec![GateFailure {
             target: artifact_id.to_string(),
             check: CheckKind::ArtifactExists,
+            field: Some("artifact_id".to_string()),
             fix: format!(
-                "shared artifact `{artifact_id}` does not exist. Create it with action `write_shared` and `based_on_generation` 0."
+                "payload.artifact_id `{artifact_id}` does not exist. Create it with action `write_shared` and `based_on_generation` 0."
             ),
         }],
         NextStep {
