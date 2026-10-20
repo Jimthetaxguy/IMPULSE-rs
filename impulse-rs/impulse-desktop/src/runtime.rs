@@ -608,6 +608,7 @@ impl Drop for DesktopRuntimeInner {
                     GovernedTaskMutation::MarkRuntimeExited {
                         actor: governed_system_actor("desktop-runtime"),
                         reason: Some("desktop runtime shut down".to_string()),
+                        exit_kind: Default::default(),
                     },
                 ) {
                     eprintln!(
@@ -1055,6 +1056,7 @@ impl DesktopRuntime {
                     GovernedTaskMutation::MarkRuntimeExited {
                         actor: governed_system_actor("desktop-runtime"),
                         reason: None,
+                        exit_kind: Default::default(),
                     },
                 ) {
                     eprintln!(
@@ -1527,6 +1529,7 @@ impl DesktopRuntime {
                     GovernedTaskMutation::MarkRuntimeExited {
                         actor: governed_system_actor("desktop-runtime"),
                         reason: Some("operator closed runtime".to_string()),
+                        exit_kind: impulse_ops::governed_task::GovernedExitKind::OperatorCancelled,
                     },
                 )
                 .err()
@@ -2525,6 +2528,7 @@ fn record_launch_abort_bound(
                 GovernedTaskMutation::MarkRuntimeExited {
                     actor: governed_system_actor("desktop-runtime"),
                     reason: Some(reason.to_string()),
+                    exit_kind: Default::default(),
                 },
             )
             .map_err(|exit_error| {
@@ -2976,6 +2980,7 @@ mod tests {
                 staged_worktree: None,
                 promotions: vec![],
                 execution_state: GovernedExecutionState::Registered,
+                exit_kind: Default::default(),
                 review_state: GovernedReviewState::AwaitingClaim,
                 claims: Vec::new(),
                 verifications: Vec::new(),
@@ -3024,11 +3029,12 @@ mod tests {
                     }
                     task.execution_state = GovernedExecutionState::LaunchFailed;
                 }
-                GovernedTaskMutation::MarkRuntimeExited { .. } => {
+                GovernedTaskMutation::MarkRuntimeExited { exit_kind, .. } => {
                     if task.execution_state != GovernedExecutionState::Running {
                         return Err("invalid runtime-exit transition".to_string());
                     }
                     task.execution_state = GovernedExecutionState::RuntimeExited;
+                    task.exit_kind = exit_kind;
                 }
                 _ => return Err("unsupported test mutation".to_string()),
             }

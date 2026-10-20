@@ -77,6 +77,7 @@ fn task_snapshot_keeps_execution_and_review_state_independent() {
         staged_worktree: None,
         promotions: vec![],
         execution_state: GovernedExecutionState::RuntimeExited,
+        exit_kind: Default::default(),
         review_state: GovernedReviewState::AwaitingOperator,
         claims: vec![],
         verifications: vec![],

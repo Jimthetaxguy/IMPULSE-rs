@@ -59,7 +59,11 @@ fn report(name: &str, runs: &[&Run]) -> Report {
         name: name.to_string(),
         tasks: runs.len(),
         passes,
-        pass_rate: if runs.is_empty() { 0.0 } else { passes as f64 / runs.len() as f64 },
+        pass_rate: if runs.is_empty() {
+            0.0
+        } else {
+            passes as f64 / runs.len() as f64
+        },
         cost_per_success: (passes > 0).then(|| cost / passes as f64),
         p50_ms: pct(&lat, 0.50),
         p95_ms: pct(&lat, 0.95),
@@ -81,7 +85,9 @@ fn best_fixed<'a>(train: impl Iterator<Item = &'a Run>) -> Option<String> {
         .max_by(|a, b| {
             let ra = a.1 .1 as f64 / a.1 .0 as f64;
             let rb = b.1 .1 as f64 / b.1 .0 as f64;
-            ra.total_cmp(&rb).then(b.1 .2.total_cmp(&a.1 .2)).then(b.0.cmp(a.0))
+            ra.total_cmp(&rb)
+                .then(b.1 .2.total_cmp(&a.1 .2))
+                .then(b.0.cmp(a.0))
         })
         .map(|(m, _)| m.to_string())
 }
@@ -94,9 +100,8 @@ fn evaluate(runs: &[Run]) -> (Vec<Report>, Vec<String>) {
     let pick = |policy: &str| -> Vec<&Run> {
         let mut out = Vec::new();
         for t in &test_tasks {
-            match test.iter().find(|r| r.task_id == *t && r.policy == policy) {
-                Some(r) => out.push(*r),
-                None => {}
+            if let Some(r) = test.iter().find(|r| r.task_id == *t && r.policy == policy) {
+                out.push(*r);
             }
         }
         out
@@ -106,7 +111,10 @@ fn evaluate(runs: &[Run]) -> (Vec<Report>, Vec<String>) {
 
     let global = best_fixed(train.iter().copied());
     match &global {
-        Some(m) => reports.push(report(&format!("single best fixed ({m}, fitted on train)"), &pick(&format!("fixed:{m}")))),
+        Some(m) => reports.push(report(
+            &format!("single best fixed ({m}, fitted on train)"),
+            &pick(&format!("fixed:{m}")),
+        )),
         None => notes.push("no fixed-model train runs: single best fixed not reported".into()),
     }
 
@@ -114,33 +122,69 @@ fn evaluate(runs: &[Run]) -> (Vec<Report>, Vec<String>) {
     // category, using the best fixed model for that category on train.
     let mut start = Vec::new();
     for t in &test_tasks {
-        let cat = test.iter().find(|r| r.task_id == *t).map(|r| r.category.as_str()).unwrap_or("");
-        let m = best_fixed(train.iter().copied().filter(|r| r.category == cat)).or_else(|| global.clone());
+        let cat = test
+            .iter()
+            .find(|r| r.task_id == *t)
+            .map(|r| r.category.as_str())
+            .unwrap_or("");
+        let m = best_fixed(train.iter().copied().filter(|r| r.category == cat))
+            .or_else(|| global.clone());
         if let Some(m) = m {
-            if let Some(r) = test.iter().find(|r| r.task_id == *t && r.policy == format!("fixed:{m}")) {
+            if let Some(r) = test
+                .iter()
+                .find(|r| r.task_id == *t && r.policy == format!("fixed:{m}"))
+            {
                 start.push(*r);
             }
         }
     }
-    reports.push(report("choose-at-start (by category, fitted on train)", &start));
+    reports.push(report(
+        "choose-at-start (by category, fitted on train)",
+        &start,
+    ));
 
     for r in &reports {
         if r.tasks < test_tasks.len() {
-            notes.push(format!("{}: {} of {} test tasks have a matching run", r.name, r.tasks, test_tasks.len()));
+            notes.push(format!(
+                "{}: {} of {} test tasks have a matching run",
+                r.name,
+                r.tasks,
+                test_tasks.len()
+            ));
         }
     }
     (reports, notes)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::args().nth(1).ok_or("usage: selector_baselines <runs.jsonl>")?;
+    let path = std::env::args()
+        .nth(1)
+        .ok_or("usage: selector_baselines <runs.jsonl>")?;
     let text = std::fs::read_to_string(path)?;
-    let runs: Vec<Run> = text.lines().filter(|l| !l.trim().is_empty()).map(serde_json::from_str).collect::<Result<_, _>>()?;
+    let runs: Vec<Run> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
     let (reports, notes) = evaluate(&runs);
-    println!("{:<52}{:>7}{:>9}{:>14}{:>10}{:>10}", "policy (test split only)", "tasks", "pass", "$/success", "p50 ms", "p95 ms");
+    println!(
+        "{:<52}{:>7}{:>9}{:>14}{:>10}{:>10}",
+        "policy (test split only)", "tasks", "pass", "$/success", "p50 ms", "p95 ms"
+    );
     for r in reports {
-        let cps = r.cost_per_success.map(|c| format!("{c:.4}")).unwrap_or_else(|| "n/a".into());
-        println!("{:<52}{:>7}{:>8.1}%{:>14}{:>10.0}{:>10.0}", r.name, r.tasks, 100.0 * r.pass_rate, cps, r.p50_ms, r.p95_ms);
+        let cps = r
+            .cost_per_success
+            .map(|c| format!("{c:.4}"))
+            .unwrap_or_else(|| "n/a".into());
+        println!(
+            "{:<52}{:>7}{:>8.1}%{:>14}{:>10.0}{:>10.0}",
+            r.name,
+            r.tasks,
+            100.0 * r.pass_rate,
+            cps,
+            r.p50_ms,
+            r.p95_ms
+        );
     }
     for n in notes {
         println!("note: {n}");
@@ -153,8 +197,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    fn run(task: &str, split: &str, cat: &str, policy: &str, pass: bool, cost: f64, lat: f64) -> Run {
-        Run { task_id: task.into(), split: split.into(), category: cat.into(), policy: policy.into(), pass, cost_usd: cost, latency_ms: lat }
+    fn run(
+        task: &str,
+        split: &str,
+        cat: &str,
+        policy: &str,
+        pass: bool,
+        cost: f64,
+        lat: f64,
+    ) -> Run {
+        Run {
+            task_id: task.into(),
+            split: split.into(),
+            category: cat.into(),
+            policy: policy.into(),
+            pass,
+            cost_usd: cost,
+            latency_ms: lat,
+        }
     }
 
     fn data() -> Vec<Run> {
@@ -179,7 +239,10 @@ mod tests {
     #[test]
     fn fixed_policy_is_fitted_on_train_only() {
         let d = data();
-        assert_eq!(best_fixed(d.iter().filter(|r| r.split == "train")), Some("sonnet".into()));
+        assert_eq!(
+            best_fixed(d.iter().filter(|r| r.split == "train")),
+            Some("sonnet".into())
+        );
     }
 
     #[test]
