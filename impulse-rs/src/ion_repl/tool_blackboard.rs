@@ -748,6 +748,7 @@ mod tests {
 
     fn assert_validates(spilled: &ClaimSpill) {
         let request = impulse_ops::governed_task::GovernedClaimRequest {
+            fencing_generation: None,
             request_id: impulse_ops::governed_task::GovernedRequestId::try_new("r-1")
                 .expect("request id"),
             project_id: "p".to_string(),

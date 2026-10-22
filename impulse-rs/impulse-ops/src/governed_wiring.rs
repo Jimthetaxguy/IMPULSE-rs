@@ -34,6 +34,12 @@ pub struct GovernedPromotionRequest {
     pub project_id: String,
     pub task_id: GovernedTaskId,
     pub expected_revision: u64,
+    /// Fencing generation the caller holds (see
+    /// [`crate::governed_task::GovernedTaskRun::fencing_generation`]). Omitted by callers that predate
+    /// fencing, which are admitted unchanged; a stale value is refused with
+    /// [`crate::governed_task::GovernedFencedError`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fencing_generation: Option<u64>,
 }
 
 /// Trigger for the daemon-owned staged-worktree discard producer (ADR-0019).
@@ -464,6 +470,7 @@ mod tests {
 
     fn promotion_request() -> GovernedPromotionRequest {
         GovernedPromotionRequest {
+            fencing_generation: None,
             request_id: GovernedRequestId::try_new("promote-1").unwrap(),
             project_id: "demo".to_string(),
             task_id: GovernedTaskId::try_new("task-wiring").unwrap(),

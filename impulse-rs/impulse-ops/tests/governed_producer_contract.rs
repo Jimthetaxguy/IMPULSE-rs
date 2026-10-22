@@ -180,6 +180,7 @@ fn profiled_registration_requires_the_canonical_builder_contract() {
 #[test]
 fn producer_triggers_exclude_derived_truth_fields() {
     let claim = GovernedClaimRequest {
+        fencing_generation: None,
         request_id: request_id("claim-request"),
         project_id: "project".to_string(),
         task_id: task_id(),
@@ -193,6 +194,7 @@ fn producer_triggers_exclude_derived_truth_fields() {
     assert!(claim_json.get("diff_ref").is_none());
 
     let verify = GovernedVerificationRequest {
+        fencing_generation: None,
         request_id: request_id("verify-request"),
         project_id: "project".to_string(),
         task_id: task_id(),
@@ -203,6 +205,7 @@ fn producer_triggers_exclude_derived_truth_fields() {
     assert!(verify_json.get("verification").is_none());
 
     let review = GovernedSupervisorReviewRequest {
+        fencing_generation: None,
         request_id: request_id("review-request"),
         project_id: "project".to_string(),
         task_id: task_id(),

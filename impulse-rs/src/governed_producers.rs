@@ -3688,6 +3688,7 @@ mod tests {
         });
 
         let request = GovernedClaimRequest {
+            fencing_generation: None,
             request_id: impulse_ops::governed_task::GovernedRequestId::try_new("req-1").unwrap(),
             project_id: registered.project_id.clone(),
             task_id: registered.id.clone(),
@@ -3794,6 +3795,7 @@ mod tests {
         assert_ne!(builder_commit, initial);
 
         let request = GovernedClaimRequest {
+            fencing_generation: None,
             request_id: impulse_ops::governed_task::GovernedRequestId::try_new("req-verify")
                 .unwrap(),
             project_id: registered.project_id.clone(),
@@ -3876,6 +3878,7 @@ mod tests {
         assert!(message.contains("staged_authoritative"), "{message}");
 
         let request = GovernedClaimRequest {
+            fencing_generation: None,
             request_id: impulse_ops::governed_task::GovernedRequestId::try_new("req-none").unwrap(),
             project_id: registered.project_id.clone(),
             task_id: registered.id.clone(),
@@ -4061,6 +4064,7 @@ mod tests {
 
     fn claim_request(task: &GovernedTaskRun, request_id: &str) -> GovernedClaimRequest {
         GovernedClaimRequest {
+            fencing_generation: None,
             request_id: impulse_ops::governed_task::GovernedRequestId::try_new(request_id).unwrap(),
             project_id: task.project_id.clone(),
             task_id: task.id.clone(),

@@ -127,6 +127,12 @@ async fn submit_claim(
     artifact_ids: Vec<String>,
 ) -> Result<ToolOutcome> {
     let request = impulse_ops::governed_task::GovernedClaimRequest {
+        fencing_generation: impulse_ops::governed_task::parse_fencing_generation(
+            std::env::var(impulse_ops::governed_task::GOVERNED_FENCING_GENERATION_ENV)
+                .ok()
+                .as_deref(),
+        )
+        .context("invalid governed fencing generation in launch environment")?,
         request_id: impulse_ops::governed_task::GovernedRequestId::try_new(format!(
             "ion-claim-{}",
             uuid::Uuid::new_v4()

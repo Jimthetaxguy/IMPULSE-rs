@@ -2884,6 +2884,12 @@ fn runtime_env(
     if let Some(task) = governed_task {
         env.push(("IMPULSE_GOVERNED_TASK_ID", task.id.to_string()));
         env.push(("IMPULSE_PROJECT_ID", task.project_id.clone()));
+        // The generation this runtime will hold once its launch is
+        // acknowledged; worker-side clients echo it so a stale worker is fenced.
+        env.push((
+            impulse_ops::governed_task::GOVERNED_FENCING_GENERATION_ENV,
+            task.launch_fencing_generation().to_string(),
+        ));
         if let Some(profile) = task.verification_profile {
             let profile = match profile {
                 GovernedVerificationProfile::RustWorkspaceV1 => "rust_workspace_v1",
@@ -4496,6 +4502,7 @@ mod tests {
             .clone()
             .unwrap();
         let request = GovernedPromotionRequest {
+            fencing_generation: None,
             request_id: impulse_ops::governed_task::GovernedRequestId::try_new("refusal-cache")
                 .unwrap(),
             project_id: task.project_id.clone(),

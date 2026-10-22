@@ -981,6 +981,7 @@ mod tests {
         assert_shared_request_compatible(
             impulse_ops::WorkbenchDaemonRequest::SubmitGovernedClaim {
                 request: impulse_ops::governed_task::GovernedClaimRequest {
+                    fencing_generation: None,
                     request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
                         "request-claim",
                     )
@@ -996,6 +997,7 @@ mod tests {
         assert_shared_request_compatible(
             impulse_ops::WorkbenchDaemonRequest::RunGovernedVerification {
                 request: impulse_ops::governed_task::GovernedVerificationRequest {
+                    fencing_generation: None,
                     request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
                         "request-verify",
                     )
@@ -1009,6 +1011,7 @@ mod tests {
         assert_shared_request_compatible(
             impulse_ops::WorkbenchDaemonRequest::RunGovernedSupervisorReview {
                 request: impulse_ops::governed_task::GovernedSupervisorReviewRequest {
+                    fencing_generation: None,
                     request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
                         "request-review",
                     )
@@ -1022,6 +1025,7 @@ mod tests {
         assert_shared_request_compatible(
             impulse_ops::WorkbenchDaemonRequest::PromoteGovernedOutcome {
                 request: impulse_ops::governed_wiring::GovernedPromotionRequest {
+                    fencing_generation: None,
                     request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
                         "request-promote",
                     )

@@ -3718,6 +3718,7 @@ fn test_staged_control_bridge_scripts_target_the_installed_bridge_entry_points()
 
     let promote =
         governed_promotion_bridge_script(&impulse_ops::governed_wiring::GovernedPromotionRequest {
+            fencing_generation: None,
             request_id: gt::GovernedRequestId::try_new("ui-promote-1").expect("request id"),
             project_id: "impulse-rs".to_string(),
             task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),

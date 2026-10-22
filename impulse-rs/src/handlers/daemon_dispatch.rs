@@ -225,6 +225,15 @@ fn governed_coordinate(
         })
 }
 
+/// The fencing generation this process holds, when it runs inside a governed
+/// runtime that was launched with one (blueprint 2.1). Echoed on worker-side
+/// requests so a stale worker is refused with a typed `Fenced` error.
+fn launch_fencing_generation() -> Result<Option<u64>> {
+    let value = std::env::var(impulse_ops::governed_task::GOVERNED_FENCING_GENERATION_ENV).ok();
+    impulse_ops::governed_task::parse_fencing_generation(value.as_deref())
+        .context("invalid governed fencing generation in the launch environment")
+}
+
 fn governed_request_id(prefix: &str) -> impulse_ops::governed_task::GovernedRequestId {
     impulse_ops::governed_task::GovernedRequestId::try_new(format!(
         "{prefix}-{}",
@@ -280,6 +289,7 @@ async fn handle_governed_claim(
     let (project_id, task_id, task) = current_governed_task(client, project_id, task_id).await?;
     let acknowledged = client
         .submit_governed_claim(impulse_ops::governed_task::GovernedClaimRequest {
+            fencing_generation: launch_fencing_generation()?,
             request_id: governed_request_id("claim"),
             project_id,
             task_id,
@@ -330,6 +340,7 @@ async fn handle_governed_verify(
     let (project_id, task_id, task) = current_governed_task(client, project_id, task_id).await?;
     let acknowledged = client
         .run_governed_verification(impulse_ops::governed_task::GovernedVerificationRequest {
+            fencing_generation: launch_fencing_generation()?,
             request_id: governed_request_id("verify"),
             project_id,
             task_id,
@@ -356,6 +367,7 @@ async fn handle_governed_review(
     let acknowledged = client
         .run_governed_supervisor_review(
             impulse_ops::governed_task::GovernedSupervisorReviewRequest {
+                fencing_generation: launch_fencing_generation()?,
                 request_id: governed_request_id("review"),
                 project_id,
                 task_id,
@@ -397,6 +409,7 @@ async fn handle_governed_promote(
     let (project_id, task_id, task) = current_governed_task(client, project_id, task_id).await?;
     let acknowledged = match client
         .promote_governed_outcome(impulse_ops::governed_wiring::GovernedPromotionRequest {
+            fencing_generation: None,
             request_id: governed_request_id("promote"),
             project_id,
             task_id,

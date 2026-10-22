@@ -307,6 +307,7 @@ async fn a_builder_socket_can_neither_promote_nor_discard() {
         vec![
             DaemonRequest::PromoteGovernedOutcome {
                 request: GovernedPromotionRequest {
+                    fencing_generation: None,
                     request_id: request_id("builder-promote"),
                     project_id: project_id.clone(),
                     task_id: registered.id.clone(),
@@ -359,6 +360,7 @@ async fn an_unknown_task_id_is_refused_before_any_side_effect() {
 
     let error = client
         .promote_governed_outcome(GovernedPromotionRequest {
+            fencing_generation: None,
             request_id: request_id("promote-missing"),
             project_id: project_id.clone(),
             task_id: GovernedTaskId::try_new("task-does-not-exist").unwrap(),

@@ -3245,6 +3245,7 @@ mod unix {
             let client = UnixDaemonOpsClient::new(socket);
             let acknowledged = client
                 .promote_outcome(impulse_ops::governed_wiring::GovernedPromotionRequest {
+                    fencing_generation: None,
                     request_id: gt::GovernedRequestId::try_new("ui-promote-1").expect("request id"),
                     project_id: "project".to_string(),
                     task_id: blocked.id.clone(),
@@ -3358,6 +3359,7 @@ mod unix {
                     .build();
                 let result = runtime.promote_governed_outcome(
                     impulse_ops::governed_wiring::GovernedPromotionRequest {
+                        fencing_generation: None,
                         request_id: impulse_ops::governed_task::GovernedRequestId::try_new(
                             "promote-refusal",
                         )
@@ -3508,6 +3510,7 @@ mod unix {
 
             let promote = WorkbenchDaemonRequest::PromoteGovernedOutcome {
                 request: impulse_ops::governed_wiring::GovernedPromotionRequest {
+                    fencing_generation: None,
                     request_id: gt::GovernedRequestId::try_new("promote").expect("request id"),
                     project_id: "project".to_string(),
                     task_id: gt::GovernedTaskId::try_new("staged-task").expect("task id"),

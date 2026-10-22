@@ -1141,6 +1141,7 @@ pub(super) fn require_producer_request_state(
     task: &impulse_ops::governed_task::GovernedTaskRun,
     request_id: &impulse_ops::governed_task::GovernedRequestId,
     expected_revision: u64,
+    fencing_generation: Option<u64>,
 ) -> Result<bool> {
     let replay = state.governed_producer_request_is_replay(request_id, &task.id)?;
     if replay {
@@ -1149,8 +1150,17 @@ pub(super) fn require_producer_request_state(
                 "governed producer replay receipt does not advance beyond expected revision {expected_revision}"
             );
         }
+        // A replay answers from a receipt that was written while the caller
+        // still held the task, so it is not re-fenced: nothing new is written.
         return Ok(true);
     }
+    // Fencing runs before the revision check so a stale worker that re-read
+    // the revision is still told the real reason: the task changed hands
+    // (blueprint 2.1). The typed `GovernedFencedError` stays downcastable.
+    // The final persist is a compare-and-swap on `expected_revision`, and
+    // every fence-advancing transition bumps the revision, so this check and
+    // the write cannot be split by a concurrent takeover.
+    task.require_fencing_generation(fencing_generation)?;
     if task.revision != expected_revision {
         anyhow::bail!(
             "governed task revision conflict: expected {expected_revision}, current {}",
@@ -1323,6 +1333,7 @@ pub(crate) async fn handle_governed_producer_request(
                     &task,
                     &request.request_id,
                     request.expected_revision,
+                    request.fencing_generation,
                 )?;
                 let claim = if replay {
                     replay_claim_input(&task, &request)?
@@ -3119,6 +3130,7 @@ mod governed_producer_handler_tests {
         assert!(error_from_response(fabricated).contains("daemon-owned"));
 
         let claim_request = GovernedClaimRequest {
+            fencing_generation: None,
             request_id: request_id("claim-producer-flow"),
             project_id: project_id.clone(),
             task_id: running.id.clone(),
@@ -3228,6 +3240,7 @@ mod governed_producer_handler_tests {
         std::fs::remove_file(repo.path().join("dirty.txt")).unwrap();
 
         let verification_request = GovernedVerificationRequest {
+            fencing_generation: None,
             request_id: request_id("verify-producer-flow"),
             project_id: project_id.clone(),
             task_id: claimed.id.clone(),
@@ -3285,6 +3298,7 @@ mod governed_producer_handler_tests {
         let invalid_repeat = handle_governed_producer_request(
             DaemonRequest::RunGovernedVerification {
                 request: GovernedVerificationRequest {
+                    fencing_generation: None,
                     request_id: request_id("verify-invalid-repeat"),
                     project_id: project_id.clone(),
                     task_id: verified.id.clone(),
@@ -3336,6 +3350,7 @@ mod governed_producer_handler_tests {
         ));
         let permissions = Arc::new(tokio::sync::RwLock::new(None));
         let review_request = GovernedSupervisorReviewRequest {
+            fencing_generation: None,
             request_id: request_id("review-producer-flow"),
             project_id: project_id.clone(),
             task_id: verified.id.clone(),
@@ -3459,6 +3474,7 @@ mod governed_producer_handler_tests {
             .expect("fixture task deserializes");
         assert!(task.active_staged_worktree().is_none());
         let request = GovernedClaimRequest {
+            fencing_generation: None,
             request_id: GovernedRequestId::try_new("claim-after-discard").unwrap(),
             project_id: "impulse-test".into(),
             task_id: task.id.clone(),

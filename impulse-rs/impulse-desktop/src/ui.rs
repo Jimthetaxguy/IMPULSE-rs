@@ -2707,6 +2707,7 @@ pub fn staged_config_refusal_notice(
 
 fn promotion_request(task: &GovernedTaskRun) -> Option<GovernedPromotionRequest> {
     Some(GovernedPromotionRequest {
+        fencing_generation: None,
         request_id: GovernedRequestId::try_new(format!("ui-promote-{}", uuid::Uuid::new_v4()))
             .ok()?,
         project_id: task.project_id.clone(),

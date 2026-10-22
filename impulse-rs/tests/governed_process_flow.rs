@@ -328,6 +328,7 @@ async fn real_daemon_builder_cli_verification_and_restart_preserve_evidence() {
 
     let review_error = client
         .run_governed_supervisor_review(GovernedSupervisorReviewRequest {
+            fencing_generation: None,
             request_id: request_id("process-supervisor-review"),
             project_id: project_id.clone(),
             task_id: verified.id.clone(),

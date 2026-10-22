@@ -393,6 +393,7 @@ async fn promote_governed_outcome(
         &task,
         &request.request_id,
         request.expected_revision,
+        request.fencing_generation,
     )?;
     if replay {
         // The receipt already exists: answer from it rather than touching Git
@@ -451,6 +452,7 @@ async fn discard_governed_staged_worktree(
         &task,
         &request.request_id,
         request.expected_revision,
+        None,
     )?;
     let staged_root = task
         .staged_worktree
@@ -648,6 +650,7 @@ async fn run_governed_verification(
         &task,
         &request.request_id,
         request.expected_revision,
+        request.fencing_generation,
     )?;
     if replay {
         // A durable receipt already exists, so no reservation is taken and no
@@ -723,6 +726,7 @@ pub(crate) async fn handle_governed_supervisor_review(
         &task,
         &request.request_id,
         request.expected_revision,
+        request.fencing_generation,
     ) {
         Ok(replay) => replay,
         Err(error) => return respond_err(error),
@@ -1121,6 +1125,7 @@ mod tests {
 
     fn promotion_request(task: &GovernedTaskRun, id: &str) -> GovernedPromotionRequest {
         GovernedPromotionRequest {
+            fencing_generation: None,
             request_id: request_id(id),
             project_id: task.project_id.clone(),
             task_id: task.id.clone(),
@@ -1769,6 +1774,7 @@ mod tests {
         let response = super::super::handlers::handle_governed_producer_request(
             DaemonRequest::SubmitGovernedClaim {
                 request: impulse_ops::governed_task::GovernedClaimRequest {
+                    fencing_generation: None,
                     request_id: request_id("refusal-claim"),
                     project_id: project_id.clone(),
                     task_id: running.id.clone(),
@@ -1855,6 +1861,7 @@ mod tests {
             super::super::handlers::handle_governed_producer_request(
                 DaemonRequest::SubmitGovernedClaim {
                     request: impulse_ops::governed_task::GovernedClaimRequest {
+                        fencing_generation: None,
                         request_id: request_id("refusal-verify-claim"),
                         project_id: project_id.clone(),
                         task_id: running.id.clone(),
@@ -1878,6 +1885,7 @@ mod tests {
         let response = handle_governed_verification(
             &state,
             impulse_ops::governed_task::GovernedVerificationRequest {
+                fencing_generation: None,
                 request_id: request_id("refusal-verify"),
                 project_id: project_id.clone(),
                 task_id: claimed.id.clone(),
@@ -2356,6 +2364,7 @@ mod tests {
         let error = run_governed_verification(
             &state,
             GovernedVerificationRequest {
+                fencing_generation: None,
                 request_id: request_id("verify-duplicate"),
                 project_id: project_id.clone(),
                 task_id: claimed.id.clone(),
@@ -2425,6 +2434,7 @@ mod tests {
         let ack = run_governed_verification(
             &state,
             GovernedVerificationRequest {
+                fencing_generation: None,
                 request_id: replayed_request,
                 project_id: project_id.clone(),
                 task_id: reloaded.id.clone(),
@@ -2515,6 +2525,7 @@ mod tests {
         let ack = run_governed_verification(
             &state,
             GovernedVerificationRequest {
+                fencing_generation: None,
                 request_id: lost_request.clone(),
                 project_id: project_id.clone(),
                 task_id: reloaded.id.clone(),
@@ -2539,6 +2550,141 @@ mod tests {
         );
     }
 
+    // ── Fencing generation (blueprint 2.1 "stale worker") ───────────────────
+
+    /// A staged Builder launched at generation N keeps a worker token. Once
+    /// the daemon has moved the fence (here: the token predates the launch
+    /// that minted the current holder), a claim carrying the old generation is
+    /// refused with the typed `Fenced` error even though it presents the
+    /// current revision, and nothing is recorded. The current holder's claim,
+    /// sent with the generation the launcher handed it, is admitted.
+    #[tokio::test]
+    async fn a_stale_worker_claim_is_fenced_and_the_current_holder_is_admitted() {
+        let (repo, state, project_id, oid) = repo_state();
+        let registered = register_governed_task(
+            &state,
+            registration(
+                &project_id,
+                repo.path(),
+                &oid,
+                WorldScope::StagedAuthoritative,
+            ),
+            ConnectionClass::Operator,
+        )
+        .unwrap();
+        // What the launcher put in the runtime's environment before launch.
+        let launched_generation = registered.launch_fencing_generation();
+        // A token from before the current holder was launched.
+        let stale_generation = registered.fencing_generation();
+        let staged_root = registered.active_staged_worktree().unwrap().root.clone();
+        let staged = Path::new(&staged_root);
+        let running = mutate(
+            &state,
+            &registered,
+            "fence-running",
+            GovernedTaskMutation::MarkRunning {
+                actor: staged_system_actor(),
+            },
+        );
+        assert_eq!(running.fencing_generation(), launched_generation);
+        std::fs::write(
+            staged.join("src/lib.rs"),
+            "pub fn wiring_fixture() -> u8 {\n    1\n}\n",
+        )
+        .unwrap();
+        git(staged, &["add", "src/lib.rs"]);
+        git(staged, &["commit", "--quiet", "-m", "builder work"]);
+
+        let claim = |id: &str, generation: u64| DaemonRequest::SubmitGovernedClaim {
+            request: impulse_ops::governed_task::GovernedClaimRequest {
+                fencing_generation: Some(generation),
+                request_id: request_id(id),
+                project_id: project_id.clone(),
+                task_id: running.id.clone(),
+                expected_revision: running.revision,
+                summary: "work complete".to_string(),
+                artifact_ids: Vec::new(),
+            },
+        };
+
+        let response = super::super::handlers::handle_governed_producer_request(
+            claim("fence-stale-claim", stale_generation),
+            &state,
+        )
+        .await;
+        match response {
+            DaemonResponse::Error { message } => assert!(
+                message.starts_with("fenced: "),
+                "expected a typed Fenced refusal, received {message}"
+            ),
+            other => panic!("a stale worker must be fenced, received {other:?}"),
+        }
+        let unchanged = state
+            .get_governed_task(&project_id, &running.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.revision, running.revision);
+        assert!(
+            unchanged.claims.is_empty(),
+            "a fenced claim records nothing"
+        );
+
+        let claimed = task_from_producer_response(
+            super::super::handlers::handle_governed_producer_request(
+                claim("fence-current-claim", launched_generation),
+                &state,
+            )
+            .await,
+        );
+        assert_eq!(
+            claimed.review_state,
+            GovernedReviewState::AwaitingVerification
+        );
+    }
+
+    /// Daemon-owned producers are fenced the same way, before any reservation
+    /// is taken or command run, and the error stays a downcastable type.
+    #[tokio::test]
+    async fn a_verification_presenting_a_stale_generation_is_fenced_before_it_runs() {
+        let (repo, state, project_id, oid) = repo_state();
+        let claimed = awaiting_verification(&state, repo.path(), &project_id, &oid);
+        let stale = claimed.fencing_generation() + 1;
+        let error = run_governed_verification(
+            &state,
+            GovernedVerificationRequest {
+                fencing_generation: Some(stale),
+                request_id: request_id("verify-fenced"),
+                project_id: project_id.clone(),
+                task_id: claimed.id.clone(),
+                expected_revision: claimed.revision,
+            },
+        )
+        .await
+        .unwrap_err();
+        let fenced = error
+            .downcast_ref::<impulse_ops::governed_task::GovernedFencedError>()
+            .expect("the refusal is the typed Fenced error");
+        assert_eq!(fenced.presented, stale);
+        assert_eq!(fenced.current, claimed.fencing_generation());
+        assert!(
+            state
+                .latest_reservation(
+                    &claimed.id,
+                    ProducerKind::Verification,
+                    &request_id("verify-fenced")
+                )
+                .unwrap()
+                .is_none(),
+            "no reservation is taken for a fenced request"
+        );
+        let unchanged = state
+            .get_governed_task(&project_id, &claimed.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.revision, claimed.revision);
+        assert!(unchanged.verifications.is_empty());
+    }
+
     #[tokio::test]
     async fn a_fresh_verification_reports_no_pending_rerun() {
         let (repo, state, project_id, oid) = repo_state();
@@ -2546,6 +2692,7 @@ mod tests {
         let ack = run_governed_verification(
             &state,
             GovernedVerificationRequest {
+                fencing_generation: None,
                 request_id: request_id("verify-fresh"),
                 project_id: project_id.clone(),
                 task_id: claimed.id.clone(),
@@ -2724,6 +2871,7 @@ mod tests {
             super::super::handlers::handle_governed_producer_request(
                 DaemonRequest::SubmitGovernedClaim {
                     request: impulse_ops::governed_task::GovernedClaimRequest {
+                        fencing_generation: None,
                         request_id: request_id("e2e-claim"),
                         project_id: project_id.clone(),
                         task_id: running.id.clone(),
@@ -2745,6 +2893,7 @@ mod tests {
         let verified = run_governed_verification(
             &state,
             impulse_ops::governed_task::GovernedVerificationRequest {
+                fencing_generation: None,
                 request_id: request_id("e2e-verify"),
                 project_id: project_id.clone(),
                 task_id: claimed.id.clone(),
@@ -2770,6 +2919,7 @@ mod tests {
         let judged: GovernedProducerAck = match handle_governed_supervisor_review(
             &state,
             impulse_ops::governed_task::GovernedSupervisorReviewRequest {
+                fencing_generation: None,
                 request_id: request_id("e2e-review"),
                 project_id: project_id.clone(),
                 task_id: verified.task.id.clone(),

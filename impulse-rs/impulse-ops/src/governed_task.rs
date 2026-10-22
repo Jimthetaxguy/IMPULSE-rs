@@ -1146,6 +1146,12 @@ pub struct GovernedClaimRequest {
     pub summary: String,
     #[serde(default)]
     pub artifact_ids: Vec<String>,
+    /// Fencing generation the caller holds (see
+    /// [`GovernedTaskRun::fencing_generation`]). Omitted by callers that predate
+    /// fencing, which are admitted unchanged; a stale value is refused with
+    /// [`GovernedFencedError`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fencing_generation: Option<u64>,
 }
 
 impl GovernedClaimRequest {
@@ -1173,6 +1179,12 @@ pub struct GovernedVerificationRequest {
     pub project_id: String,
     pub task_id: GovernedTaskId,
     pub expected_revision: u64,
+    /// Fencing generation the caller holds (see
+    /// [`GovernedTaskRun::fencing_generation`]). Omitted by callers that predate
+    /// fencing, which are admitted unchanged; a stale value is refused with
+    /// [`GovernedFencedError`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fencing_generation: Option<u64>,
 }
 
 /// Trigger for a daemon-launched Supervisor turn. The verdict payload is
@@ -1184,6 +1196,12 @@ pub struct GovernedSupervisorReviewRequest {
     pub project_id: String,
     pub task_id: GovernedTaskId,
     pub expected_revision: u64,
+    /// Fencing generation the caller holds (see
+    /// [`GovernedTaskRun::fencing_generation`]). Omitted by callers that predate
+    /// fencing, which are admitted unchanged; a stale value is refused with
+    /// [`GovernedFencedError`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fencing_generation: Option<u64>,
 }
 
 /// Strict response contract required from the launched Supervisor. Every
@@ -1259,6 +1277,24 @@ pub enum GovernedTaskEventKind {
     /// `review_state`.
     ProducerReservationInterrupted,
     PromotionRecorded,
+}
+
+impl GovernedTaskEventKind {
+    /// Whether this event moves the task's worker fence (blueprint 2.1,
+    /// "add `generation` to staged worktrees and governed producers").
+    ///
+    /// The fence moves whenever the daemon changes *who may write* for the
+    /// task: a staged worktree is materialized (a new disposable tree exists),
+    /// a runtime is launched into it (a worker now holds the task), or the
+    /// worktree is discarded (no worker may write any more). Every other
+    /// event is something a current holder may itself cause, so it leaves the
+    /// generation where it is.
+    pub fn advances_fencing_generation(self) -> bool {
+        matches!(
+            self,
+            Self::StagedWorktreeMaterialized | Self::Running | Self::StagedWorktreeDiscarded
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1358,6 +1394,55 @@ impl GovernedTaskRun {
         self.promotions.last()
     }
 
+    /// The task's current fencing generation.
+    ///
+    /// Derived from the event history rather than stored, so every ledger
+    /// written before fencing existed loads unchanged and replay cannot
+    /// disagree with it: the generation is the number of events that
+    /// [advance the fence](GovernedTaskEventKind::advances_fencing_generation).
+    /// It only ever rises, and only the daemon's own transitions raise it; no
+    /// worker request can.
+    pub fn fencing_generation(&self) -> u64 {
+        self.events
+            .iter()
+            .filter(|event| event.kind.advances_fencing_generation())
+            .count() as u64
+    }
+
+    /// The generation a runtime launched now will hold once its launch is
+    /// acknowledged (`MarkRunning` advances the fence by one). The launcher
+    /// hands this to the worker before the acknowledgement lands.
+    pub fn launch_fencing_generation(&self) -> u64 {
+        self.fencing_generation().saturating_add(1)
+    }
+
+    /// Refuse a request that presents a generation other than the current one.
+    ///
+    /// `None` is a caller that predates fencing (or an operator acting outside
+    /// any worker lease) and is admitted, exactly as before, so existing
+    /// clients keep working. A presented generation is the caller asserting
+    /// "I still hold the task as of generation N"; once the daemon has moved
+    /// the fence that assertion is stale, whatever revision the caller re-read
+    /// since.
+    pub fn require_fencing_generation(
+        &self,
+        presented: Option<u64>,
+    ) -> Result<(), GovernedFencedError> {
+        let Some(presented) = presented else {
+            return Ok(());
+        };
+        let current = self.fencing_generation();
+        if presented == current {
+            Ok(())
+        } else {
+            Err(GovernedFencedError {
+                task_id: self.id.as_str().to_string(),
+                presented,
+                current,
+            })
+        }
+    }
+
     /// The staged worktree while it is still usable, or `None` once it has been
     /// discarded or was never materialized.
     pub fn active_staged_worktree(&self) -> Option<&StagedWorktree> {
@@ -1397,6 +1482,46 @@ pub enum LaunchWorkingDirectoryError {
         "{scope} governed task `{task_id}` has no launch working directory until its staged worktree is materialized"
     )]
     StagedWorktreeNotMaterialized { task_id: String, scope: WorldScope },
+}
+
+/// Launch-environment variable through which a governed runtime learns the
+/// fencing generation it holds. The launcher sets it to
+/// [`GovernedTaskRun::launch_fencing_generation`]; worker-side clients echo it
+/// on every claim, verification and review request they send.
+pub const GOVERNED_FENCING_GENERATION_ENV: &str = "IMPULSE_GOVERNED_FENCING_GENERATION";
+
+/// Parse the value of [`GOVERNED_FENCING_GENERATION_ENV`]. Absent or blank is
+/// `None` (a runtime launched before fencing existed); anything else must be a
+/// plain decimal `u64`, so a mangled value fails loudly instead of silently
+/// dropping the fence.
+pub fn parse_fencing_generation(
+    value: Option<&str>,
+) -> Result<Option<u64>, GovernedTaskContractError> {
+    match value.map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(raw) => {
+            raw.parse::<u64>()
+                .map(Some)
+                .map_err(|_| GovernedTaskContractError::InvalidField {
+                    field: "fencing_generation",
+                    message: format!("`{raw}` is not a non-negative integer"),
+                })
+        }
+    }
+}
+
+/// A request carried a fencing generation the daemon has since moved past: a
+/// stale worker (or a stale producer) tried to write after the task changed
+/// hands. Nothing was recorded. The caller must not retry with a refreshed
+/// revision; the generation is the daemon's, not the caller's, to raise.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "fenced: governed task `{task_id}` is at fencing generation {current}, but the request presented generation {presented}; a stale worker may not write after the task changed hands"
+)]
+pub struct GovernedFencedError {
+    pub task_id: String,
+    pub presented: u64,
+    pub current: u64,
 }
 
 /// The snapshot intentionally carries the full typed record in the first
@@ -2241,5 +2366,127 @@ mod tests {
         assert_eq!(cancelled_json["data"]["exit_kind"], "operator_cancelled");
         let recovered: GovernedTaskMutation = serde_json::from_value(cancelled_json).unwrap();
         assert_eq!(recovered, cancelled);
+    }
+
+    // ── Fencing generation (blueprint 2.1) ──────────────────────────────────
+
+    fn push_event(run: &mut GovernedTaskRun, kind: GovernedTaskEventKind) {
+        let revision = run.events.len() as u64;
+        run.events.push(GovernedTaskEvent {
+            id: GovernedRecordId::try_new(format!("event-{revision}")).unwrap(),
+            revision,
+            kind,
+            actor: GovernedActor {
+                kind: GovernedActorKind::System,
+                id: "impulse-daemon".to_string(),
+            },
+            detail: format!("{kind:?}"),
+            created_at: "Tue 2026-09-01 8:00 PM EDT (UTC-04:00)".to_string(),
+        });
+        run.revision = revision;
+    }
+
+    #[test]
+    fn fencing_generation_rises_only_when_the_task_changes_hands() {
+        let mut run = run_with(WorldScope::StagedAuthoritative, None);
+        push_event(&mut run, GovernedTaskEventKind::Registered);
+        assert_eq!(run.fencing_generation(), 0);
+        push_event(&mut run, GovernedTaskEventKind::StagedWorktreeMaterialized);
+        assert_eq!(run.fencing_generation(), 1);
+        assert_eq!(run.launch_fencing_generation(), 2);
+        push_event(&mut run, GovernedTaskEventKind::Running);
+        assert_eq!(
+            run.fencing_generation(),
+            2,
+            "the launch mints the worker's generation"
+        );
+        // Work the current holder does itself never moves the fence.
+        for kind in [
+            GovernedTaskEventKind::ClaimSubmitted,
+            GovernedTaskEventKind::VerificationRecorded,
+            GovernedTaskEventKind::SupervisorVerdictRecorded,
+            GovernedTaskEventKind::OperatorDecisionRecorded,
+            GovernedTaskEventKind::PromotionRecorded,
+            GovernedTaskEventKind::ProducerReservationInterrupted,
+            GovernedTaskEventKind::RuntimeExited,
+        ] {
+            push_event(&mut run, kind);
+            assert_eq!(
+                run.fencing_generation(),
+                2,
+                "{kind:?} must not move the fence"
+            );
+        }
+        push_event(&mut run, GovernedTaskEventKind::StagedWorktreeDiscarded);
+        assert_eq!(run.fencing_generation(), 3);
+    }
+
+    #[test]
+    fn a_stale_generation_is_fenced_and_an_absent_one_is_admitted() {
+        let mut run = run_with(WorldScope::StagedAuthoritative, None);
+        push_event(&mut run, GovernedTaskEventKind::Registered);
+        push_event(&mut run, GovernedTaskEventKind::StagedWorktreeMaterialized);
+        push_event(&mut run, GovernedTaskEventKind::Running);
+        assert_eq!(run.require_fencing_generation(Some(2)), Ok(()));
+        assert_eq!(run.require_fencing_generation(None), Ok(()));
+        let fenced = run.require_fencing_generation(Some(1)).unwrap_err();
+        assert_eq!(
+            fenced,
+            GovernedFencedError {
+                task_id: "task-1".to_string(),
+                presented: 1,
+                current: 2,
+            }
+        );
+        assert!(fenced.to_string().starts_with("fenced: "));
+        // A generation from the future is just as stale: only the daemon mints them.
+        assert!(run.require_fencing_generation(Some(3)).is_err());
+    }
+
+    #[test]
+    fn fencing_generation_env_values_parse_strictly() {
+        assert_eq!(parse_fencing_generation(None), Ok(None));
+        assert_eq!(parse_fencing_generation(Some("  ")), Ok(None));
+        assert_eq!(parse_fencing_generation(Some("7")), Ok(Some(7)));
+        assert!(parse_fencing_generation(Some("-1")).is_err());
+        assert!(parse_fencing_generation(Some("two")).is_err());
+    }
+
+    /// JSON compatibility: requests written before fencing still parse (the
+    /// structs deny unknown fields, but the new field is optional), and a
+    /// request without a generation serializes byte-for-byte as before, so
+    /// idempotency fingerprints over old requests are unchanged.
+    #[test]
+    fn fencing_generation_is_optional_on_the_wire() {
+        let legacy = serde_json::json!({
+            "request_id": "claim-1",
+            "project_id": "impulse-rs",
+            "task_id": "task-1",
+            "expected_revision": 3,
+            "summary": "done",
+        });
+        let claim: GovernedClaimRequest = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(claim.fencing_generation, None);
+        let mut round_trip = serde_json::to_value(&claim).unwrap();
+        round_trip.as_object_mut().unwrap().remove("artifact_ids");
+        assert_eq!(round_trip, legacy);
+
+        let mut fenced = legacy;
+        fenced["fencing_generation"] = serde_json::json!(2);
+        let claim: GovernedClaimRequest = serde_json::from_value(fenced).unwrap();
+        assert_eq!(claim.fencing_generation, Some(2));
+
+        let verify: GovernedVerificationRequest = serde_json::from_value(serde_json::json!({
+            "request_id": "verify-1",
+            "project_id": "impulse-rs",
+            "task_id": "task-1",
+            "expected_revision": 4,
+        }))
+        .unwrap();
+        assert_eq!(verify.fencing_generation, None);
+        assert!(serde_json::to_value(&verify)
+            .unwrap()
+            .get("fencing_generation")
+            .is_none());
     }
 }
