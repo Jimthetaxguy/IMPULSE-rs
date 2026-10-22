@@ -1243,6 +1243,7 @@ impl DesktopRuntime {
                 mutation: GovernedTaskMutation::MarkRunning {
                     actor: governed_system_actor("desktop-runtime"),
                 },
+                fencing_generation: None,
             });
             match running {
                 Ok(updated) => {
@@ -3181,6 +3182,7 @@ mod tests {
                 task_id: task_id.clone(),
                 expected_revision: current.revision,
                 mutation,
+                fencing_generation: None,
             })
         }
     }

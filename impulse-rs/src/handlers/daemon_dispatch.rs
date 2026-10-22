@@ -286,6 +286,7 @@ async fn handle_governed_claim(
             expected_revision: task.revision,
             summary,
             artifact_ids,
+            generation: impulse_ops::governed_task::lease_generation_from_env(),
         })
         .await?;
     match acknowledged {

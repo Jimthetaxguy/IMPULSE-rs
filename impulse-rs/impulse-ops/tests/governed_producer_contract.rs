@@ -186,6 +186,7 @@ fn producer_triggers_exclude_derived_truth_fields() {
         expected_revision: 1,
         summary: "implemented the assigned change".to_string(),
         artifact_ids: vec!["artifact-1".to_string()],
+        generation: None,
     };
     let claim_json = serde_json::to_value(claim).unwrap();
     assert!(claim_json.get("actor").is_none());

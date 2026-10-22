@@ -243,6 +243,7 @@ impl GovernedTaskGateway for TestGovernedGateway {
             task_id: task_id.clone(),
             expected_revision: current.revision,
             mutation,
+            fencing_generation: None,
         })
     }
 
