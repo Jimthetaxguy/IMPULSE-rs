@@ -479,7 +479,12 @@ impl State {
             .filter(|r| {
                 &r.task_id == task_id && r.producer == producer && &r.request_id == request_id
             })
-            .max_by(|a, b| a.reserved_at.cmp(&b.reserved_at))
+            .max_by_key(|r| {
+                (
+                    chrono::DateTime::parse_from_rfc3339(&r.reserved_at).ok(),
+                    r.reserved_at.clone(),
+                )
+            })
             .cloned())
     }
 
@@ -646,9 +651,14 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(T, String)>>,
 {
-    with_reservation_effect(state, task_id, revision, request_id, producer, || async move {
-        side_effect().await.map_err(ProducerSideEffectError::Failed)
-    })
+    with_reservation_effect(
+        state,
+        task_id,
+        revision,
+        request_id,
+        producer,
+        || async move { side_effect().await.map_err(ProducerSideEffectError::Failed) },
+    )
     .await
 }
 
@@ -1398,5 +1408,256 @@ mod tests {
         // mutation itself is still durable, which is what replay safety
         // actually depends on.
         assert!(!state.open_reservations().unwrap().is_empty());
+    }
+
+    // ── Effect outcome: unknown vs failed-known (blueprint 2.1 "lost response")
+
+    fn persisted_journal_schema_version(state: &State) -> u64 {
+        let path = state.storage().path(PRODUCER_RESERVATIONS_FILE);
+        let journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        journal["schema_version"].as_u64().unwrap()
+    }
+
+    #[test]
+    fn a_crash_before_the_receipt_reconciles_to_an_unknown_effect_not_a_failure() {
+        let (root, state) = state();
+        let task = registered_task(&state, "lost-response");
+        let request = request_id("verify-lost-response");
+        state
+            .reserve(
+                &task.id,
+                task.revision,
+                &request,
+                ProducerKind::Verification,
+            )
+            .unwrap();
+        // The side effect ran; the daemon died before its receipt.
+        drop(state);
+
+        let base = root.path().join("impulse-test").join(".impulse");
+        let reloaded = State::new(base).unwrap();
+        reloaded.reconcile_producer_reservations().unwrap();
+
+        let reservation = reloaded
+            .latest_reservation(&task.id, ProducerKind::Verification, &request)
+            .unwrap()
+            .expect("the journal keeps the interrupted attempt");
+        assert_eq!(reservation.effect, Some(ProducerEffectOutcome::Unknown));
+        assert_eq!(
+            reservation.effect_outcome(),
+            Some(ProducerEffectOutcome::Unknown)
+        );
+        assert!(matches!(
+            reservation.outcome,
+            Some(ReservationOutcome::NeedsRerun { .. })
+        ));
+        let task = reloaded
+            .get_governed_task("impulse-test", &task.id)
+            .unwrap()
+            .unwrap();
+        let note = task
+            .events
+            .iter()
+            .find(|event| {
+                event.kind
+                    == impulse_ops::governed_task::GovernedTaskEventKind::ProducerReservationInterrupted
+            })
+            .expect("the interruption is noted on the task");
+        assert!(note.detail.contains("effect outcome unknown"));
+    }
+
+    #[tokio::test]
+    async fn a_receipt_lost_after_the_side_effect_is_unknown_and_needs_rerun() {
+        let (_root, state) = state();
+        let task = registered_task(&state, "receipt-lost");
+        let request = request_id("verify-receipt-lost");
+
+        let error = with_reservation_effect(
+            &state,
+            &task.id,
+            task.revision,
+            &request,
+            ProducerKind::Verification,
+            || async {
+                Err::<((), String), _>(ProducerSideEffectError::ReceiptLost(anyhow::anyhow!(
+                    "governed ledger write failed after cargo test finished"
+                )))
+            },
+        )
+        .await
+        .unwrap_err();
+        // The caller still sees the original error, unchanged.
+        assert_eq!(
+            error.to_string(),
+            "governed ledger write failed after cargo test finished"
+        );
+
+        let reservation = state
+            .latest_reservation(&task.id, ProducerKind::Verification, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reservation.effect_outcome(),
+            Some(ProducerEffectOutcome::Unknown),
+            "a lost receipt must never be recorded as a failure"
+        );
+        assert!(matches!(
+            reservation.outcome,
+            Some(ReservationOutcome::NeedsRerun { .. })
+        ));
+        // A replay of the same request is told it is rerunning, and is free to.
+        assert!(state
+            .pending_rerun_reason(&task.id, ProducerKind::Verification, &request)
+            .unwrap()
+            .unwrap()
+            .contains("receipt not recorded"));
+        assert!(state.open_reservations().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failure_the_producer_reports_itself_is_failed_known() {
+        let (_root, state) = state();
+        let task = registered_task(&state, "failed-known");
+        let request = request_id("verify-failed-known");
+        with_reservation(
+            &state,
+            &task.id,
+            task.revision,
+            &request,
+            ProducerKind::Verification,
+            || async { anyhow::bail!("cargo could not be spawned") as Result<((), String)> },
+        )
+        .await
+        .unwrap_err();
+        let reservation = state
+            .latest_reservation(&task.id, ProducerKind::Verification, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reservation.effect_outcome(),
+            Some(ProducerEffectOutcome::FailedKnown)
+        );
+        assert_eq!(
+            state
+                .pending_rerun_reason(&task.id, ProducerKind::Verification, &request)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_side_effect_is_recorded_as_confirmed() {
+        let (_root, state) = state();
+        let task = registered_task(&state, "confirmed");
+        let request = request_id("verify-confirmed");
+        with_reservation(
+            &state,
+            &task.id,
+            task.revision,
+            &request,
+            ProducerKind::Verification,
+            || async { Ok(((), "verify-confirmed".to_string())) },
+        )
+        .await
+        .unwrap();
+        let reservation = state
+            .latest_reservation(&task.id, ProducerKind::Verification, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reservation.effect_outcome(),
+            Some(ProducerEffectOutcome::Confirmed)
+        );
+    }
+
+    /// Compatibility: a version-1 journal (no `effect` field) still loads, its
+    /// outcomes are derived, and it is only rewritten at version 2 once a
+    /// reservation actually records an effect.
+    #[test]
+    fn a_v1_journal_loads_and_derives_effect_outcomes() {
+        let (root, state) = state();
+        let task = registered_task(&state, "legacy-journal");
+        let id = state
+            .reserve(
+                &task.id,
+                task.revision,
+                &request_id("legacy"),
+                ProducerKind::Verification,
+            )
+            .unwrap();
+        // Only an open reservation so far: nothing needs version 2.
+        assert_eq!(persisted_journal_schema_version(&state), 1);
+        drop(state);
+
+        // Hand-write the legacy shape a pre-upgrade daemon left behind: closed
+        // with a `failed: …` receipt and no `effect` field.
+        let base = root.path().join("impulse-test").join(".impulse");
+        let path = base.join(PRODUCER_RESERVATIONS_FILE);
+        let mut journal: ProducerReservationLedger =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let reservation = journal.reservations.get_mut(&id).unwrap();
+        reservation.released_at = Some(impulse_ops::now_rfc3339());
+        reservation.outcome = Some(ReservationOutcome::Released {
+            receipt_ref: "failed: cargo test failed".to_string(),
+        });
+        journal.digest = compute_digest(&journal.reservations).unwrap();
+        let bytes = serde_json::to_vec(&journal).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("\"effect\""));
+        std::fs::write(&path, bytes).unwrap();
+
+        let reloaded = State::new(base).unwrap();
+        let legacy = reloaded
+            .latest_reservation(&task.id, ProducerKind::Verification, &request_id("legacy"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.effect, None);
+        assert_eq!(
+            legacy.effect_outcome(),
+            Some(ProducerEffectOutcome::FailedKnown)
+        );
+        assert_eq!(persisted_journal_schema_version(&reloaded), 1);
+
+        // The first new close writes version 2.
+        let fresh = reloaded
+            .reserve(
+                &task.id,
+                task.revision,
+                &request_id("fresh"),
+                ProducerKind::Verification,
+            )
+            .unwrap();
+        reloaded.release(&fresh, "fresh").unwrap();
+        assert_eq!(persisted_journal_schema_version(&reloaded), 2);
+    }
+
+    #[test]
+    fn a_v1_journal_that_records_effect_outcomes_is_refused() {
+        let (root, state) = state();
+        let task = registered_task(&state, "forged-v1-journal");
+        let id = state
+            .reserve(
+                &task.id,
+                task.revision,
+                &request_id("forged"),
+                ProducerKind::Verification,
+            )
+            .unwrap();
+        state.release(&id, "forged").unwrap();
+        drop(state);
+        let base = root.path().join("impulse-test").join(".impulse");
+        let path = base.join(PRODUCER_RESERVATIONS_FILE);
+        let mut journal: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        journal["schema_version"] = serde_json::json!(1);
+        std::fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        let error = match State::new(base) {
+            Ok(_) => panic!("a v1 journal cannot carry effect outcomes"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("require version 2"),
+            "unexpected error: {error:#}"
+        );
     }
 }

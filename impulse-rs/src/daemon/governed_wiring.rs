@@ -2445,6 +2445,100 @@ mod tests {
         );
     }
 
+    /// Blueprint 2.1 failure test "lost response": the daemon is killed after
+    /// the verification commands finished but before their receipt was
+    /// durable. On restart the reservation is `NeedsRerun` (as before) and the
+    /// effect is recorded as `unknown` -- never `failed`: the task shows no
+    /// failed verification, and the rerun proceeds and confirms.
+    #[tokio::test]
+    async fn a_lost_verification_response_is_recorded_as_unknown_not_failed() {
+        let (repo, state, project_id, oid) = repo_state();
+        let claimed = awaiting_verification(&state, repo.path(), &project_id, &oid);
+        let lost_request = request_id("verify-lost-response");
+
+        state
+            .reserve(
+                &claimed.id,
+                claimed.revision,
+                &lost_request,
+                ProducerKind::Verification,
+            )
+            .unwrap();
+        // The side effect runs to completion...
+        let evidence = crate::governed_producers::run_verification(&claimed)
+            .await
+            .expect("the verification commands ran");
+        assert!(!evidence.commands.is_empty());
+        // ...and the daemon is killed before the receipt is persisted.
+        drop(evidence);
+        drop(state);
+
+        let state: SharedState = Arc::new(
+            crate::state::State::new(repo.path().join(".impulse")).expect("the daemon reloads"),
+        );
+        state
+            .reconcile_producer_reservations()
+            .expect("the restarted daemon reconciles");
+
+        let reservation = state
+            .latest_reservation(&claimed.id, ProducerKind::Verification, &lost_request)
+            .unwrap()
+            .expect("the journal keeps the interrupted attempt");
+        assert_eq!(
+            reservation.effect_outcome(),
+            Some(crate::state::ProducerEffectOutcome::Unknown)
+        );
+        assert!(matches!(
+            reservation.outcome,
+            Some(crate::state::ReservationOutcome::NeedsRerun { .. })
+        ));
+
+        let reloaded = state
+            .get_governed_task(&project_id, &claimed.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            reloaded.verifications.is_empty(),
+            "an unrecorded verification must not appear as evidence of any outcome"
+        );
+        assert_eq!(
+            reloaded.review_state,
+            GovernedReviewState::AwaitingVerification,
+            "a lost response must not read as a failed verification"
+        );
+        assert!(reloaded.events.iter().any(|event| {
+            event.kind == GovernedTaskEventKind::ProducerReservationInterrupted
+                && event.detail.contains("effect outcome unknown")
+        }));
+
+        // The rerun is not blocked, says why it reruns, and confirms.
+        let ack = run_governed_verification(
+            &state,
+            GovernedVerificationRequest {
+                request_id: lost_request.clone(),
+                project_id: project_id.clone(),
+                task_id: reloaded.id.clone(),
+                expected_revision: reloaded.revision,
+            },
+        )
+        .await
+        .expect("the rerun proceeds");
+        assert!(!ack.replayed);
+        assert_eq!(
+            ack.pending_rerun_reason.as_deref(),
+            Some("interrupted before receipt")
+        );
+        assert!(ack.task.latest_verification().is_some());
+        let rerun = state
+            .latest_reservation(&reloaded.id, ProducerKind::Verification, &lost_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rerun.effect_outcome(),
+            Some(crate::state::ProducerEffectOutcome::Confirmed)
+        );
+    }
+
     #[tokio::test]
     async fn a_fresh_verification_reports_no_pending_rerun() {
         let (repo, state, project_id, oid) = repo_state();
