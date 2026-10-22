@@ -320,10 +320,13 @@ where
         request_id,
         producer,
         || async move {
-            // A producer error is a definite failure: no receipt was due yet.
+            // A producer error is a definite failure unless the producer
+            // marked it as raised after its side effect was dispatched (a
+            // promotion that moved the branch and then failed to sync or
+            // observe it): that one is unknown, never failed.
             let mutation_request = build_mutation()
                 .await
-                .map_err(ProducerSideEffectError::Failed)?;
+                .map_err(crate::state::classify_producer_error)?;
             let receipt = mutation_request.request_id.as_str().to_string();
             // From here the side effect has run. If its receipt cannot be made
             // durable the outcome is unknown, not failed (blueprint 2.1 "lost

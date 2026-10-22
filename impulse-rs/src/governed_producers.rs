@@ -2678,18 +2678,30 @@ pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromot
         ));
     }
 
-    if !compare_and_swap_canonical_branch(&workspace, &branch_ref, &initial, &accepted_revision)? {
+    // From the compare-and-swap on, the canonical branch may already have
+    // moved. A failure past this point does not show that nothing happened,
+    // so it is marked as post-dispatch: the reservation journal records the
+    // effect as unknown and the request reruns (the reflog check above then
+    // recognizes a promotion that did land). Only a swap that reports a clean
+    // "ref did not match" is a definite, effect-free outcome.
+    let dispatched = crate::state::EffectDispatchedError::wrap;
+    let swapped =
+        compare_and_swap_canonical_branch(&workspace, &branch_ref, &initial, &accepted_revision)
+            .map_err(dispatched)?;
+    if !swapped {
         let observed = observe_head_oid(&workspace).unwrap_or(canonical_head);
         return Ok(blocked(
             observed,
             PromotionBlockedReason::ConcurrentBranchUpdate,
         ));
     }
-    sync_canonical_worktree(&workspace, &accepted_revision)?;
+    sync_canonical_worktree(&workspace, &accepted_revision).map_err(dispatched)?;
 
-    let promoted = observe_clean_git_subject(&workspace, Some(&initial))?;
+    let promoted = observe_clean_git_subject(&workspace, Some(&initial)).map_err(dispatched)?;
     if promoted != accepted_revision {
-        anyhow::bail!("canonical head did not land the accepted revision after promotion");
+        return Err(dispatched(anyhow::anyhow!(
+            "canonical head did not land the accepted revision after promotion"
+        )));
     }
     Ok(GovernedPromotionInput {
         actor: staged_system_actor(),

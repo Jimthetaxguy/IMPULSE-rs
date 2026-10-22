@@ -152,13 +152,55 @@ pub enum ProducerSideEffectError {
     /// [`ProducerEffectOutcome::Unknown`] and closed as `NeedsRerun`, the same
     /// record a crash at that point reconciles to at the next startup.
     ReceiptLost(anyhow::Error),
+    /// The producer failed *after* dispatching its side effect, so the effect
+    /// may have happened even though no mutation was built (for example a
+    /// promotion whose compare-and-swap moved the canonical branch, followed
+    /// by a failed working-tree sync or observation). Recorded as
+    /// [`ProducerEffectOutcome::Unknown`] and closed as `NeedsRerun`, exactly
+    /// like a lost receipt. Producers signal it with
+    /// [`EffectDispatchedError::wrap`]; see [`classify_producer_error`].
+    Dispatched(anyhow::Error),
 }
 
 impl ProducerSideEffectError {
     pub fn into_inner(self) -> anyhow::Error {
         match self {
-            Self::Failed(error) | Self::ReceiptLost(error) => error,
+            Self::Failed(error) | Self::ReceiptLost(error) | Self::Dispatched(error) => error,
         }
+    }
+}
+
+/// Marks a producer error raised after the producer's external side effect
+/// was dispatched, so the reservation journal records the effect as
+/// [`ProducerEffectOutcome::Unknown`] instead of a known failure.
+///
+/// Transparent: its `Display`, `{:#}` chain and `source()` are the wrapped
+/// error's, so an operator sees the same message. [`classify_producer_error`]
+/// unwraps it again before the error is returned to the caller.
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct EffectDispatchedError(anyhow::Error);
+
+impl EffectDispatchedError {
+    /// Wrap an error raised after the side effect may already have happened.
+    /// Wrapping an already-wrapped error is a no-op.
+    pub fn wrap(error: anyhow::Error) -> anyhow::Error {
+        if error.is::<Self>() {
+            return error;
+        }
+        anyhow::Error::new(Self(error))
+    }
+}
+
+/// Classify a producer error for the reservation journal: an error marked
+/// with [`EffectDispatchedError`] is [`ProducerSideEffectError::Dispatched`]
+/// (effect outcome unknown, needs rerun); anything else is a definite
+/// [`ProducerSideEffectError::Failed`] raised before the effect was
+/// dispatched.
+pub fn classify_producer_error(error: anyhow::Error) -> ProducerSideEffectError {
+    match error.downcast::<EffectDispatchedError>() {
+        Ok(EffectDispatchedError(inner)) => ProducerSideEffectError::Dispatched(inner),
+        Err(error) => ProducerSideEffectError::Failed(error),
     }
 }
 
@@ -634,8 +676,10 @@ impl State {
 ///
 /// On failure the reservation is closed (never left open) so a corrected retry
 /// is not blocked by [`ProducerReservationError::DuplicateOpenReservation`]. A
-/// failure is recorded as [`ProducerEffectOutcome::FailedKnown`]; producers
-/// that can tell a lost receipt apart use [`with_reservation_effect`]. This is a plain
+/// failure is recorded as [`ProducerEffectOutcome::FailedKnown`] unless the
+/// producer marked it with [`EffectDispatchedError`] (then
+/// [`ProducerEffectOutcome::Unknown`]); producers that can tell a lost receipt
+/// apart use [`with_reservation_effect`]. This is a plain
 /// async helper, not a method on `State`, so the handler lane can adopt it
 /// around `crate::governed_producers::run_verification` and the Supervisor
 /// review turn without a circular dependency on `src/daemon`.
@@ -657,7 +701,7 @@ where
         revision,
         request_id,
         producer,
-        || async move { side_effect().await.map_err(ProducerSideEffectError::Failed) },
+        || async move { side_effect().await.map_err(classify_producer_error) },
     )
     .await
 }
@@ -690,6 +734,18 @@ where
                 );
             }
             Ok(value)
+        }
+        Err(ProducerSideEffectError::Dispatched(error)) => {
+            // Never "failed": the producer gave up after dispatching its side
+            // effect, which may well have happened (Codex review on #141).
+            let reason =
+                format!("side effect dispatched but its outcome was not observed: {error:#}");
+            if let Err(close_error) = state.close_reservation_needs_rerun(&reservation_id, reason) {
+                tracing::error!(
+                    "failed to close producer reservation {reservation_id} as needs-rerun after a post-dispatch failure: {close_error}"
+                );
+            }
+            Err(error)
         }
         Err(ProducerSideEffectError::ReceiptLost(error)) => {
             // Never "failed": the effect may have completed. A replay of the
@@ -1659,5 +1715,82 @@ mod tests {
             format!("{error:#}").contains("require version 2"),
             "unexpected error: {error:#}"
         );
+    }
+
+    // ── Post-dispatch producer failures (Codex review on #141) ───────────────
+
+    #[test]
+    fn classify_producer_error_separates_dispatched_from_failed() {
+        let plain = classify_producer_error(anyhow::anyhow!("git could not be spawned"));
+        assert!(matches!(plain, ProducerSideEffectError::Failed(_)));
+
+        let marked = EffectDispatchedError::wrap(
+            anyhow::anyhow!("worktree sync failed").context("promotion left the branch moved"),
+        );
+        // Transparent: the operator-facing message and chain are unchanged.
+        assert_eq!(marked.to_string(), "promotion left the branch moved");
+        assert_eq!(
+            format!("{marked:#}"),
+            "promotion left the branch moved: worktree sync failed"
+        );
+        // Wrapping twice stays one layer.
+        let marked = EffectDispatchedError::wrap(marked);
+        match classify_producer_error(marked) {
+            ProducerSideEffectError::Dispatched(inner) => {
+                assert!(!inner.is::<EffectDispatchedError>());
+                assert_eq!(
+                    format!("{inner:#}"),
+                    "promotion left the branch moved: worktree sync failed"
+                );
+            }
+            other => panic!("a marked error is dispatched, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_dispatch_is_unknown_and_needs_rerun_not_failed_known() {
+        let (_root, state) = state();
+        let task = registered_task(&state, "dispatched-then-failed");
+        let request = request_id("promote-dispatched");
+        let error = with_reservation(
+            &state,
+            &task.id,
+            task.revision,
+            &request,
+            ProducerKind::Promotion,
+            || async {
+                // The compare-and-swap moved the branch; the sync after it failed.
+                Err::<((), String), _>(EffectDispatchedError::wrap(anyhow::anyhow!(
+                    "canonical worktree sync failed after the branch moved"
+                )))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "canonical worktree sync failed after the branch moved"
+        );
+        assert!(
+            !error.is::<EffectDispatchedError>(),
+            "the caller gets the producer's own error back"
+        );
+        let reservation = state
+            .latest_reservation(&task.id, ProducerKind::Promotion, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reservation.effect_outcome(),
+            Some(ProducerEffectOutcome::Unknown)
+        );
+        assert!(matches!(
+            reservation.outcome,
+            Some(ReservationOutcome::NeedsRerun { .. })
+        ));
+        assert!(state
+            .pending_rerun_reason(&task.id, ProducerKind::Promotion, &request)
+            .unwrap()
+            .unwrap()
+            .contains("outcome was not observed"));
     }
 }
