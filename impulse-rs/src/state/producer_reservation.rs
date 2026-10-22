@@ -44,7 +44,17 @@ use super::State;
 use crate::storage::Storage;
 
 const PRODUCER_RESERVATIONS_FILE: &str = "PRODUCER_RESERVATIONS.json";
-const PRODUCER_RESERVATIONS_SCHEMA_VERSION: u32 = 1;
+/// The newest journal schema this build writes. Version 2 adds the explicit
+/// [`ProducerEffectOutcome`] on each reservation (blueprint 2.1, "lost
+/// response"). It is written only once a reservation actually carries one, so
+/// an untouched version-1 journal stays readable by older builds; a build that
+/// predates version 2 refuses it by version instead of by a confusing digest
+/// mismatch over a field it does not know.
+const PRODUCER_RESERVATIONS_SCHEMA_VERSION: u32 = 2;
+/// The pre-effect-outcome schema. Loaded as-is; each reservation's outcome is
+/// derived from its [`ReservationOutcome`] (see
+/// [`ProducerReservation::effect_outcome`]).
+const PRODUCER_RESERVATIONS_LEGACY_SCHEMA_VERSION: u32 = 1;
 
 /// A reservation's identity. An alias over the existing governed-record id
 /// type rather than a new newtype: reservations are governed-task-adjacent
@@ -103,6 +113,55 @@ pub enum ReservationOutcome {
     NeedsRerun { reason: String },
 }
 
+/// What is known about a producer's external side effect (a verification run,
+/// a Supervisor turn, a promotion), following the blueprint's effect lifecycle
+/// *intended -> dispatched -> confirmed / failed-known / unknown*.
+///
+/// The distinction that matters is `FailedKnown` versus `Unknown`. A lost
+/// response — the daemon killed after `cargo` finished but before the receipt
+/// was durable, or a receipt write that failed after the side effect ran — is
+/// **not** a failure: the effect may well have happened. Recording it as
+/// failed would invite an operator (or a retry policy) to treat finished work
+/// as never done. Only execution evidence closes an effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerEffectOutcome {
+    /// The side effect ran and its governed-task receipt is durable.
+    Confirmed,
+    /// The producer itself reported a definite failure before any receipt was
+    /// due. Nothing durable claims the effect happened.
+    FailedKnown,
+    /// The side effect was dispatched and may have completed, but no durable
+    /// receipt proves it either way. Always paired with
+    /// [`ReservationOutcome::NeedsRerun`].
+    Unknown,
+}
+
+/// How a producer's side effect failed, as far as the producer can tell.
+///
+/// Returned by the closure given to [`with_reservation_effect`]. The wrapped
+/// error is handed back to the caller unchanged (same message, same
+/// downcastable type); only the journal's record differs.
+#[derive(Debug)]
+pub enum ProducerSideEffectError {
+    /// The producer reported a definite failure before any receipt was due:
+    /// recorded as [`ProducerEffectOutcome::FailedKnown`].
+    Failed(anyhow::Error),
+    /// The side effect was dispatched, then its receipt could not be made
+    /// durable (blueprint 2.1 "lost response"): recorded as
+    /// [`ProducerEffectOutcome::Unknown`] and closed as `NeedsRerun`, the same
+    /// record a crash at that point reconciles to at the next startup.
+    ReceiptLost(anyhow::Error),
+}
+
+impl ProducerSideEffectError {
+    pub fn into_inner(self) -> anyhow::Error {
+        match self {
+            Self::Failed(error) | Self::ReceiptLost(error) => error,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProducerReservation {
     pub id: ReservationId,
@@ -115,11 +174,35 @@ pub struct ProducerReservation {
     pub released_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ReservationOutcome>,
+    /// Recorded when the reservation closes. Absent on version-1 records and
+    /// on open reservations; read it through [`Self::effect_outcome`], which
+    /// derives the value for legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<ProducerEffectOutcome>,
 }
 
 impl ProducerReservation {
     fn is_open(&self) -> bool {
         self.released_at.is_none()
+    }
+
+    /// The effect outcome, `None` while the reservation is still open.
+    ///
+    /// Version-1 records carry no explicit value, so it is derived from how
+    /// they were closed: `NeedsRerun` is unknown (no receipt proves anything),
+    /// a release whose receipt reference is a `failed: …` note is a known
+    /// failure, and any other release is confirmed.
+    pub fn effect_outcome(&self) -> Option<ProducerEffectOutcome> {
+        if let Some(effect) = self.effect {
+            return Some(effect);
+        }
+        match self.outcome.as_ref()? {
+            ReservationOutcome::NeedsRerun { .. } => Some(ProducerEffectOutcome::Unknown),
+            ReservationOutcome::Released { receipt_ref } if receipt_ref.starts_with("failed: ") => {
+                Some(ProducerEffectOutcome::FailedKnown)
+            }
+            ReservationOutcome::Released { .. } => Some(ProducerEffectOutcome::Confirmed),
+        }
     }
 }
 
@@ -144,7 +227,7 @@ impl Default for ProducerReservationLedger {
         // Hashing an empty, already-valid map cannot fail.
         let digest = compute_digest(&reservations).expect("hashing an empty map cannot fail");
         Self {
-            schema_version: PRODUCER_RESERVATIONS_SCHEMA_VERSION,
+            schema_version: PRODUCER_RESERVATIONS_LEGACY_SCHEMA_VERSION,
             reservations,
             digest,
         }
@@ -169,9 +252,19 @@ impl ProducerReservationLedger {
     }
 
     fn validate_shape(&self) -> Result<()> {
-        if self.schema_version != PRODUCER_RESERVATIONS_SCHEMA_VERSION {
+        if !matches!(
+            self.schema_version,
+            PRODUCER_RESERVATIONS_LEGACY_SCHEMA_VERSION | PRODUCER_RESERVATIONS_SCHEMA_VERSION
+        ) {
             return Err(
                 ProducerReservationError::UnsupportedSchemaVersion(self.schema_version).into(),
+            );
+        }
+        if self.schema_version < self.required_schema_version() {
+            anyhow::bail!(
+                "producer reservation journal declares schema version {} but records effect outcomes, which require version {}",
+                self.schema_version,
+                PRODUCER_RESERVATIONS_SCHEMA_VERSION
             );
         }
         for (key, reservation) in &self.reservations {
@@ -191,7 +284,18 @@ impl ProducerReservationLedger {
         Ok(())
     }
 
+    /// Version 2 once any reservation records an explicit effect outcome.
+    fn required_schema_version(&self) -> u32 {
+        if self.reservations.values().any(|r| r.effect.is_some()) {
+            PRODUCER_RESERVATIONS_SCHEMA_VERSION
+        } else {
+            PRODUCER_RESERVATIONS_LEGACY_SCHEMA_VERSION
+        }
+    }
+
     fn persist(&mut self, storage: &Storage) -> Result<()> {
+        // Never lowers a version already on disk.
+        self.schema_version = self.schema_version.max(self.required_schema_version());
         self.digest = compute_digest(&self.reservations)
             .context("Failed to compute producer reservation journal digest")?;
         storage
@@ -274,6 +378,7 @@ impl State {
                         stale.revision
                     ),
                 });
+                stale.effect = Some(ProducerEffectOutcome::Unknown);
             }
         }
 
@@ -287,6 +392,7 @@ impl State {
             reserved_at: now,
             released_at: None,
             outcome: None,
+            effect: None,
         };
         candidate.reservations.insert(id.clone(), reservation);
         candidate.persist(self.storage())?;
@@ -303,6 +409,25 @@ impl State {
     /// failure here leaves the reservation exactly as open as it was before
     /// the call, never silently (or partially) released.
     pub fn release(&self, id: &ReservationId, receipt_ref: impl Into<String>) -> Result<()> {
+        self.close_released(id, receipt_ref.into(), ProducerEffectOutcome::Confirmed)
+    }
+
+    /// Release a reservation whose producer reported a definite failure. The
+    /// effect is recorded as [`ProducerEffectOutcome::FailedKnown`].
+    pub fn release_failed(&self, id: &ReservationId, error: &anyhow::Error) -> Result<()> {
+        self.close_released(
+            id,
+            format!("failed: {error}"),
+            ProducerEffectOutcome::FailedKnown,
+        )
+    }
+
+    fn close_released(
+        &self,
+        id: &ReservationId,
+        receipt_ref: String,
+        effect: ProducerEffectOutcome,
+    ) -> Result<()> {
         let mut ledger = self.producer_reservations.lock().map_err(lock_err)?;
         let existing = ledger
             .reservations
@@ -318,9 +443,8 @@ impl State {
             .get_mut(id)
             .expect("presence just confirmed against the same ledger");
         reservation.released_at = Some(impulse_ops::now_rfc3339());
-        reservation.outcome = Some(ReservationOutcome::Released {
-            receipt_ref: receipt_ref.into(),
-        });
+        reservation.outcome = Some(ReservationOutcome::Released { receipt_ref });
+        reservation.effect = Some(effect);
         candidate.persist(self.storage())?;
         *ledger = candidate;
         Ok(())
@@ -337,6 +461,26 @@ impl State {
             .filter(|r| r.is_open())
             .cloned()
             .collect())
+    }
+
+    /// The most recent reservation for this exact task/producer/request triple,
+    /// open or closed. Lets the operator surface (and tests) read the recorded
+    /// [`ProducerEffectOutcome`] of an attempt.
+    pub fn latest_reservation(
+        &self,
+        task_id: &GovernedTaskId,
+        producer: ProducerKind,
+        request_id: &GovernedRequestId,
+    ) -> Result<Option<ProducerReservation>> {
+        let ledger = self.producer_reservations.lock().map_err(lock_err)?;
+        Ok(ledger
+            .reservations
+            .values()
+            .filter(|r| {
+                &r.task_id == task_id && r.producer == producer && &r.request_id == request_id
+            })
+            .max_by(|a, b| a.reserved_at.cmp(&b.reserved_at))
+            .cloned())
     }
 
     /// The reason the most recent reservation for this exact
@@ -412,6 +556,9 @@ impl State {
             .expect("presence just confirmed against the same ledger");
         reservation.released_at = Some(impulse_ops::now_rfc3339());
         reservation.outcome = Some(ReservationOutcome::NeedsRerun { reason });
+        // No receipt exists, so nothing proves the side effect did or did not
+        // happen: a lost response is unknown, never failed.
+        reservation.effect = Some(ProducerEffectOutcome::Unknown);
         candidate.persist(self.storage())?;
         *ledger = candidate;
         Ok(())
@@ -437,7 +584,7 @@ impl State {
             id: "producer-reservation-journal".to_string(),
         };
         let detail = format!(
-            "producer reservation {} ({:?}) for request {} needs rerun: {reason}",
+            "producer reservation {} ({:?}) for request {} needs rerun (effect outcome unknown): {reason}",
             reservation.id, reservation.producer, reservation.request_id
         );
         // Deterministic per-reservation request id: a repeat reconcile (or
@@ -480,9 +627,10 @@ impl State {
 /// after the side effect alone — before its mutation is persisted — would
 /// reopen the gap this journal exists to close.
 ///
-/// On failure the reservation is released with the failure recorded (never
-/// left open) so a corrected retry is not blocked by
-/// [`ProducerReservationError::DuplicateOpenReservation`]. This is a plain
+/// On failure the reservation is closed (never left open) so a corrected retry
+/// is not blocked by [`ProducerReservationError::DuplicateOpenReservation`]. A
+/// failure is recorded as [`ProducerEffectOutcome::FailedKnown`]; producers
+/// that can tell a lost receipt apart use [`with_reservation_effect`]. This is a plain
 /// async helper, not a method on `State`, so the handler lane can adopt it
 /// around `crate::governed_producers::run_verification` and the Supervisor
 /// review turn without a circular dependency on `src/daemon`.
@@ -498,6 +646,26 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<(T, String)>>,
 {
+    with_reservation_effect(state, task_id, revision, request_id, producer, || async move {
+        side_effect().await.map_err(ProducerSideEffectError::Failed)
+    })
+    .await
+}
+
+/// [`with_reservation`] for a producer that can tell a definite failure apart
+/// from a lost receipt. See [`ProducerSideEffectError`].
+pub async fn with_reservation_effect<F, Fut, T>(
+    state: &State,
+    task_id: &GovernedTaskId,
+    revision: u64,
+    request_id: &GovernedRequestId,
+    producer: ProducerKind,
+    side_effect: F,
+) -> Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(T, String), ProducerSideEffectError>>,
+{
     let reservation_id = state.reserve(task_id, revision, request_id, producer)?;
     match side_effect().await {
         Ok((value, receipt_ref)) => {
@@ -505,7 +673,7 @@ where
             // durable at this point (that is `side_effect`'s contract).
             // A failure releasing *this* journal entry must not turn a
             // durably-recorded success into a reported failure — log and
-            // continue, exactly like the error branch below.
+            // continue, exactly like the error branches below.
             if let Err(release_error) = state.release(&reservation_id, receipt_ref) {
                 tracing::error!(
                     "failed to release producer reservation {reservation_id} after a successful side effect: {release_error}"
@@ -513,8 +681,19 @@ where
             }
             Ok(value)
         }
-        Err(error) => {
-            if let Err(release_error) = state.release(&reservation_id, format!("failed: {error}")) {
+        Err(ProducerSideEffectError::ReceiptLost(error)) => {
+            // Never "failed": the effect may have completed. A replay of the
+            // same request reruns it and reports this reason.
+            let reason = format!("receipt not recorded after the side effect ran: {error:#}");
+            if let Err(close_error) = state.close_reservation_needs_rerun(&reservation_id, reason) {
+                tracing::error!(
+                    "failed to close producer reservation {reservation_id} as needs-rerun after a lost receipt: {close_error}"
+                );
+            }
+            Err(error)
+        }
+        Err(ProducerSideEffectError::Failed(error)) => {
+            if let Err(release_error) = state.release_failed(&reservation_id, &error) {
                 tracing::error!(
                     "failed to release producer reservation {reservation_id} after side-effect error: {release_error}"
                 );
@@ -1099,6 +1278,7 @@ mod tests {
             outcome: Some(ReservationOutcome::NeedsRerun {
                 reason: "interrupted before receipt".to_string(),
             }),
+            effect: Some(ProducerEffectOutcome::Unknown),
         };
         let json = serde_json::to_string(&original).unwrap();
         let recovered: ProducerReservation = serde_json::from_str(&json).unwrap();

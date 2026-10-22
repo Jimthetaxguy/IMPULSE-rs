@@ -54,7 +54,7 @@ use super::handlers::{
     persist_governed_mutation, require_current_governed_task, require_producer_request_state,
 };
 use super::protocol::{respond_err, respond_ok, DaemonRequest, DaemonResponse};
-use crate::state::{ProducerKind, SharedState};
+use crate::state::{ProducerKind, ProducerSideEffectError, SharedState};
 
 /// The actor every daemon-owned staged-worktree and promotion side effect is
 /// recorded under. Mirrors `governed_producers::staged_system_actor`, which is
@@ -313,16 +313,24 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<GovernedTaskMutationRequest>>,
 {
-    crate::state::with_reservation(
+    crate::state::with_reservation_effect(
         state,
         task_id,
         expected_revision,
         request_id,
         producer,
         || async move {
-            let mutation_request = build_mutation().await?;
+            // A producer error is a definite failure: no receipt was due yet.
+            let mutation_request = build_mutation()
+                .await
+                .map_err(ProducerSideEffectError::Failed)?;
             let receipt = mutation_request.request_id.as_str().to_string();
-            let updated = persist_governed_mutation(state, mutation_request).await?;
+            // From here the side effect has run. If its receipt cannot be made
+            // durable the outcome is unknown, not failed (blueprint 2.1 "lost
+            // response"): the journal closes the reservation as needs-rerun.
+            let updated = persist_governed_mutation(state, mutation_request)
+                .await
+                .map_err(ProducerSideEffectError::ReceiptLost)?;
             Ok((updated, receipt))
         },
     )
