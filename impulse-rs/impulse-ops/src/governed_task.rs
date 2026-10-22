@@ -1271,6 +1271,62 @@ pub struct GovernedTaskEvent {
     pub created_at: String,
 }
 
+/// What a worker *published* about its own work. A worker claim is a promise
+/// that the work is done; the worker can say nothing else through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromiseClaimedStatus {
+    Done,
+}
+
+/// What independent evidence says about a published promise (blueprint 2.1
+/// change #4: "only verifier or execution events set `evidenced_status`").
+///
+/// There is no `Broken`: a failed or inconclusive verification does not close
+/// the promise either way, it simply leaves it `Open` (the blueprint's
+/// "false completion" test). Only a passing verification by a `Verifier` actor
+/// against the claim's own subject revision makes it `Kept`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromiseEvidencedStatus {
+    Open,
+    Kept,
+}
+
+/// One worker promise, with its claimed and evidenced status side by side.
+///
+/// This is a read-only projection derived from `claims` and `verifications`;
+/// it is never stored and has no setter, so the only way to move
+/// `evidenced_status` is to record a verification, which the ledger admits
+/// only from a `Verifier` actor through the daemon's verification producer. A
+/// worker cannot mark its own promise kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedPromise {
+    pub claim_id: GovernedRecordId,
+    pub promised_by: GovernedActor,
+    pub summary: String,
+    pub subject_revision: String,
+    pub claimed_status: PromiseClaimedStatus,
+    pub evidenced_status: PromiseEvidencedStatus,
+    /// Verification records that bear on this promise, oldest first.
+    pub evidence: Vec<GovernedRecordId>,
+    /// Outcome of the newest bearing verification, if any.
+    pub latest_evidence_outcome: Option<GovernedVerificationOutcome>,
+    /// A later claim replaced this one (after changes were requested or a
+    /// verification failed). Only the current promise can diverge.
+    pub superseded: bool,
+}
+
+impl GovernedPromise {
+    /// Claimed done, but evidence has not kept it: the gap the operator
+    /// surface must show instead of trusting the claim.
+    pub fn diverges(&self) -> bool {
+        !self.superseded
+            && self.claimed_status == PromiseClaimedStatus::Done
+            && self.evidenced_status != PromiseEvidencedStatus::Kept
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernedTaskRun {
     pub id: GovernedTaskId,
@@ -1356,6 +1412,55 @@ impl GovernedTaskRun {
 
     pub fn latest_promotion(&self) -> Option<&GovernedPromotion> {
         self.promotions.last()
+    }
+
+    /// Every worker promise on this run, claimed status beside evidenced
+    /// status. Derived on read; see [`GovernedPromise`].
+    pub fn promises(&self) -> Vec<GovernedPromise> {
+        let latest = self.claims.len().checked_sub(1);
+        self.claims
+            .iter()
+            .enumerate()
+            .map(|(index, claim)| {
+                let bearing = self
+                    .verifications
+                    .iter()
+                    .filter(|verification| {
+                        // Evidence counts only when it comes from the
+                        // verifier and is about exactly what was promised.
+                        verification.actor.kind == GovernedActorKind::Verifier
+                            && verification.claim_id == claim.id
+                            && verification.subject_revision == claim.subject_revision
+                    })
+                    .collect::<Vec<_>>();
+                let latest_evidence_outcome =
+                    bearing.last().map(|verification| verification.outcome);
+                let evidenced_status = match latest_evidence_outcome {
+                    Some(GovernedVerificationOutcome::Passed) => PromiseEvidencedStatus::Kept,
+                    _ => PromiseEvidencedStatus::Open,
+                };
+                GovernedPromise {
+                    claim_id: claim.id.clone(),
+                    promised_by: claim.actor.clone(),
+                    summary: claim.summary.clone(),
+                    subject_revision: claim.subject_revision.clone(),
+                    claimed_status: PromiseClaimedStatus::Done,
+                    evidenced_status,
+                    evidence: bearing
+                        .iter()
+                        .map(|verification| verification.id.clone())
+                        .collect(),
+                    latest_evidence_outcome,
+                    superseded: Some(index) != latest,
+                }
+            })
+            .collect()
+    }
+
+    /// The current promise when the worker claims done but the evidence does
+    /// not (yet) agree. `None` when there is no claim or evidence kept it.
+    pub fn claim_evidence_divergence(&self) -> Option<GovernedPromise> {
+        self.promises().into_iter().find(GovernedPromise::diverges)
     }
 
     /// The staged worktree while it is still usable, or `None` once it has been

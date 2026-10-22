@@ -2373,7 +2373,8 @@ pub(in crate::state) mod tests {
     use impulse_ops::governed_task::{
         ApprovalPolicy, GovernedCommandEvidence, GovernedTaskMutation, GovernedTaskMutationRequest,
         GovernedTaskRegistration, GovernedVerificationInput, OperatorDecisionInput,
-        SupervisorVerdictInput, WorkerCompletionClaimInput,
+        PromiseClaimedStatus, PromiseEvidencedStatus, SupervisorVerdictInput,
+        WorkerCompletionClaimInput,
     };
     use tempfile::TempDir;
 
@@ -5889,5 +5890,123 @@ pub(in crate::state) mod tests {
             staged.shared_config_digest = SharedRepositoryConfigPin::Recorded(digest);
         }
         assert!(staged_worktree_is_discardable(&task));
+    }
+
+    // ── Promises: claimed vs evidenced (blueprint 2.1 change #4) ────────────
+
+    /// Blueprint 2.1 failure test "false completion": a failed tool run is
+    /// injected while the worker claims "done". The promise's evidenced status
+    /// stays `open` and the run reports claimed-vs-evidenced divergence; only
+    /// a passing verifier record keeps the promise.
+    #[test]
+    fn a_failed_run_under_a_done_claim_leaves_the_promise_open_and_divergent() {
+        let (_root, state) = state();
+        let registered = state
+            .register_governed_task(registration(&state, "register-promise"))
+            .unwrap();
+        let running = state
+            .mutate_governed_task(mutation(
+                &registered,
+                "running-promise",
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "desktop"),
+                },
+            ))
+            .unwrap();
+        assert!(running.promises().is_empty());
+        assert!(running.claim_evidence_divergence().is_none());
+
+        // The worker says it is done...
+        let claimed = claim(&state, &running, "claim-promise");
+        let promise = claimed
+            .claim_evidence_divergence()
+            .expect("unverified claim diverges");
+        assert_eq!(promise.claimed_status, PromiseClaimedStatus::Done);
+        assert_eq!(promise.evidenced_status, PromiseEvidencedStatus::Open);
+        assert!(promise.evidence.is_empty());
+
+        // ...but the verification run fails.
+        let failed = verify(
+            &state,
+            &claimed,
+            "verify-promise-failed",
+            GovernedVerificationOutcome::Failed,
+        );
+        let promise = failed
+            .claim_evidence_divergence()
+            .expect("a failed run must not close a done claim");
+        assert_eq!(promise.evidenced_status, PromiseEvidencedStatus::Open);
+        assert_eq!(
+            promise.latest_evidence_outcome,
+            Some(GovernedVerificationOutcome::Failed)
+        );
+        assert_eq!(promise.evidence.len(), 1);
+        // The worker's own record still says done; the evidence disagrees.
+        assert_eq!(
+            failed.latest_claim().unwrap().summary,
+            "implementation complete"
+        );
+
+        // A new claim supersedes the old promise; a passing verification by
+        // the verifier is the only thing that keeps it.
+        let reclaimed = claim(&state, &failed, "claim-promise-2");
+        let verified = verify(
+            &state,
+            &reclaimed,
+            "verify-promise-passed",
+            GovernedVerificationOutcome::Passed,
+        );
+        let promises = verified.promises();
+        assert_eq!(promises.len(), 2);
+        assert!(promises[0].superseded);
+        assert_eq!(promises[0].evidenced_status, PromiseEvidencedStatus::Open);
+        assert!(!promises[1].superseded);
+        assert_eq!(promises[1].evidenced_status, PromiseEvidencedStatus::Kept);
+        assert!(verified.claim_evidence_divergence().is_none());
+    }
+
+    /// Only verifier evidence about the promised subject counts. A record that
+    /// names the claim but comes from anyone else, or verifies a different
+    /// revision, cannot set `evidenced_status` (defense in depth: the ledger
+    /// already refuses a non-verifier verification).
+    #[test]
+    fn evidence_from_a_non_verifier_or_another_revision_cannot_keep_a_promise() {
+        let (_root, state) = state();
+        let registered = state
+            .register_governed_task(registration(&state, "register-forged-evidence"))
+            .unwrap();
+        let running = state
+            .mutate_governed_task(mutation(
+                &registered,
+                "running-forged-evidence",
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "desktop"),
+                },
+            ))
+            .unwrap();
+        let claimed = claim(&state, &running, "claim-forged-evidence");
+        let passed = verify(
+            &state,
+            &claimed,
+            "verify-forged-evidence",
+            GovernedVerificationOutcome::Passed,
+        );
+        assert!(passed.claim_evidence_divergence().is_none());
+
+        // The worker cannot record its own evidence through the ledger.
+        let mut by_worker = passed.clone();
+        by_worker.verifications[0].actor = actor(GovernedActorKind::Worker, "worker-1");
+        assert_eq!(
+            by_worker.promises()[0].evidenced_status,
+            PromiseEvidencedStatus::Open
+        );
+        assert!(by_worker.claim_evidence_divergence().is_some());
+
+        let mut other_revision = passed;
+        other_revision.verifications[0].subject_revision = "def456".into();
+        assert_eq!(
+            other_revision.promises()[0].evidenced_status,
+            PromiseEvidencedStatus::Open
+        );
     }
 }
