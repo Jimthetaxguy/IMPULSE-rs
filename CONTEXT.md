@@ -548,7 +548,7 @@ filesystem, network, process, or environment access (`open()` and `os.getenv()` 
 16 MiB of collected print output; `time.sleep` returns at once. Every failure comes back as a `PythonResult`
 whose `fault` is one of `syntax`, `unsupported`, `runtime`, `timeout`, `memory`; nothing falls back to
 system CPython. The interpreter shares the daemon process, so a stack-overflow or allocator abort is
-not isolated (ADR-0021 follow-up: `monty-pool`). Distinct from `src/monty/`, the unbuilt PyO3 stub.
+not isolated (ADR-0021 follow-up: `monty-pool`). Distinct from `src/monty/`, which is keyword routing, injection selection, KDB, and swarm heuristics in plain Rust. The optional PyO3 `monty-support` feature and `src/monty/python.rs` were removed on 2026-10-21; they never compiled an extension.
 - **Source of truth:** `src/tools/python.rs` (`execute_python`, `execute_python_with_timeout`,
   `PythonResult`, `fault`) and ADR-0021.
 
