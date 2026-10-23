@@ -18,6 +18,10 @@ use std::sync::RwLock;
 use crate::storage::Storage;
 
 const LIVE_STATE_FILE: &str = "LIVE_STATE.json";
+/// How long a state update waits for another process's update to finish
+/// before failing. Generous: the longest holder appends and syncs one history
+/// line or one memory decision.
+const STATE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const HISTORY_FILE: &str = "HISTORY.jsonl";
 const CONFLICTS_FILE: &str = "CONFLICTS.jsonl";
 
@@ -66,6 +70,10 @@ pub struct State {
     /// This process's copy of `config.json`. Only [`State::update_config`]
     /// replaces it.
     config: RwLock<Config>,
+    /// Sessions whose history line `end_session` appended but whose removal
+    /// from `LIVE_STATE.json` failed to save, with that line. A retry here
+    /// finishes the end instead of recording the session twice.
+    half_ended_sessions: std::sync::Mutex<HashMap<String, HistoryEntry>>,
 }
 
 impl std::fmt::Debug for State {
@@ -105,6 +113,7 @@ impl State {
             governed_producer_locks: tokio::sync::Mutex::new(HashMap::new()),
             live_state: RwLock::new(live_state),
             config: RwLock::new(config),
+            half_ended_sessions: std::sync::Mutex::new(HashMap::new()),
         };
         state.reconcile_accepted_run_memory_candidates()?;
         // Must follow candidate reconciliation: the log is cross-checked against
@@ -121,6 +130,15 @@ impl State {
 
     pub fn storage(&self) -> &Storage {
         &self.storage
+    }
+
+    /// Take the project-wide lock every read-modify-write of shared state
+    /// holds, failing after [`STATE_LOCK_WAIT`] rather than hanging behind a
+    /// holder that never finishes. Not re-entrant.
+    pub(super) fn lock_project_state(&self, purpose: &str) -> Result<crate::storage::StorageLock> {
+        self.storage
+            .lock_exclusive_within(STATE_LOCK_WAIT)
+            .with_context(|| format!("Failed to lock project state to {purpose}"))
     }
 
     /// Serialize daemon-owned producer side effects per governed task.
@@ -154,10 +172,7 @@ impl State {
     ///
     /// The lock is not re-entrant, so `change` must not start another update.
     fn update_live_state<T>(&self, change: impl FnOnce(&mut LiveState) -> Result<T>) -> Result<T> {
-        let _lock = self
-            .storage
-            .lock_exclusive()
-            .context("Failed to lock project state for a live-state update")?;
+        let _lock = self.lock_project_state("update the live state")?;
         let mut current = self
             .storage
             .read_json::<LiveState>(LIVE_STATE_FILE)
@@ -195,10 +210,23 @@ impl State {
         // process or another, waits for the lock and then finds the session
         // gone, so it is never recorded twice. The in-memory copy is not locked
         // during the append, so readers never wait on the disk.
-        self.update_live_state(|state| {
+        let ended = self.update_live_state(|state| {
             let Some(session) = state.get_session(session_id) else {
                 return Ok(None);
             };
+            // An earlier end here appended its history line but failed to
+            // save the live state, so the session is still here. Finish that
+            // end rather than recording the session twice.
+            let half_ended = self
+                .half_ended_sessions
+                .lock()
+                .map_err(lock_err)?
+                .get(session_id)
+                .cloned();
+            if let Some(recorded) = half_ended {
+                state.remove_session(session_id);
+                return Ok(Some(recorded));
+            }
             let entry = HistoryEntry {
                 session_id: session.id.clone(),
                 session_name: session.name.clone(),
@@ -212,9 +240,21 @@ impl State {
             self.storage
                 .append_jsonl(HISTORY_FILE, &entry)
                 .context("Failed to append session to history log")?;
+            // Remembered until the live-state save below succeeds.
+            self.half_ended_sessions
+                .lock()
+                .map_err(lock_err)?
+                .insert(session_id.to_string(), entry.clone());
             state.remove_session(session_id);
             Ok(Some(entry))
-        })
+        });
+        if ended.is_ok() {
+            self.half_ended_sessions
+                .lock()
+                .map_err(lock_err)?
+                .remove(session_id);
+        }
+        ended
     }
 
     pub async fn track_file(&self, session_id: &str, file_path: &str) -> Result<()> {
@@ -341,10 +381,7 @@ impl State {
     /// setting another process had saved since: a daemon that recorded a
     /// supervisor permission grant undid a `config` command run meanwhile.
     fn update_config(&self, change: impl FnOnce(&mut Config) -> bool) -> Result<bool> {
-        let _lock = self
-            .storage
-            .lock_exclusive()
-            .context("Failed to lock project state for a config update")?;
+        let _lock = self.lock_project_state("update the config")?;
         let mut current = self
             .storage
             .read_json::<Config>(CONFIG_FILE)
@@ -376,28 +413,55 @@ impl State {
         Ok(config.clone())
     }
 
-    /// Update guardrail rules in config and persist to disk
-    pub fn update_guardrail_rules(&self, rules: Vec<crate::guardrail::GuardRule>) -> Result<()> {
+    /// Change the guardrail rules as they are on disk now and persist them.
+    ///
+    /// Takes the change rather than a finished list, so a rule toggled by
+    /// another process since this one loaded its config is kept.
+    pub fn update_guardrail_rules(
+        &self,
+        change: impl FnOnce(&mut Vec<crate::guardrail::GuardRule>),
+    ) -> Result<()> {
         self.update_config(|config| {
-            config.guardrails.rules = rules;
+            change(&mut config.guardrails.rules);
             true
         })
         .context("Failed to persist guardrail rules to config")?;
         Ok(())
     }
 
+    /// Change the supervisor's baseline permission policy as it is on disk now,
+    /// normalize and persist it, and return the result.
+    ///
+    /// Takes the change rather than a finished policy: a grant built from this
+    /// process's copy reinstated a permission revoked from the CLI since.
     pub fn update_impulse_agent_permissions(
         &self,
-        policy: impulse_ops::SupervisorPermissionPolicy,
-    ) -> Result<()> {
-        let mut normalized = policy;
-        normalized.normalize();
+        change: impl FnOnce(&mut impulse_ops::SupervisorPermissionPolicy),
+    ) -> Result<impulse_ops::SupervisorPermissionPolicy> {
+        let mut updated = None;
         self.update_config(|config| {
-            config.impulse_agent_permissions = normalized;
+            change(&mut config.impulse_agent_permissions);
+            config.impulse_agent_permissions.normalize();
+            updated = Some(config.impulse_agent_permissions.clone());
             true
         })
         .context("Failed to persist agent permissions to config")?;
-        Ok(())
+        updated.context("agent permission update did not run")
+    }
+
+    /// The config as `config.json` holds it now, refreshing this process's
+    /// copy. For decisions that must see a change another process made, such
+    /// as a permission revoked from the CLI while the daemon runs; the atomic
+    /// rename means an unlocked read never sees a torn file.
+    pub fn current_config(&self) -> Result<Config> {
+        let mut current = self
+            .storage
+            .read_json::<Config>(CONFIG_FILE)
+            .context("Failed to read config from disk")?;
+        let mut copy = self.config.write().map_err(lock_err)?;
+        current.keep_process_local(&copy);
+        *copy = current.clone();
+        Ok(current)
     }
 
     /// Conflict analytics, built from the audit trail conflict detection
@@ -650,7 +714,9 @@ mod tests {
 
         assert!(cli.set_config("log_level", "debug").unwrap());
         daemon
-            .update_impulse_agent_permissions(impulse_ops::SupervisorPermissionPolicy::default())
+            .update_impulse_agent_permissions(|policy| {
+                *policy = impulse_ops::SupervisorPermissionPolicy::default();
+            })
             .unwrap();
 
         let reopened = State::new(dir.path().to_path_buf()).unwrap();
@@ -686,6 +752,65 @@ mod tests {
         );
         let on_disk = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
         assert!(!on_disk.contains("test-key"));
+    }
+
+    /// Review: the history append landed but the live-state save failed, so
+    /// the session stayed and ending it again recorded it a second time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_end_after_a_failed_save_does_not_record_the_session_twice() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = State::new(dir.path().to_path_buf()).unwrap();
+        let session = state.create_session("s".to_string(), None).await.unwrap();
+        // The history file exists, so its append still works when the
+        // directory is read-only; the atomic live-state write does not.
+        std::fs::write(dir.path().join(HISTORY_FILE), "").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let first = state.end_session(&session.id, "done".to_string()).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(first.is_err(), "the live-state save should have failed");
+
+        let second = state
+            .end_session(&session.id, "again".to_string())
+            .await
+            .unwrap()
+            .expect("the session is still recorded as live");
+        assert_eq!(second.summary, "done");
+        assert_eq!(state.get_history_sync().unwrap().len(), 1);
+        assert!(state.get_session(&session.id).await.unwrap().is_none());
+    }
+
+    /// A permission revoked from the CLI while the daemon runs must survive
+    /// the daemon's next grant, which used to start from its stale copy.
+    #[test]
+    fn test_a_permission_grant_keeps_a_revocation_made_elsewhere() {
+        use impulse_ops::SupervisorActionPermission as Permission;
+        let dir = tempfile::TempDir::new().unwrap();
+        let daemon = State::new(dir.path().to_path_buf()).unwrap();
+        let cli = State::new(dir.path().to_path_buf()).unwrap();
+        assert!(daemon
+            .config_snapshot()
+            .unwrap()
+            .impulse_agent_permissions
+            .allows_action(Permission::ModifyPermissions));
+
+        cli.update_impulse_agent_permissions(|policy| {
+            policy
+                .allowed_actions
+                .retain(|action| *action != Permission::ModifyPermissions);
+        })
+        .unwrap();
+        let granted = daemon
+            .update_impulse_agent_permissions(|policy| policy.grant_action(Permission::FocusAgent))
+            .unwrap();
+
+        assert!(!granted.allows_action(Permission::ModifyPermissions));
+        assert!(!daemon
+            .current_config()
+            .unwrap()
+            .impulse_agent_permissions
+            .allows_action(Permission::ModifyPermissions));
     }
 
     #[tokio::test]
@@ -805,7 +930,16 @@ mod tests {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match std::io::Read::read(&mut drain, &mut buf) {
-                Ok(0) => break,
+                // A FIFO also reads as empty before the writer has connected;
+                // closing it then breaks the writer's pipe and fails the end,
+                // so keep draining until the end has actually finished.
+                Ok(0)
+                    if end.is_finished()
+                        || started.elapsed() > std::time::Duration::from_secs(10) =>
+                {
+                    break
+                }
+                Ok(0) => std::thread::sleep(std::time::Duration::from_millis(5)),
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if end.is_finished() || started.elapsed() > std::time::Duration::from_secs(10) {

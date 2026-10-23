@@ -265,10 +265,7 @@ impl State {
         if matches!(reconciled_candidate_ledger(&ledger, &expected), Ok(None)) {
             return Ok(());
         }
-        let _lock = self
-            .storage()
-            .lock_exclusive()
-            .context("Failed to lock project state to reconcile memory candidates")?;
+        let _lock = self.lock_project_state("reconcile memory candidates")?;
         let current = MemoryCandidateLedger::load(self.storage())?;
         let expected = expected_accepted_run_candidates(
             &super::governed_task::governed_tasks_on_disk(self.storage())?,
@@ -329,10 +326,7 @@ impl State {
                 // Re-read under the lock: another process opening the same
                 // fresh clone may have adopted the log (and the daemon may have
                 // decided since), and its ledger must not be replaced.
-                let _lock = self
-                    .storage()
-                    .lock_exclusive()
-                    .context("Failed to lock project state to adopt the memory log")?;
+                let _lock = self.lock_project_state("adopt the memory log")?;
                 let current = MemoryCandidateLedger::load(self.storage())?;
                 if current.memory_log_head.is_some() {
                     *ledger = current;
@@ -457,10 +451,7 @@ impl State {
             .map_err(|error| anyhow::anyhow!("memory candidate ledger lock poisoned: {error}"))?;
         // Checked and written against the ledger as it is on disk, so a
         // reconcile another process wrote since is kept.
-        let _lock = self
-            .storage()
-            .lock_exclusive()
-            .context("Failed to lock project state to record a memory candidate")?;
+        let _lock = self.lock_project_state("record a memory candidate")?;
         *ledger = MemoryCandidateLedger::load(self.storage())?;
         if let Some(stored) = ledger.candidates.get(&candidate.id) {
             // The derived candidate is always `PendingReview`, while a decided
@@ -551,18 +542,6 @@ impl State {
             .into());
         }
 
-        // Derive governed truth before taking the candidate-ledger lock, so the
-        // two locks are always acquired in the same order as reconciliation.
-        let expected_candidates = self
-            .all_governed_tasks()?
-            .iter()
-            .filter(|task| task.is_accepted())
-            .map(derive_accepted_run_memory_candidate)
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(|candidate| (candidate.id.clone(), candidate))
-            .collect::<BTreeMap<_, _>>();
-
         let mut ledger = self
             .memory_candidates
             .lock()
@@ -574,11 +553,13 @@ impl State {
         // The revision check, the append and the commit run against the
         // ledger and log as they are on disk, under the storage lock, so a
         // repair another process wrote since is neither lost nor rolled back.
-        let _lock = self
-            .storage()
-            .lock_exclusive()
-            .context("Failed to lock project state for a memory decision")?;
+        let _lock = self.lock_project_state("record a memory decision")?;
         *ledger = MemoryCandidateLedger::load(self.storage())?;
+        // Governed truth read from disk after the ledger, as reconcile does:
+        // this process's copy of the tasks can predate a candidate on disk.
+        let expected_candidates = expected_accepted_run_candidates(
+            &super::governed_task::governed_tasks_on_disk(self.storage())?,
+        )?;
         *log = MemoryLog::load(
             self.storage(),
             ledger.memory_log_head.as_ref(),
@@ -856,7 +837,6 @@ impl State {
     }
 }
 
-/// The candidate a log entry was promoted from, when it names one.
 /// The candidate every accepted task derives, keyed by candidate id.
 fn expected_accepted_run_candidates(
     tasks: &[GovernedTaskRun],
@@ -936,6 +916,7 @@ fn reconciled_candidate_ledger(
     Ok(changed.then_some(repaired))
 }
 
+/// The candidate a log entry was promoted from, when it names one.
 fn tail_candidate_id(
     entry: &impulse_ops::memory_candidate::MemoryLogEntry,
 ) -> Option<&MemoryCandidateId> {
