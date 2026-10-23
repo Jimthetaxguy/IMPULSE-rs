@@ -136,6 +136,18 @@ files. Nothing in them contradicts the work above. Additions:
   2026-10-18; main pins 1.0.0. A pool must also discard a worker after any
   resource-limit failure. This sharpens candidate 9.
 
+### Full read of the Gemini notes
+
+This covered 29 of the 32 notes that mention IMPULSE in full, the IMPULSE sections of one more, and skipped two that reference the private compartment. Most of the material is historical (the March refactors, the retired egui/Tauri GUI). New items:
+
+- **Plan as a stopping governor** (`d432aa3c/coding_agent_harness_design_learnings.md`, citing Fan et al.): a plan held by the harness and injected fresh each turn, plus a `LoopTermination::GoalMet` once every item is done and the last verification passed. The cited result is 30-40% fewer re-verification loops after edits. `LoopTrip` has no "done" condition today. This is distinct from the planner hook above, which concerns starting work rather than stopping it.
+- **Measure recall-tool use before investing more in it.** The same note reports recall tools went unused in 56% of runs. `blackboard_fetch` is exactly such a tool, and `LoopReport` does not count per-tool calls. Counting them would show whether ADR-0023 paging earns its cost.
+- **Staged compaction matters less on frontier windows:** the gain is 2.7-5.5% at 96-128k tokens, per the same source. That lowers the priority of the staged-compaction item above.
+- **Hygiene:**
+  - `build_hygiene` (3,361 LOC) is still present. Gemini recommended deleting its sweep code in March, and nobody acted on or recorded that.
+  - Daemon-mode `session-start` injects no context (`daemon_dispatch.rs`), unlike hook mode.
+  - A Gemini fleet scan lists IMPULSE-rs as 24 crates. It has 6 workspace members.
+
 Also noted: `ToolRegistry::with_defaults` logs an error and returns an empty
 registry. Its production callers (agent discovery, voice adapter) could
 therefore advertise zero tools silently; `try_with_defaults()?` would fail
