@@ -399,6 +399,15 @@ pub struct LoopReport {
     /// have to move.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub compactions: usize,
+    /// Observed calls per tool name. Shows whether a tool earns its place in
+    /// the schema the model sees every round: a recall tool such as
+    /// `blackboard_fetch` that is never called is pure context cost.
+    ///
+    /// Omitted when empty, for the same reason as `compactions`: the governed
+    /// Builder report never observes individual calls, so its serialized form
+    /// and every stored `loop_report_digest` stay byte-identical.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub calls_by_tool: std::collections::BTreeMap<String, usize>,
     pub elapsed_ms: u64,
 }
 
@@ -436,6 +445,7 @@ pub struct LoopBreaker {
     last_round_keys: Option<Vec<String>>,
     repeated_round_streak: usize,
     compactions: usize,
+    calls_by_tool: std::collections::BTreeMap<String, usize>,
 }
 
 impl LoopBreaker {
@@ -455,6 +465,7 @@ impl LoopBreaker {
             last_round_keys: None,
             repeated_round_streak: 0,
             compactions: 0,
+            calls_by_tool: std::collections::BTreeMap::new(),
         }
     }
 
@@ -544,6 +555,7 @@ impl LoopBreaker {
         outcome: CallOutcome<'_>,
     ) -> Option<LoopTrip> {
         self.tool_calls += 1;
+        *self.calls_by_tool.entry(tool.to_string()).or_default() += 1;
 
         let call_key = format!("{tool}\u{1f}{}", canonical_json(input));
         self.round_keys.push(call_key.clone());
@@ -600,6 +612,7 @@ impl LoopBreaker {
             tool_errors: self.tool_errors,
             tool_calls_interrupted: self.dispatched.saturating_sub(self.tool_calls),
             compactions: self.compactions,
+            calls_by_tool: self.calls_by_tool.clone(),
             elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         }
     }
@@ -765,6 +778,12 @@ mod tests {
             tool_errors: 2,
             tool_calls_interrupted: 1,
             compactions: 2,
+            calls_by_tool: [
+                ("file_read".to_string(), 7),
+                ("blackboard_fetch".to_string(), 2),
+            ]
+            .into_iter()
+            .collect(),
             elapsed_ms: 1234,
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -1395,6 +1414,29 @@ mod tests {
         let mut contract = LoopContract::ion_tool_loop();
         contract.budget.max_context_chars = Some(1);
         assert!(contract.validate().is_ok());
+    }
+
+    #[test]
+    fn test_report_counts_calls_per_tool_and_omits_the_map_when_empty() {
+        let mut breaker = LoopBreaker::new(contract(10, None, None));
+        breaker.begin_round().unwrap();
+        for (tool, n) in [("file_read", 1), ("file_read", 2), ("blackboard_fetch", 3)] {
+            breaker.admit_call().unwrap();
+            breaker.observe_call(tool, &json!(n), OK);
+        }
+        let report = breaker.report(LoopTermination::Completed);
+        assert_eq!(report.calls_by_tool.get("file_read"), Some(&2));
+        assert_eq!(report.calls_by_tool.get("blackboard_fetch"), Some(&1));
+        assert_eq!(
+            report.calls_by_tool.values().sum::<usize>(),
+            report.tool_calls
+        );
+
+        // A report with no observed calls (the governed Builder's) keeps the
+        // field out of its JSON, so stored digests over it do not change.
+        let empty = LoopBreaker::new(contract(10, None, None)).report(LoopTermination::Completed);
+        let json = serde_json::to_value(&empty).unwrap();
+        assert!(json.get("calls_by_tool").is_none(), "{json}");
     }
 
     #[test]
