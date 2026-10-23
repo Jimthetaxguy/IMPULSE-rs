@@ -501,4 +501,69 @@ mod tests {
         assert_eq!(recovered.content, insight.content);
         assert_eq!(recovered.intent, insight.intent);
     }
+
+    #[test]
+    fn test_context_tier_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                ContextTier::None,
+                ContextTier::Full,
+                ContextTier::Essential,
+                ContextTier::Critical,
+                ContextTier::Minimal,
+                ContextTier::PostCompaction,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+    }
+
+    #[test]
+    fn test_insight_type_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                InsightType::FileModified,
+                InsightType::ErrorEncountered,
+                InsightType::DecisionMade,
+                InsightType::TaskCompleted,
+                InsightType::ToolInvocation,
+                InsightType::DiffDetected,
+                InsightType::DelegationDetected,
+                InsightType::RemoteConnection,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+    }
+
+    #[test]
+    fn test_agent_kind_wire_names_differ_from_label() {
+        // Pinned, not aliased. `label` is the short pane name written into
+        // prompts and context templates (`agent::prompts`,
+        // `context_lifecycle::templates`); nothing parses it back as an
+        // AgentKind, and serde keeps the snake_case variant names.
+        let rows = crate::test_support::wire_vs_str_api(
+            &[
+                AgentKind::ClaudeCode,
+                AgentKind::Codex,
+                AgentKind::OpenCode,
+                AgentKind::Gemini,
+                AgentKind::Cursor,
+                AgentKind::GenericShell,
+            ],
+            None,
+            |v| v.label().to_string(),
+        );
+        assert_eq!(
+            rows,
+            crate::test_support::expected_rows(&[
+                ("claude_code", "claude", false),
+                ("codex", "codex", true),
+                ("open_code", "opencode", false),
+                ("gemini", "gemini", true),
+                ("cursor", "cursor", true),
+                ("generic_shell", "shell", false),
+            ])
+        );
+    }
 }

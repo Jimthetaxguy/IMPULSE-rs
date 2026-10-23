@@ -195,4 +195,52 @@ mod tests {
         assert_eq!(InjectionScope::parse("both"), Some(InjectionScope::Both));
         assert_eq!(InjectionScope::parse("invalid"), None);
     }
+
+    #[test]
+    fn test_injection_mode_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                InjectionMode::Off,
+                InjectionMode::Review,
+                InjectionMode::Apply,
+            ],
+            None,
+            |v| {
+                assert_eq!(InjectionMode::parse(v.as_str()), Some(*v));
+                v.as_str().to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn test_injection_scope_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                InjectionScope::Daemon,
+                InjectionScope::Direct,
+                InjectionScope::Both,
+            ],
+            None,
+            |v| {
+                assert_eq!(InjectionScope::parse(v.as_str()), Some(*v));
+                v.as_str().to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn test_injection_surface_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                InjectionSurface::DaemonChat,
+                InjectionSurface::Orchestrate,
+                InjectionSurface::Handoff,
+                InjectionSurface::SyncContext,
+                InjectionSurface::AgentPaneInit,
+                InjectionSurface::AgentPaneRefresh,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+    }
 }

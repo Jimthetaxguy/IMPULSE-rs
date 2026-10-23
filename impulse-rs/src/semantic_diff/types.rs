@@ -409,4 +409,22 @@ mod tests {
         assert!(block.contains("+ foo (function)"));
         assert!(block.contains("~ bar (function)"));
     }
+
+    #[test]
+    fn test_change_kind_wire_names_match_as_str_and_display() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                ChangeKind::Added,
+                ChangeKind::Modified,
+                ChangeKind::Deleted,
+                ChangeKind::Moved,
+                ChangeKind::Renamed,
+            ],
+            None,
+            |v| {
+                assert_eq!(v.to_string(), v.as_str());
+                v.as_str().to_string()
+            },
+        );
+    }
 }

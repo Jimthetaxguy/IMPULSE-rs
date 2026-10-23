@@ -360,3 +360,36 @@ mod file_open_panel_tests {
         assert!(result.is_ok());
     }
 }
+
+#[cfg(test)]
+mod native_island_kind_tests {
+    use super::NativeIslandKind;
+
+    #[test]
+    fn test_native_island_kind_wire_names_match_as_str_except_appkit_probe() {
+        for kind in [
+            NativeIslandKind::MenuBar,
+            NativeIslandKind::GlobalShortcut,
+            NativeIslandKind::FileOpenPanel,
+            NativeIslandKind::Notification,
+            NativeIslandKind::FloatingPanel,
+            NativeIslandKind::AccessibilityHook,
+        ] {
+            let wire = format!("\"{}\"", kind.as_str());
+            assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<NativeIslandKind>(&wire).unwrap(),
+                kind
+            );
+        }
+        // Pinned, not aliased. snake_case writes "app_kit_probe"; `as_str`
+        // says "appkit_probe". Requests are built and decoded through serde on
+        // both sides (`ui::parse_workspace_folder_pick_result`), and `as_str`
+        // reaches users only in the UnsupportedNativeIsland error, which
+        // AppKitProbe never produces because the default host handles it.
+        let probe = NativeIslandKind::AppKitProbe;
+        assert_eq!(serde_json::to_string(&probe).unwrap(), "\"app_kit_probe\"");
+        assert_eq!(probe.as_str(), "appkit_probe");
+        assert!(serde_json::from_str::<NativeIslandKind>("\"appkit_probe\"").is_err());
+    }
+}

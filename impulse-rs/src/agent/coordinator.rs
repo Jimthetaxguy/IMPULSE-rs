@@ -1250,4 +1250,33 @@ mod tests {
             RecommendationType::FileConflict
         );
     }
+
+    #[test]
+    fn test_conflict_resolution_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                ConflictResolution::Merge,
+                ConflictResolution::AcceptTheirs,
+                ConflictResolution::AcceptMine,
+                ConflictResolution::Rebase,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+    }
+
+    #[test]
+    fn test_recommendation_type_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                RecommendationType::FileConflict,
+                RecommendationType::ErrorAssist,
+                RecommendationType::CrossPaneSync,
+                RecommendationType::TaskComplete,
+                RecommendationType::DelegationReady,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+    }
 }

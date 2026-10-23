@@ -187,4 +187,33 @@ mod tests {
         let result = execute_computed_routing("task: architecture review", &MontyConfig::default());
         assert!(result.is_ok());
     }
+
+    #[test]
+    fn test_routing_target_wire_names_differ_from_as_str() {
+        // Pinned, not aliased. RoutingTarget has no serde rename, so the wire
+        // name is the variant name; `as_str` is the spelling printed by
+        // `orchestrate --compute-routing`. A ComputedRoute is only produced
+        // in-process (`routing::route_by_keywords`), never parsed from input.
+        let rows = crate::test_support::wire_vs_str_api(
+            &[
+                RoutingTarget::ClaudeCode,
+                RoutingTarget::Codex,
+                RoutingTarget::OpenCode,
+                RoutingTarget::Gemini,
+                RoutingTarget::ChatGPT,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+        assert_eq!(
+            rows,
+            crate::test_support::expected_rows(&[
+                ("ClaudeCode", "claude-code", false),
+                ("Codex", "codex", false),
+                ("OpenCode", "opencode", false),
+                ("Gemini", "gemini", false),
+                ("ChatGPT", "chatgpt", false),
+            ])
+        );
+    }
 }

@@ -884,4 +884,42 @@ mod tests {
         assert_eq!(direct.session_id, None);
         assert_eq!(direct.fetch_max_age, default_fetch_max_age());
     }
+
+    #[test]
+    fn test_check_kind_wire_names_match_as_str_and_display() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                CheckKind::Request,
+                CheckKind::ClaimsPresent,
+                CheckKind::SourceResolves,
+                CheckKind::FetchUnusable,
+                CheckKind::SubjectMatches,
+                CheckKind::StaleRead,
+                CheckKind::HandoffExists,
+                CheckKind::ArtifactExists,
+                CheckKind::AlreadyAccepted,
+            ],
+            None,
+            |v| {
+                assert_eq!(v.to_string(), v.as_str());
+                v.as_str().to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn test_workflow_state_wire_names_match_as_str_and_display() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                WorkflowState::Pending,
+                WorkflowState::Accepted,
+                WorkflowState::Recorded,
+            ],
+            None,
+            |v| {
+                assert_eq!(v.to_string(), v.as_str());
+                v.as_str().to_string()
+            },
+        );
+    }
 }
