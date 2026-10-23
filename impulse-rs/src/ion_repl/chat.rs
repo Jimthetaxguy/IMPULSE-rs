@@ -763,6 +763,9 @@ fn bash_command_escape_candidates(command: &str, tool_ctx: &ToolContext) -> Vec<
             || bare.contains("$HOME")
             // Every `${HOME...}` form: `${HOME}`, `${HOME:-}`, `${HOME%/}`.
             || bare.contains("${HOME")
+            // The repo's parent (`${PWD%/*}`) and the previous directory.
+            || bare.contains("${PWD%")
+            || bare.contains("OLDPWD")
         {
             flagged.push(token.clone());
         }
@@ -781,25 +784,35 @@ fn bash_command_escape_candidates(command: &str, tool_ctx: &ToolContext) -> Vec<
     flagged
 }
 
-/// Whether `command` runs a `cd` with no target (or `cd --`), which goes to
-/// `$HOME`. [`split_shell_tokens`] drops the `;`/`&&` after it, so the token
-/// scan would read the *next command's* name as the `cd` target.
+/// Whether `command` runs a `cd` whose destination this scan cannot see: no
+/// target (`$HOME`), `-` (`$OLDPWD`), or a variable (`cd $X`, `cd ${X:-}`).
+/// [`split_shell_tokens`] drops the `;`/`&&` after a bare `cd`, so the token
+/// scan would read the *next command's* name as its target.
+///
+/// `cd` counts anywhere in a command segment, not only as its first word, so
+/// `builtin cd`, `command cd`, `{ cd; }` and `then cd` are caught; the cost is
+/// an occasional extra `CONFIRM` for text such as a heredoc line reading `cd`.
 fn bare_cd_reaches_home(command: &str) -> bool {
     let mut segments = command.split(|c: char| SHELL_METACHARS.contains(&c) || c == '\n');
     segments.any(|segment| {
         let mut parts = segment.split_whitespace();
         while let Some(word) = parts.next() {
-            if word == "cd" {
-                return match parts.next() {
-                    None => true,
-                    Some("--") => parts.next().is_none(),
-                    Some(_) => false,
-                };
+            if word != "cd" {
+                continue;
             }
-            // `cd` only matters as the segment's command word, after any
-            // `VAR=value` assignments.
-            if !word.contains('=') {
-                return false;
+            // `-P`/`-L`/`-e`/`-@` and `--` are options, not the destination.
+            let target = parts
+                .by_ref()
+                .find(|part| !(part.len() > 1 && part.starts_with('-')));
+            let unseen = match target {
+                None => true,
+                Some(target) => {
+                    let target = target.trim_matches(|c| c == '"' || c == '\'');
+                    target == "-" || target.starts_with('$')
+                }
+            };
+            if unseen {
+                return true;
             }
         }
         false
@@ -2456,38 +2469,61 @@ mod tests {
         );
     }
 
+    /// Roots set to the working directory, as Ion's sandbox does. The default
+    /// context's relative write root makes the older `cd <target>` check flag
+    /// every `cd X`, which would hide whether the bare-`cd` check works.
+    fn repo_rooted_ctx() -> ToolContext {
+        let root = std::env::current_dir().unwrap();
+        ToolContext {
+            allowed_write_roots: vec![root.clone()],
+            allowed_read_roots: vec![root],
+            ..ToolContext::with_all_capabilities()
+        }
+    }
+
     #[test]
     fn test_bash_command_escape_candidates_flags_bare_cd_to_home() {
-        let ctx = ToolContext::default();
+        let ctx = repo_rooted_ctx();
         for command in [
             "cd && rm -rf ./*",
             "cd; cat .ssh/id_rsa .aws/credentials",
             "cd",
             "cd -- ; ls",
             "X=1 cd\nls",
+            "cd -P; cat .ssh/id_rsa",
+            "cd -L && cat .aws/credentials",
+            "builtin cd; ls",
+            "command cd; ls",
+            "{ cd; }; ls",
+            "if true; then cd; fi; ls",
+            "cd $UNSET_VAR; ls",
+            "cd ${X:-}; ls",
+            "cd -; ls",
         ] {
             assert!(
                 !bash_command_escape_candidates(command, &ctx).is_empty(),
-                "`{command}` changes to $HOME and must be flagged"
+                "`{command}` changes to a directory the scan cannot see"
             );
         }
-        for command in ["cd src && ls", "cd -- src", "echo cd", "abcd; ls"] {
+        for command in ["cd src && ls", "cd -- src", "cd -P src", "abcd; ls"] {
             assert!(
-                !bare_cd_reaches_home(command),
-                "`{command}` does not change to $HOME"
+                bash_command_escape_candidates(command, &ctx).is_empty(),
+                "`{command}` stays in the repo"
             );
         }
     }
 
     #[test]
     fn test_bash_command_escape_candidates_flags_hidden_home_and_root_forms() {
-        let ctx = ToolContext::default();
+        let ctx = repo_rooted_ctx();
         for command in [
             "rm -rf ${HOME:-}",
             "rm -rf ${HOME%/}/x",
             "cat ${HOME:?}/.ssh/id_rsa",
             "cat \\/etc/passwd",
             "cat {/etc/passwd,}",
+            "cat ${PWD%/*}/secret",
+            "cd ${PWD%/*}; ls",
         ] {
             assert!(
                 !bash_command_escape_candidates(command, &ctx).is_empty(),

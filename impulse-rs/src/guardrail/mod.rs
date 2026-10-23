@@ -85,6 +85,9 @@ mod tests {
             "git add \":(top)\"",
             "git add ''.",
             "git add \\.",
+            "git add --no-ignore-removal",
+            "git add ':/*'",
+            "git add ':(top)*'",
         ] {
             assert!(blocks(command, "bash"), "`{command}` stages the whole tree");
         }
@@ -117,6 +120,24 @@ mod tests {
             assert!(blocks(content, "file_write"), "`{content}` writes a secret");
         }
         assert!(!blocks(r#"{"token_count": 12}"#, "file_write"));
+    }
+
+    /// Adversarial review: an any-suffix secret pattern blocked these ordinary
+    /// lines at the Write/Edit hook (target `file`).
+    #[test]
+    fn test_evaluate_action_allows_identifiers_that_start_with_a_secret_word() {
+        for content in [
+            "let tokens = split_shell_tokens(command);",
+            "window_tokens: DEFAULT_WINDOW_TOKENS,",
+            "max_tokens: DEFAULT_MAX_TOKENS_LIMIT,",
+            "tokenizer_config: AutoTokenizerConfig,",
+            r#"secret_name = "my-long-identifier-name""#,
+            "let password_hash = hash_password_with_salt(&pw);",
+            r#"api_key_env: "ANTHROPIC_API_KEY_VARIABLE""#,
+            "tokens_freed: total_decision_tokens / 3,",
+        ] {
+            assert!(!blocks(content, "file"), "`{content}` is ordinary code");
+        }
     }
 
     #[test]
