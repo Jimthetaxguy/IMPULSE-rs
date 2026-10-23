@@ -726,6 +726,9 @@ impl Drop for DesktopRuntimeInner {
             .map(|(_, record)| record)
             .collect::<Vec<_>>();
         for record in records {
+            // As in `close_agent`: a writer still feeding queued input would
+            // keep the child from exiting before the reap deadline.
+            record.input.stop();
             if let Err(error) = record.backend.kill() {
                 let message = format!(
                     "desktop shutdown could not confirm runtime termination for {}: {error}",
@@ -1150,6 +1153,7 @@ impl DesktopRuntime {
             let Some(record) = removed else {
                 return;
             };
+            record.input.stop();
             if let Err(error) = record.backend.kill() {
                 let message = format!(
                     "terminal EOF observed for {exit_agent_id}, but its process could not be confirmed terminated: {error}"
@@ -1659,7 +1663,7 @@ impl DesktopRuntime {
                 .insert(request.session_id.clone(), record);
             return Err(DesktopBridgeError::TerminalTerminationFailed {
                 message: format!(
-                    "session {} remains managed because process termination was not confirmed: {error}",
+                    "session {} remains managed because process termination was not confirmed (its input is stopped): {error}",
                     request.session_id
                 ),
             });
