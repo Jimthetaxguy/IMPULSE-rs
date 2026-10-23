@@ -69,9 +69,9 @@ impl DynamicTool for BuildHealthTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let config = parse_hygiene_config(&params);
+        let config = parse_hygiene_config(&params, ctx, false)?;
         let report = off_runtime(move || {
             let paths = config.expanded_scan_paths();
             let projects = build_hygiene::discover_rust_projects(&paths);
@@ -142,9 +142,9 @@ impl DynamicTool for SweepTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let config = parse_hygiene_config(&params);
+        let config = parse_hygiene_config(&params, ctx, true)?;
         let days = params
             .get("days")
             .and_then(|v| v.as_u64())
@@ -227,9 +227,9 @@ impl DynamicTool for WipeTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let config = parse_hygiene_config(&params);
+        let config = parse_hygiene_config(&params, ctx, true)?;
         let dry_run = params
             .get("dry_run")
             .and_then(|v| v.as_bool())
@@ -298,9 +298,9 @@ impl DynamicTool for CleanAllTool {
     async fn execute(
         &self,
         params: serde_json::Value,
-        _ctx: &ToolContext,
+        ctx: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
-        let config = parse_hygiene_config(&params);
+        let config = parse_hygiene_config(&params, ctx, true)?;
         let dry_run = params
             .get("dry_run")
             .and_then(|v| v.as_bool())
@@ -510,20 +510,118 @@ impl DynamicTool for ToolAvailabilityTool {
 // Helper
 // ============================================================================
 
-fn parse_hygiene_config(params: &serde_json::Value) -> BuildHygieneConfig {
+/// Builds the hygiene config from `params`, checking every caller-supplied
+/// `scan_paths` entry against `ctx`'s roots (`write` for tools that delete).
+///
+/// `scan_paths` is a comma-separated `ParamType::String`, so the executor's
+/// `validate_paths`, which only checks `FilePath` params, never saw it: an
+/// MCP caller limited to one read root could scan, and with write capability
+/// wipe, `target/` directories anywhere. The configured defaults are trusted
+/// and stay unchecked; an unrestricted (CLI) context allows every path.
+fn parse_hygiene_config(
+    params: &serde_json::Value,
+    ctx: &ToolContext,
+    write: bool,
+) -> Result<BuildHygieneConfig, ToolError> {
     let mut config = BuildHygieneConfig::default();
     if let Some(paths) = params.get("scan_paths").and_then(|v| v.as_str()) {
         config.scan_paths = paths.split(',').map(|s| s.trim().to_string()).collect();
+        if let Some(refused) = config
+            .expanded_scan_paths()
+            .into_iter()
+            .find(|path| !ctx.is_path_allowed(path, write))
+        {
+            return Err(ToolError::PathNotAllowed(refused.display().to_string()));
+        }
     }
     if let Some(threshold) = params.get("threshold_gb").and_then(|v| v.as_f64()) {
         config.size_threshold_gb = threshold;
     }
-    config
+    Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A context limited to `root` for reads and writes, like a restricted
+    /// (non-CLI) caller.
+    fn restricted_to(root: &std::path::Path) -> ToolContext {
+        let mut ctx = ToolContext::with_all_capabilities();
+        ctx.allowed_read_roots = vec![root.to_path_buf()];
+        ctx.allowed_write_roots = vec![root.to_path_buf()];
+        ctx
+    }
+
+    /// A fake Rust project with a `target/` directory under `dir`.
+    fn fake_project(dir: &std::path::Path) -> std::path::PathBuf {
+        let project = dir.join("victim");
+        std::fs::create_dir_all(project.join("target/debug")).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"victim\"\n").unwrap();
+        std::fs::write(project.join("target/debug/blob"), vec![0u8; 4096]).unwrap();
+        project
+    }
+
+    /// Path audit: `scan_paths` is a String param, so the executor's
+    /// FilePath sandbox never saw it. A restricted caller could scan
+    /// outside its roots with build_health and delete with wipe.
+    #[tokio::test]
+    async fn test_scan_paths_outside_the_roots_are_refused_and_nothing_is_wiped() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = fake_project(outside.path());
+        let ctx = restricted_to(allowed.path());
+        let scan = serde_json::json!({
+            "scan_paths": outside.path().display().to_string(),
+            "dry_run": false,
+        });
+
+        for (name, result) in [
+            (
+                "build_health",
+                BuildHealthTool
+                    .execute(scan.clone(), &ctx)
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "sweep",
+                SweepTool.execute(scan.clone(), &ctx).await.map(|_| ()),
+            ),
+            (
+                "wipe",
+                WipeTool.execute(scan.clone(), &ctx).await.map(|_| ()),
+            ),
+            (
+                "clean_all",
+                CleanAllTool.execute(scan.clone(), &ctx).await.map(|_| ()),
+            ),
+        ] {
+            assert!(
+                matches!(result, Err(ToolError::PathNotAllowed(_))),
+                "{name} must refuse a scan path outside its roots, got {result:?}"
+            );
+        }
+        assert!(
+            victim.join("target/debug/blob").exists(),
+            "nothing outside was deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_scan_paths_inside_the_roots_and_unrestricted_contexts_still_work() {
+        let allowed = tempfile::tempdir().unwrap();
+        fake_project(allowed.path());
+        let inside = serde_json::json!({"scan_paths": allowed.path().display().to_string()});
+        let restricted = restricted_to(allowed.path());
+        assert!(BuildHealthTool
+            .execute(inside.clone(), &restricted)
+            .await
+            .is_ok());
+        // The CLI context has no roots and keeps scanning anywhere.
+        let unrestricted = ToolContext::with_all_capabilities();
+        assert!(BuildHealthTool.execute(inside, &unrestricted).await.is_ok());
+    }
 
     /// Round 3 (reviewer B): the scans and subprocesses ran on the runtime's
     /// own thread. On a single-threaded runtime, work run inline would hold

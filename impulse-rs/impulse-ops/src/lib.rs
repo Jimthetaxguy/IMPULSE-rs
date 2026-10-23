@@ -34,6 +34,8 @@ pub enum OpsError {
     Json(#[from] serde_json::Error),
     #[error("missing artifact parent directory for {0}")]
     MissingParent(PathBuf),
+    #[error("artifact {field} `{value}` is not a single path segment")]
+    InvalidPathSegment { field: &'static str, value: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -952,7 +954,31 @@ pub fn artifact_file_path(
         .join(format!("{}.json", artifact_id))
 }
 
+/// Checks that an artifact's ids can each be used as one path segment.
+///
+/// `artifact_file_path` joins `project_id`, `agent_id` and `id` into a path,
+/// and acknowledge/apply re-save an artifact using the ids stored in its own
+/// JSON. A forged artifact with `"project_id": "../../.."` would otherwise
+/// make an operator's click write outside `.impulse`. Only what can leave a
+/// directory is refused, so existing ids (which may contain dots) still work.
+pub fn validate_artifact_path_ids(artifact: &ArtifactEnvelope) -> Result<(), OpsError> {
+    for (field, value) in [
+        ("project_id", artifact.project_id.as_str()),
+        ("agent_id", artifact.agent_id.as_str()),
+        ("id", artifact.id.as_str()),
+    ] {
+        if value.is_empty() || value == "." || value == ".." || value.contains(['/', '\\', '\0']) {
+            return Err(OpsError::InvalidPathSegment {
+                field,
+                value: value.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn save_artifact(impulse_dir: &Path, artifact: &ArtifactEnvelope) -> Result<PathBuf, OpsError> {
+    validate_artifact_path_ids(artifact)?;
     let path = artifact_file_path(
         impulse_dir,
         &artifact.project_id,
@@ -1046,6 +1072,58 @@ mod tests {
         let saved: ArtifactEnvelope =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(saved.id, "artifact-1");
+    }
+
+    /// Path audit: acknowledge/apply re-save an artifact using the ids in
+    /// its own JSON, so a forged id must not steer the write outside.
+    #[test]
+    fn test_save_artifact_refuses_ids_that_leave_the_directory() {
+        let temp = TempDir::new().unwrap();
+        let impulse = temp.path().join(".impulse");
+        for (field, value) in [
+            ("project_id", "../../.."),
+            ("agent_id", "a/b"),
+            ("id", ".."),
+            ("id", ""),
+            ("project_id", "nul\0byte"),
+        ] {
+            let mut artifact = ArtifactEnvelope {
+                id: "artifact-1".into(),
+                project_id: "project-a".into(),
+                agent_id: "agent-a".into(),
+                ..Default::default()
+            };
+            match field {
+                "project_id" => artifact.project_id = value.into(),
+                "agent_id" => artifact.agent_id = value.into(),
+                _ => artifact.id = value.into(),
+            }
+            match save_artifact(&impulse, &artifact) {
+                Err(OpsError::InvalidPathSegment { field: refused, .. }) => {
+                    assert_eq!(refused, field)
+                }
+                other => panic!("{field}={value:?} must be refused, got {other:?}"),
+            }
+        }
+        // Nothing was written anywhere under the temp root.
+        assert!(!impulse.exists());
+        let err = OpsError::InvalidPathSegment {
+            field: "id",
+            value: "..".into(),
+        };
+        assert!(err.to_string().contains("not a single path segment"));
+    }
+
+    #[test]
+    fn test_save_artifact_accepts_ids_with_dots() {
+        let temp = TempDir::new().unwrap();
+        let artifact = ArtifactEnvelope {
+            id: "report.v2".into(),
+            project_id: "impulse.rs".into(),
+            agent_id: "agent-a".into(),
+            ..Default::default()
+        };
+        assert!(save_artifact(temp.path(), &artifact).unwrap().exists());
     }
 
     #[test]
