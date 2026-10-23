@@ -49,6 +49,51 @@ and ranked changes #1, #5 and later are unknown until James supplies it.
    tracked files but not untracked or ignored ones. A restore point would copy
    those before the first `file_write`/`bash_exec` of a session.
 
+## From the Cursor and Grok sources (second sweep)
+
+Sources: `~/.cursor/plans/` and the Cursor `state.vscdb` composer threads
+(mostly execution and PR-landing work, no new primitives); grok-build in
+`~/.grok` (memory-v2 `topics/impulse-rs.md`, the 2026-09-17 authority-hole
+sessions, the 2026-10-21 "propose state" session); grokbot in `~/.grokbot`
+(daemon state only) with its autonomous logs under `~/Desktop/.remember/`;
+and the Grok-built `~/code/min-agent-rs` and `~/code/tools/context-lane`.
+
+7. **Total tool-call budget per loop run.** `LoopBudget` capped rounds,
+   wall clock, streaks and context, but one round runs every call the model
+   batched, so ten rounds of fan-out were unbounded. *Implemented in a
+   follow-up PR* (`max_tool_calls`, `LoopTrip::ToolCallBudget`, Ion default
+   50, governed Builder unchanged).
+8. **Redact credential-shaped tool output** before it reaches the model or
+   the blackboard. The tool-output guardrail rules only warn
+   (`src/guardrail/defaults.rs`), and `wrap_untrusted_tool_output`
+   (`src/ion_repl/chat.rs`) passes content through unchanged. Prior art:
+   `min-agent-rs/src/redact.rs`.
+9. **Run Monty in a subprocess worker (`monty-pool`).** ADR-0021 records that
+   `max_memory` does not bound gradual growth, and the interpreter runs inside
+   the daemon. The first slice is one worker under a parent-side hard timeout,
+   tested so that a crashing program leaves the daemon alive.
+10. **A calculator without Python.** `calculate()` still interpolates into a
+    Python program and requires `Capability::PythonExec`, so voice policy
+    classifies a calculator call as mutating. A pure-Rust parser for the
+    existing allowlisted grammar removes the over-gate.
+11. **Proposal-acceptor rules for context compiler v0** (Grok, 2026-10-21).
+    The model proposes a lane document and a Rust acceptor refuses unsourced
+    facts, reads without excerpts, and self-assigned ids or budgets.
+    Redaction runs before anything is written. Prior art: `context-lane`.
+12. **License mismatch.** `LICENSE` is Apache-2.0 but every `Cargo.toml` says
+    MIT. James needs to pick one.
+
+Also noted: `ToolRegistry::with_defaults` logs an error and returns an empty
+registry. Its production callers (agent discovery, voice adapter) could
+therefore advertise zero tools silently; `try_with_defaults()?` would fail
+closed. Grok Build's per-prompt `rewind_points.jsonl` snapshots give a
+concrete shape for candidate 6.
+
+Stale claims in those sources: the Cursor 2026-09-02 transcript describes a
+`block-tool-output-secret` rule and a 32 KiB output cap that are not on
+main. Grok memory says `PythonExecTool` ignores its timeout (it doesn't) and
+that main fails to compile `impulse-desktop` (fixed).
+
 ## Looked at and set aside
 
 - **Argument-bound, expiring `ApprovalGrant`.** Proposed to stop arguments
