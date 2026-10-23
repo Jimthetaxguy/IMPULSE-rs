@@ -427,18 +427,26 @@ mod tests {
 
     #[test]
     fn test_retrieval_mode_wire_names_are_pinned() {
-        // Serde uses the variant name, not `as_str`'s lowercase form.
+        // Serde uses the variant name, not `as_str`'s lowercase form. Pinned,
+        // not aliased: config and CLI reach a mode through `parse`, and no
+        // serialized struct carries a RetrievalMode, so serde never reads the
+        // `as_str` spelling.
         for (mode, wire) in [
             (RetrievalMode::Keyword, "\"Keyword\""),
             (RetrievalMode::Semantic, "\"Semantic\""),
         ] {
             assert_eq!(serde_json::to_string(&mode).unwrap(), wire);
             assert_eq!(serde_json::from_str::<RetrievalMode>(wire).unwrap(), mode);
+            let shown = format!("\"{}\"", mode.as_str());
+            assert!(serde_json::from_str::<RetrievalMode>(&shown).is_err());
         }
     }
 
     #[test]
     fn test_search_backend_wire_names_are_pinned() {
+        // Pinned, not aliased, for the same reason as RetrievalMode: the
+        // `as_str` spelling ("sqlite-vec") is reported in `backend_used` as a
+        // plain string and read back only through `parse`.
         for (backend, wire) in [
             (SearchBackend::Auto, "\"Auto\""),
             (SearchBackend::SqliteVec, "\"SqliteVec\""),
@@ -450,11 +458,15 @@ mod tests {
                 serde_json::from_str::<SearchBackend>(wire).unwrap(),
                 backend
             );
+            let shown = format!("\"{}\"", backend.as_str());
+            assert!(serde_json::from_str::<SearchBackend>(&shown).is_err());
         }
     }
 
     #[test]
     fn test_index_scope_wire_names_are_pinned() {
+        // IndexScope has only `parse` ("history", "genome", "all"), the CLI
+        // input path; serde keeps the variant name. Pinned.
         for (scope, wire) in [
             (IndexScope::History, "\"History\""),
             (IndexScope::Genome, "\"Genome\""),
@@ -462,6 +474,9 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_string(&scope).unwrap(), wire);
             assert_eq!(serde_json::from_str::<IndexScope>(wire).unwrap(), scope);
+            let lowercase = wire.to_lowercase();
+            assert_eq!(IndexScope::parse(lowercase.trim_matches('"')), Some(scope));
+            assert!(serde_json::from_str::<IndexScope>(&lowercase).is_err());
         }
     }
 }

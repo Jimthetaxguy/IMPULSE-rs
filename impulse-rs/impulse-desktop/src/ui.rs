@@ -3693,3 +3693,24 @@ pub fn DesktopShell() -> Element {
         }
     }
 }
+
+#[cfg(test)]
+mod governed_ack_kind_tests {
+    use super::GovernedAckKind;
+
+    #[test]
+    fn test_governed_ack_kind_wire_names_match_as_str() {
+        for kind in [
+            GovernedAckKind::DiscardStrandedCommit,
+            GovernedAckKind::PromotionRerunPending,
+            GovernedAckKind::PromotionRefused,
+        ] {
+            let wire = format!("\"{}\"", kind.as_str());
+            assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<GovernedAckKind>(&wire).unwrap(),
+                kind
+            );
+        }
+    }
+}

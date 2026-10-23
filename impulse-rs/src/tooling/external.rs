@@ -942,7 +942,8 @@ mod tests {
 
     #[test]
     fn test_capability_wire_names_are_pinned() {
-        // Manifests name capabilities by variant (no serde rename).
+        // Manifests name capabilities by variant (no serde rename), and the
+        // `as_str` spelling is accepted as an alias.
         for (capability, wire) in [
             (Capability::FileSystemRead, "\"FileSystemRead\""),
             (Capability::FileSystemWrite, "\"FileSystemWrite\""),
@@ -954,6 +955,14 @@ mod tests {
             assert_eq!(serde_json::to_string(&capability).unwrap(), wire);
             assert_eq!(
                 serde_json::from_str::<Capability>(wire).unwrap(),
+                capability
+            );
+            // `tools describe` and the manifest show `as_str`; a manifest that
+            // copies that spelling parses to the same capability.
+            let shown = format!("\"{}\"", capability.as_str());
+            assert_ne!(shown, wire);
+            assert_eq!(
+                serde_json::from_str::<Capability>(&shown).unwrap(),
                 capability
             );
         }
