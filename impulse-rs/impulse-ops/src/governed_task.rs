@@ -2303,4 +2303,32 @@ mod tests {
         let recovered: GovernedTaskMutation = serde_json::from_value(cancelled_json).unwrap();
         assert_eq!(recovered, cancelled);
     }
+
+    #[test]
+    fn test_claim_request_generation_round_trips_and_defaults_to_none() {
+        let request = GovernedClaimRequest {
+            request_id: GovernedRequestId::try_new("claim-fenced").unwrap(),
+            project_id: "workspace".to_string(),
+            task_id: GovernedTaskId::try_new("task-1").unwrap(),
+            expected_revision: 3,
+            summary: "done".to_string(),
+            artifact_ids: Vec::new(),
+            generation: Some(2),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["generation"], 2);
+        let recovered: GovernedClaimRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(recovered, request);
+
+        // A pre-fencing client omits the field; it reads as None and is not
+        // written back out.
+        let legacy = GovernedClaimRequest {
+            generation: None,
+            ..request
+        };
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("generation").is_none());
+        let recovered: GovernedClaimRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(recovered.generation, None);
+    }
 }

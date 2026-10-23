@@ -1553,6 +1553,21 @@ fn apply_mutation(
             ) {
                 return invalid_transition("a settled review has no worker lease to take over");
             }
+            // Once the worker has handed in a claim, its part is done until
+            // the review sends work back (ChangesRequested, VerificationFailed),
+            // which reopens the lease. A takeover in between would fence no
+            // one and leave the old generation's claim under review.
+            if matches!(
+                task.review_state,
+                GovernedReviewState::AwaitingVerification
+                    | GovernedReviewState::AwaitingSupervisor
+                    | GovernedReviewState::AwaitingOperator
+                    | GovernedReviewState::Escalated
+            ) {
+                return invalid_transition(
+                    "a claim is under review; take over only after it is sent back",
+                );
+            }
             if task.world_scope.requires_staged_worktree()
                 && task.active_staged_worktree().is_none()
             {
@@ -6308,6 +6323,63 @@ pub(in crate::state) mod tests {
             ))
             .unwrap_err();
         assert!(error.to_string().contains("settled review"));
+    }
+
+    #[test]
+    fn fenced_error_display_names_what_was_presented() {
+        let task_id = GovernedTaskId::try_new("task-fenced").unwrap();
+        let stale = GovernedTaskStateError::Fenced {
+            task_id: task_id.clone(),
+            presented: PresentedGeneration::Stale(0),
+            current: 1,
+        };
+        assert_eq!(
+            stale.to_string(),
+            "governed task `task-fenced` write fenced: presented lease generation 0, current generation 1"
+        );
+        let missing = GovernedTaskStateError::Fenced {
+            task_id,
+            presented: PresentedGeneration::Missing,
+            current: 2,
+        };
+        assert!(missing
+            .to_string()
+            .contains("presented lease generation none, current generation 2"));
+    }
+
+    /// Review on #140: a takeover while a claim was under review left the old
+    /// generation's claim in the pipeline with no worker left to fence.
+    #[test]
+    fn takeover_is_refused_while_a_claim_is_under_review() {
+        let (_root, state) = state();
+        let running = running_task(&state, "takeover-under-review");
+        let claimed = state
+            .mutate_governed_task(fenced_claim(&running, "claim-under-review", None))
+            .unwrap();
+        assert_eq!(
+            claimed.review_state,
+            GovernedReviewState::AwaitingVerification
+        );
+        let error = state
+            .mutate_governed_task(mutation(
+                &claimed,
+                "takeover-under-review",
+                GovernedTaskMutation::TakeOverWorker {
+                    actor: actor(GovernedActorKind::Operator, "james"),
+                    reason: "worker went quiet".into(),
+                },
+            ))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("a claim is under review"),
+            "unexpected error: {error:#}"
+        );
+        let unchanged = state
+            .get_governed_task("impulse-test", &claimed.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.lease_generation(), 0);
+        assert_eq!(unchanged.revision, claimed.revision);
     }
 
     /// Compatibility: a ledger that never saw a takeover is still written at
