@@ -148,6 +148,8 @@ This covered 29 of the 32 notes that mention IMPULSE in full, the IMPULSE sectio
   - Daemon-mode `session-start` injects no context (`daemon_dispatch.rs`), unlike hook mode.
   - A Gemini fleet scan lists IMPULSE-rs as 24 crates. It has 6 workspace members.
 
+**Single-writer assumption to revisit with ADR-0020's endpoint.** After a failed append, `state/memory_record.rs` truncates `MEMORY.jsonl` back to its earlier length. `storage/mod.rs` deliberately does not do this for other logs, because truncation also removes records another process appended in the meantime. It is safe today only because the daemon is the sole writer of the memory log. If memory promotion ever writes from a second process, replace the rollback with the skip-torn-line approach `append_jsonl_path` uses.
+
 Also noted: `ToolRegistry::with_defaults` logs an error and returns an empty
 registry. Its production callers (agent discovery, voice adapter) could
 therefore advertise zero tools silently; `try_with_defaults()?` would fail
