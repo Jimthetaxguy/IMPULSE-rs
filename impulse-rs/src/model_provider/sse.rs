@@ -21,7 +21,14 @@ const MAX_SSE_EVENT_BYTES: usize = 16 * 1024 * 1024;
 /// Longest silence accepted between chunks of a streamed reply. A server
 /// that sends headers and then nothing would otherwise hold the stream, and
 /// the policy's fallback, forever.
+#[cfg(not(test))]
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Tests that stall a real loopback stream run in real time, because under
+/// paused time tokio jumps the clock while a request waits on real socket
+/// bytes, which fired reqwest's request timeout on a healthy server. They
+/// need an idle timeout that elapses quickly.
+#[cfg(test)]
+pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The HTTP client settings every provider uses. Redirects are refused: a
 /// model API has no reason to redirect a POST, and reqwest strips only the
