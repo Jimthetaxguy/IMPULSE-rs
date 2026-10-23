@@ -904,8 +904,9 @@ struct ReplToolExecutor<'a> {
 /// The files a session has read or written, with the modification time it
 /// last saw for each, so `file_write` can refuse to replace a file the model
 /// has never seen or that changed since it looked (another agent, an editor,
-/// a `bash_exec`). Keyed by the path as `ToolContext::resolve_path` resolves
-/// it, the same resolution the tool itself uses.
+/// a `bash_exec`). Keyed by `tooling::resolve_for_write` of the resolved
+/// path, the exact physical path `file_write` replaces, so `x/../a` and `a`
+/// (or a symlinked prefix) share one entry.
 #[derive(Debug, Default)]
 pub(crate) struct FileVersions(
     std::sync::Mutex<std::collections::HashMap<PathBuf, Option<std::time::SystemTime>>>,
@@ -920,25 +921,31 @@ impl FileVersions {
 
     /// Remember `path` as seen at its current modification time.
     fn record(&self, path: &std::path::Path) {
-        let seen = Self::modified(path);
+        let key = Self::key(path);
+        let seen = Self::modified(&key);
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(path.to_path_buf(), seen);
+            .insert(key, seen);
+    }
+
+    fn key(path: &std::path::Path) -> PathBuf {
+        crate::tooling::resolve_for_write(path)
     }
 
     /// Why a write to `path` must not run, or `None` when it may: the path
     /// does not exist yet, or this session saw it at its current version.
     fn write_refusal(&self, path: &std::path::Path) -> Option<String> {
-        if std::fs::symlink_metadata(path).is_err() {
+        let key = Self::key(path);
+        if std::fs::symlink_metadata(&key).is_err() {
             return None;
         }
-        let current = Self::modified(path);
+        let current = Self::modified(&key);
         let versions = self
             .0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match versions.get(path) {
+        match versions.get(&key) {
             None => Some(format!(
                 "'{}' already exists and has not been read in this session. Read it with \
                  file_read first, then write the full new content.",
@@ -1108,6 +1115,19 @@ impl ToolExecutor for ReplToolExecutor<'_> {
                     is_error: true,
                 };
             }
+            // Checked again after the prompt: the file may have been edited,
+            // or created, while the human was deciding.
+            if name == "file_write" {
+                if let Some(reason) = tracked_path
+                    .as_deref()
+                    .and_then(|path| self.file_versions.write_refusal(path))
+                {
+                    return ToolExecutionResult {
+                        content: format!("Refused: {reason}"),
+                        is_error: true,
+                    };
+                }
+            }
             Some(ApprovalGrant::new(name, verdict.as_ref().map(|r| r.action)))
         } else {
             None
@@ -1128,7 +1148,12 @@ impl ToolExecutor for ReplToolExecutor<'_> {
                     .flatten();
                 let result = match tool.run(input, self.ctx).await {
                     Ok(outcome) => {
-                        if outcome.ok {
+                        // A read counts only when it returned content: an
+                        // oversized file comes back Ok with an `error` and
+                        // nothing the model could have looked at.
+                        let saw_content =
+                            name != "file_read" || outcome.payload.get("content").is_some();
+                        if outcome.ok && saw_content {
                             if let Some(path) = &tracked_path {
                                 self.file_versions.record(path);
                             }
@@ -2885,6 +2910,119 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "edited elsewhere\n"
+        );
+    }
+
+    /// Codex review on #148: the three ways the first version let an unread
+    /// or changed file be overwritten.
+    #[tokio::test]
+    async fn test_file_write_refusal_holds_for_aliases_oversized_reads_and_edits_during_the_prompt()
+    {
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+        let edit_during_prompt: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+        let confirm = |_name: &str, _input: &Value, verdict: &GuardVerdict, _paths: &[PathBuf]| {
+            if let Some(path) = edit_during_prompt.lock().unwrap().take() {
+                std::fs::write(&path, "edited during the prompt\n").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(
+                        std::time::SystemTime::now() + std::time::Duration::from_secs(120),
+                    )
+                    .unwrap();
+            }
+            decide_approval(verdict, "y")
+        };
+        let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
+        let executor = ReplToolExecutor {
+            tools: &tools,
+            ctx: &ctx,
+            confirm: &confirm,
+            untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
+        };
+        let root = repo_root.path();
+        std::fs::write(root.join("existing.txt"), "original\n").unwrap();
+
+        // `missing/../existing.txt` names the existing file: refused unread.
+        let aliased = root.join("missing").join("..").join("existing.txt");
+        let result = executor
+            .execute(
+                "file_write",
+                serde_json::json!({"path": aliased.display().to_string(), "content": "x"}),
+            )
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("has not been read"),
+            "{}",
+            result.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("existing.txt")).unwrap(),
+            "original\n"
+        );
+
+        // Reading through one spelling counts for the other.
+        let read = executor
+            .execute(
+                "file_read",
+                serde_json::json!({"path": root.join("existing.txt").display().to_string()}),
+            )
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        let result = executor
+            .execute(
+                "file_write",
+                serde_json::json!({"path": aliased.display().to_string(), "content": "ok\n"}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+
+        // A file too large to read returns no content, so it is not "read".
+        let big = root.join("big.txt");
+        std::fs::write(&big, vec![b'x'; 1_000_001]).unwrap();
+        let read = executor
+            .execute(
+                "file_read",
+                serde_json::json!({"path": big.display().to_string()}),
+            )
+            .await;
+        assert!(read.content.contains("File too large"), "{}", read.content);
+        let result = executor
+            .execute(
+                "file_write",
+                serde_json::json!({"path": big.display().to_string(), "content": "small"}),
+            )
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert_eq!(std::fs::metadata(&big).unwrap().len(), 1_000_001);
+
+        // An edit made while the human is deciding is not overwritten.
+        let target = root.join("existing.txt");
+        *edit_during_prompt.lock().unwrap() = Some(target.clone());
+        let result = executor
+            .execute(
+                "file_write",
+                serde_json::json!({"path": target.display().to_string(), "content": "clobber\n"}),
+            )
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("changed since"),
+            "{}",
+            result.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "edited during the prompt\n"
         );
     }
 
