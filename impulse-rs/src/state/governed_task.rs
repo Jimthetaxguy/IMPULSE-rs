@@ -1556,14 +1556,19 @@ fn apply_mutation(
             // Once the worker has handed in a claim, its part is done until
             // the review sends work back (ChangesRequested, VerificationFailed),
             // which reopens the lease. A takeover in between would fence no
-            // one and leave the old generation's claim under review.
-            if matches!(
-                task.review_state,
-                GovernedReviewState::AwaitingVerification
-                    | GovernedReviewState::AwaitingSupervisor
-                    | GovernedReviewState::AwaitingOperator
-                    | GovernedReviewState::Escalated
-            ) {
+            // one and leave the old generation's claim under review. Replay
+            // does not re-judge this: a ledger written before the rule may
+            // hold such a takeover, and refusing it would fail the whole
+            // ledger closed (see `MutationContext::is_replay`).
+            if !context.is_replay
+                && matches!(
+                    task.review_state,
+                    GovernedReviewState::AwaitingVerification
+                        | GovernedReviewState::AwaitingSupervisor
+                        | GovernedReviewState::AwaitingOperator
+                        | GovernedReviewState::Escalated
+                )
+            {
                 return invalid_transition(
                     "a claim is under review; take over only after it is sent back",
                 );
@@ -6323,6 +6328,48 @@ pub(in crate::state) mod tests {
             ))
             .unwrap_err();
         assert!(error.to_string().contains("settled review"));
+    }
+
+    /// Review on #140: the under-review rule ran during replay too, so a
+    /// ledger written before it that holds such a takeover failed
+    /// `State::new` for the whole project.
+    #[test]
+    fn a_takeover_recorded_under_review_still_replays() {
+        let (_root, state) = state();
+        let running = running_task(&state, "replay-under-review");
+        let mut claimed = state
+            .mutate_governed_task(fenced_claim(&running, "claim-replay", None))
+            .unwrap();
+        assert_eq!(
+            claimed.review_state,
+            GovernedReviewState::AwaitingVerification
+        );
+        let takeover = || GovernedTaskMutation::TakeOverWorker {
+            actor: actor(GovernedActorKind::Operator, "james"),
+            reason: "recorded before the rule".into(),
+        };
+        let now = "2026-10-23T00:00:00Z";
+        let next_revision = claimed.revision + 1;
+        let live = apply_mutation(
+            &mut claimed.clone(),
+            takeover(),
+            next_revision,
+            MutationContext::live(now, OperatorAuthentication::Declared),
+        );
+        assert!(live.is_err(), "a live takeover under review is refused");
+        let replayed = apply_mutation(
+            &mut claimed,
+            takeover(),
+            next_revision,
+            MutationContext {
+                now,
+                operator_authentication: OperatorAuthentication::Declared,
+                replay_claim: None,
+                is_replay: true,
+            },
+        );
+        assert!(replayed.is_ok(), "replay must reproduce it: {replayed:?}");
+        assert_eq!(claimed.lease_generation(), 1);
     }
 
     #[test]
