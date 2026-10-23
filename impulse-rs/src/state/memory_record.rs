@@ -845,9 +845,9 @@ mod tests {
             entry_count: 0,
             head_digest: MEMORY_LOG_GENESIS_DIGEST.to_string(),
         };
-        let error = MemoryLog::load(&storage, Some(&head), LedgerOrigin::Local)
-            .err()
-            .expect("a zero-entry committed head must be refused");
+        let Err(error) = MemoryLog::load(&storage, Some(&head), LedgerOrigin::Local) else {
+            panic!("a zero-entry committed head must be refused");
+        };
         assert!(matches!(
             error.downcast_ref::<MemoryLogError>(),
             Some(MemoryLogError::EmptyCommittedHead)
@@ -1423,10 +1423,7 @@ mod tests {
                 MemoryLogError::DuplicateRecord { record_id },
                 "more than one entry",
             ),
-            (
-                MemoryLogError::EmptyCommittedHead,
-                "head of zero entries",
-            ),
+            (MemoryLogError::EmptyCommittedHead, "head of zero entries"),
         ];
         assert_eq!(
             cases.len(),

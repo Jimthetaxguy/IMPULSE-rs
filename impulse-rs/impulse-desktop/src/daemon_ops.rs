@@ -706,6 +706,11 @@ mod unix {
                 WorkbenchDaemonRequest::MutateGovernedTask { .. }
                     | WorkbenchDaemonRequest::PromoteGovernedOutcome { .. }
                     | WorkbenchDaemonRequest::DiscardGovernedStagedWorktree { .. }
+            ) || matches!(
+                request,
+                // A supervisor permission change is operator-only (ADR-0018).
+                WorkbenchDaemonRequest::RunSupervisorAction { action }
+                    if action.changes_permissions()
             )
         }
 
@@ -3525,6 +3530,18 @@ mod unix {
             };
             assert!(UnixDaemonOpsClient::requires_operator_class(&promote));
             assert!(UnixDaemonOpsClient::requires_operator_class(&discard));
+            assert!(UnixDaemonOpsClient::requires_operator_class(
+                &WorkbenchDaemonRequest::RunSupervisorAction {
+                    action: impulse_ops::SupervisorAction::ClearSessionOverride { confirmed: true },
+                }
+            ));
+            assert!(!UnixDaemonOpsClient::requires_operator_class(
+                &WorkbenchDaemonRequest::RunSupervisorAction {
+                    action: impulse_ops::SupervisorAction::SearchMemory {
+                        query: "q".to_string(),
+                    },
+                }
+            ));
             assert!(
                 !UnixDaemonOpsClient::requires_operator_class(
                     &WorkbenchDaemonRequest::GetGovernedTask {

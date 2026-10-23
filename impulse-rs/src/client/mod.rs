@@ -217,6 +217,10 @@ impl DaemonClient {
                 | DaemonRequest::RegisterGovernedTask { .. }
                 | DaemonRequest::PromoteGovernedOutcome { .. }
                 | DaemonRequest::DiscardGovernedStagedWorktree { .. }
+        ) || matches!(
+            request,
+            // A supervisor permission change is operator-only (ADR-0018).
+            DaemonRequest::RunSupervisorAction { action } if action.changes_permissions()
         )
     }
 
@@ -912,6 +916,21 @@ mod tests {
             matches!(received[1], DaemonRequest::MutateGovernedTask { .. }),
             "a refused presentation must not swallow the request"
         );
+    }
+
+    #[test]
+    fn test_supervisor_permission_changes_present_the_operator_capability() {
+        let change = DaemonRequest::RunSupervisorAction {
+            action: impulse_ops::SupervisorAction::ResetBaselinePermissions { confirmed: true },
+        };
+        assert!(DaemonClient::requires_operator_class(&change));
+        let focus = DaemonRequest::RunSupervisorAction {
+            action: impulse_ops::SupervisorAction::FocusAgent {
+                agent_id: "tab-1".to_string(),
+                session_id: None,
+            },
+        };
+        assert!(!DaemonClient::requires_operator_class(&focus));
     }
 
     #[test]
