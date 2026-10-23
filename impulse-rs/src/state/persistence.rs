@@ -963,15 +963,39 @@ mod tests {
             writes_waited,
             "a write did not wait for the end in progress"
         );
-        // Round 4/5 (reviewer A): a second end must not record the session
-        // again, and tracking it must not report success and then vanish.
-        assert_eq!(
-            writes,
-            Ok((Some(true), true)),
-            "after the end, a second end found nothing and tracking was refused"
-        );
+        // Whether the end itself succeeds depends on the platform's FIFO
+        // semantics (Linux opens a FIFO read-write without a peer and then
+        // refuses `fsync` on it), so only check that the waiting writes ran
+        // once the lock was released. What they must find after an end is
+        // checked on a regular file in
+        // `test_writes_after_an_end_find_the_session_gone`.
+        assert!(writes.is_ok(), "the waiting writes never ran");
+    }
+
+    /// Round 4/5 (reviewer A): a second end must not record the session
+    /// again, and tracking it must not report success and then vanish.
+    #[tokio::test]
+    async fn test_writes_after_an_end_find_the_session_gone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = State::new(dir.path().to_path_buf()).unwrap();
+        let ending = state.create_session("s".to_string(), None).await.unwrap();
+        let other = state.create_session("t".to_string(), None).await.unwrap();
+
+        assert!(state
+            .end_session(&ending.id, "done".to_string())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(state
+            .end_session(&ending.id, "again".to_string())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state.track_file(&ending.id, "late.rs").await.is_err());
+
+        assert_eq!(state.get_history_sync().unwrap().len(), 1);
         let saved = std::fs::read_to_string(dir.path().join(LIVE_STATE_FILE)).unwrap();
-        assert!(!saved.contains(&ending_id));
+        assert!(!saved.contains(&ending.id));
         assert!(saved.contains(&other.id));
     }
 
