@@ -2716,9 +2716,28 @@ pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromot
 pub async fn promote_governed_outcome_async(
     task: GovernedTaskRun,
 ) -> Result<GovernedPromotionInput> {
-    tokio::task::spawn_blocking(move || promote_governed_outcome(&task))
+    run_blocking_effect("governed outcome promotion worker panicked", move || {
+        promote_governed_outcome(&task)
+    })
+    .await?
+}
+
+/// Run a blocking side effect on the blocking pool. A panic there can land
+/// after the effect was dispatched (a promotion's compare-and-swap moved the
+/// branch, then the sync panicked), so the join failure is marked dispatched:
+/// the journal records it as unknown, never as a known failure.
+async fn run_blocking_effect<T, F>(panic_context: &'static str, effect: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(effect)
         .await
-        .context("governed outcome promotion worker panicked")?
+        .map_err(|join_error| {
+            crate::state::EffectDispatchedError::wrap(
+                anyhow::Error::new(join_error).context(panic_context),
+            )
+        })
 }
 
 /// Remove a staged worktree and its administrative entry. Called after a
@@ -2757,6 +2776,27 @@ mod tests {
         GovernedTaskId, GovernedVerification, SupervisorVerdictKind, WorkerCompletionClaim,
     };
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_run_blocking_effect_marks_a_panic_as_dispatched() {
+        let error = run_blocking_effect("effect worker panicked", || -> u8 {
+            panic!("panicked after the compare-and-swap")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.is::<crate::state::EffectDispatchedError>());
+        assert!(format!("{error:#}").contains("effect worker panicked"));
+        assert!(matches!(
+            crate::state::classify_producer_error(error),
+            crate::state::ProducerSideEffectError::Dispatched(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_run_blocking_effect_returns_the_effect_value() {
+        let value = run_blocking_effect("unused", || 7_u8).await.unwrap();
+        assert_eq!(value, 7);
+    }
 
     fn run(repo: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")

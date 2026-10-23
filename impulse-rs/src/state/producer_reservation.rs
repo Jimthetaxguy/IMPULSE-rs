@@ -592,8 +592,14 @@ impl State {
 
     fn close_reservation_needs_rerun(&self, id: &ReservationId, reason: String) -> Result<()> {
         let mut ledger = self.producer_reservations.lock().map_err(lock_err)?;
-        if !ledger.reservations.contains_key(id) {
-            return Err(ProducerReservationError::NotFound(id.clone()).into());
+        let existing = ledger
+            .reservations
+            .get(id)
+            .ok_or_else(|| ProducerReservationError::NotFound(id.clone()))?;
+        // Now called on the live path too (a lost receipt), not only by the
+        // startup reconcile: never overwrite an outcome already recorded.
+        if !existing.is_open() {
+            return Err(ProducerReservationError::AlreadyReleased(id.clone()).into());
         }
 
         let mut candidate = ledger.clone();
@@ -988,6 +994,38 @@ mod tests {
         state.release(&id, "receipt-1").unwrap();
         let error = state.release(&id, "receipt-2").unwrap_err();
         assert!(error.to_string().contains("already released"));
+    }
+
+    /// A lost receipt now closes reservations on the live path, so it must
+    /// not overwrite an outcome a release already recorded.
+    #[test]
+    fn needs_rerun_close_refuses_an_already_released_reservation() {
+        let (_root, state) = state();
+        let task = registered_task(&state, "rerun-after-release");
+        let id = state
+            .reserve(
+                &task.id,
+                task.revision,
+                &request_id("req-1"),
+                ProducerKind::Verification,
+            )
+            .unwrap();
+        state.release(&id, "receipt-1").unwrap();
+        let error = state
+            .close_reservation_needs_rerun(&id, "late lost receipt".to_string())
+            .unwrap_err();
+        assert!(error.to_string().contains("already released"));
+        let recorded = state
+            .latest_reservation(&task.id, ProducerKind::Verification, &request_id("req-1"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recorded.outcome,
+            Some(ReservationOutcome::Released {
+                receipt_ref: "receipt-1".to_string()
+            })
+        );
+        assert_eq!(recorded.effect, Some(ProducerEffectOutcome::Confirmed));
     }
 
     /// Simulates a daemon crash between a producer side effect and its

@@ -331,6 +331,10 @@ where
             // From here the side effect has run. If its receipt cannot be made
             // durable the outcome is unknown, not failed (blueprint 2.1 "lost
             // response"): the journal closes the reservation as needs-rerun.
+            // That includes a ledger that refuses the receipt (a revision
+            // conflict, an invalid transition): the refusal is definite, but
+            // it is a refusal of the receipt, and the effect it would have
+            // recorded already ran, so `FailedKnown` would be false.
             let updated = persist_governed_mutation(state, mutation_request)
                 .await
                 .map_err(ProducerSideEffectError::ReceiptLost)?;
