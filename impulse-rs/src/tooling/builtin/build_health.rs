@@ -131,6 +131,7 @@ impl DynamicTool for SweepTool {
                     required: false,
                     default: None,
                 },
+                scan_paths_param(),
             ],
         }
     }
@@ -216,6 +217,7 @@ impl DynamicTool for WipeTool {
                     required: false,
                     default: None,
                 },
+                scan_paths_param(),
             ],
         }
     }
@@ -281,13 +283,16 @@ impl DynamicTool for CleanAllTool {
                 .into(),
             version: "0.1.0".into(),
             category: ToolCategory::System,
-            params: vec![ToolParam {
-                name: "dry_run".into(),
-                description: "Only show what would be cleaned (default: true)".into(),
-                param_type: ParamType::Bool,
-                required: false,
-                default: Some(serde_json::json!(true)),
-            }],
+            params: vec![
+                ToolParam {
+                    name: "dry_run".into(),
+                    description: "Only show what would be cleaned (default: true)".into(),
+                    param_type: ParamType::Bool,
+                    required: false,
+                    default: Some(serde_json::json!(true)),
+                },
+                scan_paths_param(),
+            ],
         }
     }
 
@@ -509,6 +514,22 @@ impl DynamicTool for ToolAvailabilityTool {
 // ============================================================================
 // Helper
 // ============================================================================
+
+/// `scan_paths`, which every hygiene tool reads through
+/// [`parse_hygiene_config`]. Declared on each of them so callers can see it
+/// and the path-param guard test covers it; it is a comma-separated String,
+/// so the tool itself checks each entry against the context's roots.
+fn scan_paths_param() -> ToolParam {
+    ToolParam {
+        name: "scan_paths".into(),
+        description: "Comma-separated directories to scan (supports ~). Each must be inside \
+                      the caller's allowed roots. Defaults to the configured scan paths"
+            .into(),
+        param_type: ParamType::String,
+        required: false,
+        default: None,
+    }
+}
 
 /// Builds the hygiene config from `params`, checking every caller-supplied
 /// `scan_paths` entry against `ctx`'s roots (`write` for tools that delete).

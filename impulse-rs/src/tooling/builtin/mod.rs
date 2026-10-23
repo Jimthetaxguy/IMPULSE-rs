@@ -166,6 +166,9 @@ mod path_param_guard {
     const VALIDATED_IN_TOOL: &[(&str, &str)] = &[
         // parse_hygiene_config checks every entry with is_path_allowed.
         ("build_health", "scan_paths"),
+        ("sweep", "scan_paths"),
+        ("wipe", "scan_paths"),
+        ("clean_all", "scan_paths"),
         // resolve_and_validate_memory_dir allows a closed set of dirs.
         ("genome_read", "impulse_dir"),
         ("memory_search", "impulse_dir"),
