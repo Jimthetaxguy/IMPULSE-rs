@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # Every pull request, not only those into main: a PR stacked on another
+  # PR's branch got no CI at all until it was retargeted.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
