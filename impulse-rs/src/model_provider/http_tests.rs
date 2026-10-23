@@ -300,9 +300,11 @@ async fn test_local_first_falls_back_from_a_dead_local_server_over_http() {
 }
 
 /// Review P2: a server that sends 200 headers and then nothing must time
-/// out, so the policy can fall back before the first event. Paused time
-/// skips the idle timeout without waiting for it.
-#[tokio::test(start_paused = true)]
+/// out, so the policy can fall back before the first event. Real time, with
+/// the test build's short `STREAM_IDLE_TIMEOUT`: paused time also advanced
+/// past reqwest's request timeout while the live server's reply was in
+/// flight on loopback, which failed this test about 4 runs in 10.
+#[tokio::test]
 async fn test_a_stalled_stream_times_out_and_falls_back() {
     let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let stalled_url = format!("http://{}/v1", stalled.local_addr().unwrap());
