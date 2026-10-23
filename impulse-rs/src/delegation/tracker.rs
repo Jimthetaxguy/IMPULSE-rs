@@ -90,13 +90,14 @@ impl DelegationTracker {
     }
 
     /// Removes the finished delegation that finished first. Returns whether
-    /// there was one.
+    /// there was one. The id is the last key so two delegations with equal
+    /// timestamps do not leave the choice to HashMap iteration order.
     fn drop_oldest_finished(&mut self) -> bool {
         let oldest = self
             .delegations
             .values()
             .filter(|d| d.is_completed())
-            .min_by_key(|d| (d.completed_at, d.created_at))
+            .min_by_key(|d| (d.completed_at, d.created_at, d.id.clone()))
             .map(|d| d.id.clone());
         match oldest {
             Some(id) => self.delegations.remove(&id).is_some(),
