@@ -2347,4 +2347,54 @@ mod tests {
         let recovered: GovernedTaskMutation = serde_json::from_value(cancelled_json).unwrap();
         assert_eq!(recovered, cancelled);
     }
+
+    #[test]
+    fn test_governed_promise_round_trips_through_serde() {
+        for (evidenced_status, latest_evidence_outcome, evidence) in [
+            (PromiseEvidencedStatus::Open, None, Vec::new()),
+            (
+                PromiseEvidencedStatus::Open,
+                Some(GovernedVerificationOutcome::Failed),
+                vec![GovernedRecordId::try_new("verification-1").unwrap()],
+            ),
+            (
+                PromiseEvidencedStatus::Kept,
+                Some(GovernedVerificationOutcome::Passed),
+                vec![
+                    GovernedRecordId::try_new("verification-1").unwrap(),
+                    GovernedRecordId::try_new("verification-2").unwrap(),
+                ],
+            ),
+        ] {
+            let promise = GovernedPromise {
+                claim_id: GovernedRecordId::try_new("claim-1").unwrap(),
+                promised_by: GovernedActor {
+                    kind: GovernedActorKind::Worker,
+                    id: "worker-1".to_string(),
+                },
+                summary: "implemented the change".to_string(),
+                subject_revision: oid('a'),
+                claimed_status: PromiseClaimedStatus::Done,
+                evidenced_status,
+                evidence,
+                latest_evidence_outcome,
+                superseded: false,
+            };
+            let json = serde_json::to_value(&promise).unwrap();
+            assert_eq!(json["claimed_status"], "done");
+            let recovered: GovernedPromise = serde_json::from_value(json).unwrap();
+            assert_eq!(recovered, promise);
+        }
+        for (status, wire) in [
+            (PromiseEvidencedStatus::Open, "\"open\""),
+            (PromiseEvidencedStatus::Kept, "\"kept\""),
+        ] {
+            assert_eq!(serde_json::to_string(&status).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<PromiseEvidencedStatus>(wire).unwrap(),
+                status
+            );
+        }
+        assert!(serde_json::from_str::<PromiseEvidencedStatus>("\"broken\"").is_err());
+    }
 }
