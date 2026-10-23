@@ -250,7 +250,13 @@ pub struct ContextHealthSummary {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCapabilityId {
+    // `as_str` (and so the daemon's "Missing tool capabilities" error)
+    // spells these without the inner underscore; accept that spelling back
+    // too, so a client can grant the capability the error named. The wire
+    // name written stays `file_system_*`.
+    #[serde(alias = "filesystem_read")]
     FileSystemRead,
+    #[serde(alias = "filesystem_write")]
     FileSystemWrite,
     Network,
     PythonExec,
@@ -1673,7 +1679,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_capability_id_wire_names_differ_from_as_str_for_filesystem() {
+    fn test_tool_capability_id_wire_names_and_as_str_spelling_both_parse() {
         let cases = [
             (ToolCapabilityId::FileSystemRead, "file_system_read"),
             (ToolCapabilityId::FileSystemWrite, "file_system_write"),
@@ -1684,11 +1690,20 @@ mod tests {
         for (capability, wire) in cases {
             assert_eq!(round_trip(&capability), wire);
         }
-        // Pinned as it is today: `as_str` (used in daemon error text) spells the
-        // filesystem pair without the inner underscore, so that spelling is
-        // not accepted back on the wire.
+        // `as_str` (used in the daemon's error text) spells the filesystem
+        // pair without the inner underscore; that spelling is accepted back
+        // so a client can grant exactly what the error named.
         assert_eq!(ToolCapabilityId::FileSystemRead.as_str(), "filesystem_read");
-        assert!(serde_json::from_str::<ToolCapabilityId>(r#""filesystem_read""#).is_err());
+        for capability in [
+            ToolCapabilityId::FileSystemRead,
+            ToolCapabilityId::FileSystemWrite,
+        ] {
+            let named_in_error = format!("\"{}\"", capability.as_str());
+            assert_eq!(
+                serde_json::from_str::<ToolCapabilityId>(&named_in_error).unwrap(),
+                capability
+            );
+        }
         for capability in [
             ToolCapabilityId::Network,
             ToolCapabilityId::PythonExec,
