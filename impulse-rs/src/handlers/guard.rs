@@ -348,14 +348,12 @@ pub fn handle_guard(
             }
         }
     } else if let Some(ref rule_id) = enable {
-        let mut config = resolve_known_rule_id(state, rule_id)?;
-        set_rule_enabled(&mut config.guardrails.rules, rule_id, true);
-        state.update_guardrail_rules(config.guardrails.rules.clone())?;
+        resolve_known_rule_id(state, rule_id)?;
+        state.update_guardrail_rules(|rules| set_rule_enabled(rules, rule_id, true))?;
         println!("Enabled rule: {}", rule_id);
     } else if let Some(ref rule_id) = disable {
-        let mut config = resolve_known_rule_id(state, rule_id)?;
-        set_rule_enabled(&mut config.guardrails.rules, rule_id, false);
-        state.update_guardrail_rules(config.guardrails.rules.clone())?;
+        resolve_known_rule_id(state, rule_id)?;
+        state.update_guardrail_rules(|rules| set_rule_enabled(rules, rule_id, false))?;
         println!("Disabled rule: {}", rule_id);
     } else if let Some(ref action_str) = action {
         match guardrail::evaluate_action(action_str, &target, &config.guardrails) {

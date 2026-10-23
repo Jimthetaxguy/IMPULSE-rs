@@ -132,7 +132,7 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 |------|-----------|
 | Errors | `thiserror` enums, `anyhow` app errors, `Result<T>` everywhere |
 | File I/O | Atomic writes (temp + rename), unique temp names |
-| State | `RwLock` + dirty flag + sync on Drop |
+| State | In-memory copy + locked re-read-modify-write per change |
 | Naming | `PascalCase` types, `snake_case` functions, `SCREAMING_SNAKE` constants |
 | Tests | Unit tests in `mod tests`, integration tests use `DaemonGuard` RAII |
 | Features | `office-support`, `monty-support`, `datafusion-support` (all opt-in) |

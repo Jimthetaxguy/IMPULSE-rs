@@ -54,7 +54,9 @@ pub(crate) async fn build_supervisor_permission_state(
     state: &SharedState,
     supervisor_session_override: &Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
 ) -> Result<impulse_ops::SupervisorPermissionState> {
-    let config = state.config_snapshot()?;
+    // Read from disk, not this process's copy: a permission revoked with
+    // `impulse-rs config` while the daemon runs must take effect at once.
+    let config = state.current_config()?;
     let session_override = supervisor_session_override.read().await.clone();
     Ok(impulse_ops::SupervisorPermissionState::resolve(
         config.impulse_agent_permissions,
@@ -597,29 +599,26 @@ async fn run_supervisor_action(
             grant_tool_capabilities,
             ..
         } => {
-            let mut updated_policy = match scope {
-                impulse_ops::PermissionChangeScope::SessionOverride => {
-                    permission_state.effective.clone()
+            let grant = |policy: &mut impulse_ops::SupervisorPermissionPolicy| {
+                for permission in &grant_actions {
+                    policy.grant_action(*permission);
                 }
-                impulse_ops::PermissionChangeScope::PersistentDefault => {
-                    permission_state.baseline.clone()
+                for capability in &grant_tool_capabilities {
+                    policy.grant_tool_capability(*capability);
                 }
+                policy.normalize();
             };
-            for permission in grant_actions {
-                updated_policy.grant_action(permission);
-            }
-            for capability in grant_tool_capabilities {
-                updated_policy.grant_tool_capability(capability);
-            }
-            updated_policy.normalize();
-
             let next_state = match scope {
                 impulse_ops::PermissionChangeScope::SessionOverride => {
-                    *supervisor_session_override.write().await = Some(updated_policy.clone());
+                    let mut updated_policy = permission_state.effective.clone();
+                    grant(&mut updated_policy);
+                    *supervisor_session_override.write().await = Some(updated_policy);
                     build_supervisor_permission_state(state, supervisor_session_override).await?
                 }
                 impulse_ops::PermissionChangeScope::PersistentDefault => {
-                    state.update_impulse_agent_permissions(updated_policy.clone())?;
+                    // Granted onto the policy as it is on disk, not onto this
+                    // process's copy, so a revocation made meanwhile stands.
+                    state.update_impulse_agent_permissions(grant)?;
                     *supervisor_session_override.write().await = None;
                     build_supervisor_permission_state(state, supervisor_session_override).await?
                 }
@@ -680,9 +679,9 @@ async fn run_supervisor_action(
             })
         }
         impulse_ops::SupervisorAction::ResetBaselinePermissions { .. } => {
-            state.update_impulse_agent_permissions(
-                impulse_ops::SupervisorPermissionPolicy::default(),
-            )?;
+            state.update_impulse_agent_permissions(|policy| {
+                *policy = impulse_ops::SupervisorPermissionPolicy::default();
+            })?;
             *supervisor_session_override.write().await = None;
             let next_state =
                 build_supervisor_permission_state(state, supervisor_session_override).await?;

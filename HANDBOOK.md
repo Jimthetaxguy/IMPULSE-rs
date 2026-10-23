@@ -575,7 +575,7 @@ The coordinator detects four types of cross-pane coordination needs:
 - **anyhow** — For application errors
 - **Result<T>** — Never panic, return Result<T, E>
 - **Atomic writes** — Always temp file + rename (unique temp names)
-- **Dirty flag** — Track state changes, sync on Drop
+- **Locked read-modify-write** — Re-read shared state under the storage lock before every change
 - **Input validation** — Sanitize user-supplied IDs before using as path/SQL components
 
 ### Naming Conventions
@@ -605,8 +605,7 @@ fs::rename(&temp_path, &path)?;
 
 - **tokio::sync::RwLock** — For async state
 - **std::sync::RwLock** — For sync state with try_read/try_write
-- **Dirty flag** — Track when state needs sync to disk
-- **Sync on exit** — Always persist dirty state before exit
+- **Locked read-modify-write** — Each change re-reads its file under `Storage::lock_exclusive` and persists immediately
 
 ---
 

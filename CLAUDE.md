@@ -76,9 +76,9 @@ All file operations use temp file + rename. Temp file names include PID + timest
 
 Sanitize user-supplied IDs before using as filesystem paths or SQL components. Validate protocol data on socket boundaries. Allowlist table names for PRAGMA queries.
 
-### 4. Dirty Flag State Management
+### 4. Locked Read-Modify-Write for Shared State
 
-In-memory state tracks whether it's been modified. Sync to disk only when dirty. Always persist on Drop/exit.
+Every process that opens a project (the daemon and each direct-mode hook) keeps its own in-memory copy of `.impulse/` state, so never save that copy whole. A change to a shared file runs as one read-modify-write under `Storage::lock_exclusive`: re-read the file, apply only this change, write atomically, then refresh the in-memory copy from what was written (`State::update_live_state`, `State::update_config`, and the memory-candidate writers). The lock is not re-entrant, so a change must never start another locked update; take it through `State::lock_project_state`, which fails after a bounded wait instead of hanging. Pass a change, not a finished value built from the copy (`update_impulse_agent_permissions(|policy| ...)`). Daemon-only files (`GOVERNED_TASKS.json`, `PRODUCER_RESERVATIONS.json`) are still whole-file writes, safe only while the daemon is their single writer; the startup projection rewrite of `GENOME_PROJECTION.md` is not yet locked.
 
 ### 5. Capability-Based Tool Access
 
@@ -157,7 +157,7 @@ ADR-0020's state and request-type contracts implement candidate decisions, `MEMO
 |------------|------|
 | Error handling | `thiserror` enums + `anyhow` application errors |
 | File I/O | Atomic (temp + rename), unique temp names |
-| State | `RwLock` + dirty flag + sync on Drop |
+| State | In-memory copy + locked re-read-modify-write per change |
 | Naming | `PascalCase` structs, `snake_case` functions, `SCREAMING_SNAKE` constants |
 | Testing | Unit tests in `mod tests` per file, integration tests with `DaemonGuard` RAII |
 | Feature flags | `office-support` (default), `monty-support`, `datafusion-support` (opt-in) |
