@@ -506,6 +506,20 @@ impl SupervisorAction {
         }
     }
 
+    /// Whether this action changes the supervisor's permission policy.
+    ///
+    /// These take effect for every later supervisor action, so the daemon
+    /// accepts them only from an operator-class connection (ADR-0018); the
+    /// `confirmed` field is the client's own claim and authorizes nothing.
+    pub fn changes_permissions(&self) -> bool {
+        matches!(
+            self,
+            Self::ModifyPermissions { .. }
+                | Self::ClearSessionOverride { .. }
+                | Self::ResetBaselinePermissions { .. }
+        )
+    }
+
     pub fn confirmed(&self) -> bool {
         match self {
             Self::FocusAgent { .. }

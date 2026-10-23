@@ -10,7 +10,8 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use super::actor_provenance::{
-    authorize_governed_mutation, mutation_authorization_needs_profile, ConnectionClass,
+    authorize_governed_mutation, mutation_authorization_needs_profile, ActorProvenanceError,
+    ConnectionClass,
 };
 use super::protocol::{
     request_type_name, respond_err, respond_ok, DaemonRequest, DaemonResponse, PROTOCOL_VERSION,
@@ -786,6 +787,15 @@ pub(crate) fn validate_request_fields(
     Ok(())
 }
 
+/// Whether `connection_class` may run `action`. A permission change is
+/// operator-only; every other supervisor action keeps its policy-based gate.
+pub(crate) fn supervisor_action_allowed(
+    action: &impulse_ops::SupervisorAction,
+    connection_class: ConnectionClass,
+) -> bool {
+    !action.changes_permissions() || connection_class.is_operator()
+}
+
 #[tracing::instrument(skip_all, fields(request_type = request_type_name(&request)))]
 pub(crate) async fn process_request(
     request: DaemonRequest,
@@ -884,7 +894,18 @@ pub(crate) async fn process_request(
             .await
         }
 
-        // Supervisor group
+        // Supervisor group. A permission change is operator-only, checked
+        // here because `handle_supervisor_request` never sees the class.
+        DaemonRequest::RunSupervisorAction { ref action }
+            if !supervisor_action_allowed(action, connection_class) =>
+        {
+            respond_err(format!(
+                "Supervisor action failed: {}",
+                ActorProvenanceError::OperatorClassRequired {
+                    request: "RunSupervisorAction",
+                }
+            ))
+        }
         DaemonRequest::GetSupervisorPermissions
         | DaemonRequest::SupervisorChat { .. }
         | DaemonRequest::RunSupervisorAction { .. }
@@ -3577,5 +3598,102 @@ mod request_validation_tests {
             session_id: "../escape".to_string(),
         };
         assert!(validate_request_fields(&request).is_err());
+    }
+}
+
+#[cfg(test)]
+mod supervisor_permission_gate_tests {
+    use std::sync::Arc;
+
+    use tokio::sync::RwLock;
+
+    use super::{process_request, supervisor_action_allowed, ProcessRequestContext};
+    use crate::daemon::actor_provenance::ConnectionClass;
+    use crate::daemon::protocol::{DaemonRequest, DaemonResponse};
+    use crate::state::State;
+
+    fn reset_baseline() -> impulse_ops::SupervisorAction {
+        impulse_ops::SupervisorAction::ResetBaselinePermissions { confirmed: true }
+    }
+
+    async fn run(
+        state: Arc<State>,
+        action: impulse_ops::SupervisorAction,
+        connection_class: ConnectionClass,
+    ) -> DaemonResponse {
+        let registry = crate::tooling::ToolRegistry::new();
+        let tool_context = crate::tooling::ToolContext::default();
+        let terminal_telemetry = Arc::new(RwLock::new(
+            crate::ops_workbench::TerminalOpsTelemetryStore::default(),
+        ));
+        let supervisor_session_override = Arc::new(RwLock::new(None));
+        let conflict_resolver = Arc::new(RwLock::new(
+            crate::agent::coordinator::ConflictResolver::new(),
+        ));
+        let delegation_tracker = Arc::new(RwLock::new(crate::delegation::DelegationTracker::new()));
+        let cached_agent = Arc::new(tokio::sync::Mutex::new(None));
+        process_request(
+            DaemonRequest::RunSupervisorAction { action },
+            ProcessRequestContext {
+                state,
+                registry: &registry,
+                tool_context: &tool_context,
+                terminal_telemetry: &terminal_telemetry,
+                supervisor_session_override: &supervisor_session_override,
+                conflict_resolver: &conflict_resolver,
+                delegation_tracker: &delegation_tracker,
+                cached_agent: &cached_agent,
+                connection_class,
+            },
+        )
+        .await
+    }
+
+    #[test]
+    fn test_supervisor_action_allowed_gates_only_permission_changes() {
+        assert!(!supervisor_action_allowed(
+            &reset_baseline(),
+            ConnectionClass::NonOperator
+        ));
+        assert!(supervisor_action_allowed(
+            &reset_baseline(),
+            ConnectionClass::Operator
+        ));
+        let search = impulse_ops::SupervisorAction::SearchMemory {
+            query: "q".to_string(),
+        };
+        assert!(supervisor_action_allowed(
+            &search,
+            ConnectionClass::NonOperator
+        ));
+    }
+
+    /// A same-UID client without the operator capability used to rewrite the
+    /// persisted supervisor policy by setting `confirmed: true` itself.
+    #[tokio::test]
+    async fn test_non_operator_cannot_change_supervisor_permissions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(State::new(dir.path().to_path_buf()).unwrap());
+        let escalate = impulse_ops::SupervisorAction::ModifyPermissions {
+            scope: impulse_ops::PermissionChangeScope::PersistentDefault,
+            grant_actions: vec![impulse_ops::SupervisorActionPermission::SendInput],
+            grant_tool_capabilities: Vec::new(),
+            confirmed: true,
+        };
+        let before = state.config_snapshot().unwrap().impulse_agent_permissions;
+
+        let response = run(Arc::clone(&state), escalate, ConnectionClass::NonOperator).await;
+
+        match response {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("operator-class connection"), "{message}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(state.config_snapshot().unwrap().impulse_agent_permissions)
+                .unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
     }
 }
