@@ -569,7 +569,7 @@ fn test_dioxus_desktop_launch_binary_is_feature_gated() {
     assert!(manifest_text.contains("required-features = [\"desktop-app\"]"));
     assert!(manifest_text
         .contains("desktop-app = [\"dep:dioxus-desktop\", \"dioxus/desktop\", \"dep:rfd\"]"));
-    assert!(manifest_text.contains("dioxus-desktop = { version = \"0.6.3\", optional = true }"));
+    assert!(manifest_text.contains("dioxus-desktop = { version = \"0.7.10\", optional = true }"));
     assert!(launcher_text.contains("use impulse_desktop::desktop_host::desktop_config;"));
     assert!(launcher_text.contains("dioxus::LaunchBuilder::desktop()"));
     assert!(launcher_text.contains(".with_cfg(desktop_config())"));
