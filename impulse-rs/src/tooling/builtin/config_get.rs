@@ -72,6 +72,11 @@ impl DynamicTool for ConfigGetTool {
             })));
         }
 
+        // The sandbox checked `impulse_dir`, not this file inside it: a
+        // config.json symlinked out of an allowed root would be followed.
+        if !ctx.is_path_allowed(&config_path, false) {
+            return Err(ToolError::PathNotAllowed(config_path.display().to_string()));
+        }
         let content = std::fs::read_to_string(&config_path)
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read config: {}", e)))?;
 
@@ -104,6 +109,31 @@ impl DynamicTool for ConfigGetTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Path audit: the sandbox checked `impulse_dir`, so a config.json inside an
+    /// allowed root that is a symlink to a file outside was followed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_a_symlinked_config_pointing_outside_the_roots_is_refused() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, "{\"stolen\": true}\n").unwrap();
+        std::os::unix::fs::symlink(&secret, allowed.path().join("config.json")).unwrap();
+        let mut ctx = ToolContext::with_all_capabilities();
+        ctx.allowed_read_roots = vec![allowed.path().to_path_buf()];
+        ctx.allowed_write_roots = vec![allowed.path().to_path_buf()];
+        let result = ConfigGetTool
+            .execute(
+                serde_json::json!({"impulse_dir": allowed.path().display().to_string()}),
+                &ctx,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ToolError::PathNotAllowed(_))),
+            "a symlink out of the roots must be refused, got {result:?}"
+        );
+    }
 
     /// Recorded review P3: with no `impulse_dir`, the tool read a
     /// `.impulse` relative to the process's working directory instead of the
