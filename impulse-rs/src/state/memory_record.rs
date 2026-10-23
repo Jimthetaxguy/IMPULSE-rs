@@ -92,6 +92,12 @@ pub enum MemoryLogError {
     },
     #[error("memory log holds more than one entry for record `{record_id}`")]
     DuplicateRecord { record_id: MemoryRecordId },
+    #[error(
+        "the candidate ledger records a committed memory log head of zero entries; \
+         a head is only written by a promotion, so .impulse/MEMORY_CANDIDATES.json \
+         was modified outside Impulse and is refused"
+    )]
+    EmptyCommittedHead,
 }
 
 /// The committed head of the log, recorded in the candidate ledger.
@@ -253,6 +259,11 @@ impl MemoryLog {
 
         let committed_count = match committed_head {
             Some(head) => {
+                // A promotion always commits at least one entry. Without this
+                // check a zero count over an empty log indexes `entries[0]`.
+                if head.entry_count == 0 {
+                    return Err(MemoryLogError::EmptyCommittedHead.into());
+                }
                 let found = entries.len() as u64;
                 if found < head.entry_count {
                     return Err(MemoryLogError::Truncated {
@@ -262,7 +273,7 @@ impl MemoryLog {
                     }
                     .into());
                 }
-                let index = head.entry_count.saturating_sub(1) as usize;
+                let index = (head.entry_count - 1) as usize;
                 let actual = &entries[index].entry_digest;
                 if actual != &head.head_digest {
                     return Err(MemoryLogError::HeadMismatch {
@@ -825,6 +836,22 @@ mod tests {
                 "record must not carry `{forbidden}`"
             );
         }
+    }
+
+    #[test]
+    fn test_load_refuses_a_zero_entry_committed_head_instead_of_panicking() {
+        let (_dir, storage) = storage();
+        let head = MemoryLogHead {
+            entry_count: 0,
+            head_digest: MEMORY_LOG_GENESIS_DIGEST.to_string(),
+        };
+        let error = MemoryLog::load(&storage, Some(&head), LedgerOrigin::Local)
+            .err()
+            .expect("a zero-entry committed head must be refused");
+        assert!(matches!(
+            error.downcast_ref::<MemoryLogError>(),
+            Some(MemoryLogError::EmptyCommittedHead)
+        ));
     }
 
     #[test]
@@ -1396,10 +1423,14 @@ mod tests {
                 MemoryLogError::DuplicateRecord { record_id },
                 "more than one entry",
             ),
+            (
+                MemoryLogError::EmptyCommittedHead,
+                "head of zero entries",
+            ),
         ];
         assert_eq!(
             cases.len(),
-            8,
+            9,
             "every MemoryLogError variant must be covered"
         );
         for (error, expected) in cases {

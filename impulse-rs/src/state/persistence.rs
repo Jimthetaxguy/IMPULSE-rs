@@ -68,6 +68,10 @@ pub struct State {
     /// can never silently fail to set/read it under lock contention — a dropped
     /// set would lose the mutation that triggered it.
     dirty: AtomicBool,
+    /// Serializes every `LIVE_STATE.json` write from snapshot to rename. Without
+    /// it two daemon tasks could clone in one order and rename in the other,
+    /// leaving the older snapshot on disk with `dirty` already cleared.
+    live_state_write: std::sync::Mutex<()>,
     config: RwLock<Config>,
 }
 
@@ -82,6 +86,7 @@ impl std::fmt::Debug for State {
 impl Drop for State {
     fn drop(&mut self) {
         if self.dirty.load(Ordering::Acquire) {
+            let _write = self.live_state_write.lock();
             if let Ok(state) = self.live_state.read() {
                 if let Err(err) = self.storage.write_json(LIVE_STATE_FILE, &*state) {
                     tracing::error!("failed to persist live state on drop: {}", err);
@@ -121,6 +126,7 @@ impl State {
             live_state: RwLock::new(live_state),
             ending_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
             dirty: AtomicBool::new(false),
+            live_state_write: std::sync::Mutex::new(()),
             config: RwLock::new(config),
         };
         state.reconcile_accepted_run_memory_candidates()?;
@@ -166,13 +172,16 @@ impl State {
     }
 
     pub async fn sync_immediate(&self) -> Result<()> {
-        let state = self.live_state.read().map_err(lock_err)?.clone();
-        self.storage
-            .write_json(LIVE_STATE_FILE, &state)
-            .context("Failed to write live state to disk")?;
-
+        let _write = self.live_state_write.lock().map_err(lock_err)?;
+        // Cleared before the snapshot, not after the write: a mutation that
+        // lands between the two sets it again and is flushed later, instead of
+        // being marked clean without ever reaching disk.
         self.dirty.store(false, Ordering::Release);
-
+        let state = self.live_state.read().map_err(lock_err)?.clone();
+        if let Err(error) = self.storage.write_json(LIVE_STATE_FILE, &state) {
+            self.mark_dirty();
+            return Err(error).context("Failed to write live state to disk");
+        }
         Ok(())
     }
 
@@ -633,6 +642,31 @@ impl ConflictAnalytics {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A failed live-state write must leave the state dirty, so the `Drop`
+    /// flush still tries to persist the mutation it could not save.
+    #[tokio::test]
+    async fn test_sync_immediate_failure_leaves_state_dirty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = State::new(dir.path().to_path_buf()).unwrap();
+        state.mark_dirty();
+        // A directory at the target path makes the final rename fail.
+        std::fs::create_dir_all(dir.path().join(LIVE_STATE_FILE).join("blocker")).unwrap();
+
+        assert!(state.sync_immediate().await.is_err());
+        assert!(state.dirty.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_sync_immediate_success_clears_dirty() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = State::new(dir.path().to_path_buf()).unwrap();
+        state.mark_dirty();
+
+        state.sync_immediate().await.unwrap();
+
+        assert!(!state.dirty.load(Ordering::Acquire));
+    }
 
     /// Review P2: try-locks on the Tokio RwLocks failed any call that
     /// overlapped another, which the daemon's concurrent connections do.
