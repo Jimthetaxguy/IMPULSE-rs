@@ -505,3 +505,96 @@ pub(crate) fn render_analytics(
         f.render_widget(Paragraph::new(content).block(block), area);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn draw(width: u16, height: u16, render: impl FnOnce(&mut Frame)) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(render).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn session(name: &str, status: SessionStatus) -> crate::state::Session {
+        let mut session = crate::state::Session::new(name.to_string(), None);
+        session.status = status;
+        session
+    }
+
+    #[test]
+    fn test_render_dashboard_renders_from_an_empty_impulse_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state =
+            std::sync::Arc::new(crate::state::State::new(dir.path().to_path_buf()).unwrap());
+        let mut tui = TuiState::new(state);
+        let screen = draw(140, 45, |f| {
+            render_dashboard(f, f.area(), &mut tui, &[], &[])
+        });
+        assert!(screen.contains("Statistics"), "{screen}");
+        assert!(screen.contains("Live"), "{screen}");
+    }
+
+    #[test]
+    fn test_render_activity_panel_shows_each_status_symbol_and_caps_at_eight() {
+        let statuses = [
+            ("active-one", SessionStatus::Active, "●"),
+            ("idle-one", SessionStatus::Idle, "◐"),
+            ("waiting-one", SessionStatus::Waiting, "○"),
+            ("done-one", SessionStatus::Completed, "✓"),
+            ("broken-one", SessionStatus::Error, "✗"),
+        ];
+        let mut sessions: Vec<_> = statuses
+            .iter()
+            .map(|(name, status, _)| session(name, *status))
+            .collect();
+        for n in 0..5 {
+            sessions.push(session(&format!("extra-{n}"), SessionStatus::Idle));
+        }
+        let screen = draw(80, 30, |f| render_activity_panel(f, f.area(), &sessions));
+        for (name, _, symbol) in statuses {
+            assert!(screen.contains(name), "missing {name}: {screen}");
+            assert!(screen.contains(symbol), "missing {symbol}: {screen}");
+        }
+        // Ten sessions, eight shown: the last two are cut.
+        assert!(screen.contains("extra-2"), "{screen}");
+        assert!(
+            !screen.contains("extra-3"),
+            "only eight sessions are listed"
+        );
+    }
+
+    #[test]
+    fn test_render_engine_indicator_draws_every_state() {
+        for engine in [
+            crate::branding::EngineState::Idle,
+            crate::branding::EngineState::Thinking,
+            crate::branding::EngineState::Success,
+        ] {
+            let screen = draw(40, 12, |f| render_engine_indicator(f, f.area(), engine));
+            assert!(screen.contains("Engine"), "{screen}");
+        }
+    }
+
+    #[test]
+    fn test_render_stats_and_analytics_handle_empty_input_and_tiny_areas() {
+        let screen = draw(80, 20, |f| render_stats_panel(f, f.area(), &[], &[], None));
+        assert!(screen.contains("Statistics"), "{screen}");
+        let screen = draw(80, 30, |f| render_analytics(f, f.area(), &[], &[]));
+        assert!(screen.contains("Analytics"), "{screen}");
+        let screen = draw(3, 2, |f| {
+            render_stats_panel(f, f.area(), &[], &[], Some("degraded"));
+            render_activity_panel(f, f.area(), &[]);
+            render_analytics(f, f.area(), &[], &[]);
+        });
+        assert_eq!(screen.chars().count(), 6);
+    }
+}
