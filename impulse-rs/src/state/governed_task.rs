@@ -491,9 +491,11 @@ impl State {
             .ok_or_else(|| GovernedTaskStateError::NotFound(request.task_id.clone()))?;
         require_project(&expected_project, &current.project_id)?;
         // Fencing runs before the revision check on purpose: a stale worker
-        // that re-reads the task gets a fresh revision but can never get a
-        // fresh lease generation, and it must hear `Fenced`, not a
-        // `RevisionConflict` that invites another retry.
+        // that re-reads the task gets a fresh revision, and it must hear
+        // `Fenced`, not a `RevisionConflict` that invites another retry. The
+        // generation is not a secret (it is the count of takeover events any
+        // client can read), so this stops an honest but delayed worker; it is
+        // not authorization.
         require_current_lease_generation(&current, &request.mutation, request.fencing_generation)?;
         if current.revision != request.expected_revision {
             return Err(GovernedTaskStateError::RevisionConflict {
