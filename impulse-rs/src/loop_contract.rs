@@ -34,6 +34,13 @@ pub const ION_DEFAULT_WALL_CLOCK: Duration = Duration::from_secs(180);
 pub const ION_DEFAULT_REPEATED_CALL_STREAK: usize = 3;
 /// Default consecutive identical tool errors that trip the Ion loop.
 pub const ION_DEFAULT_SAME_ERROR_STREAK: usize = 3;
+/// Default total tool calls one Ion tool-loop exchange may run.
+///
+/// The round cap alone does not bound the work: one round runs every call
+/// the model batched into it, so ten rounds of wide fan-out could run any
+/// number of ungated reads. Fifty is five calls a round across the full ten
+/// rounds, enough for a real investigation and well short of a runaway.
+pub const ION_DEFAULT_MAX_TOOL_CALLS: usize = 50;
 /// Default context budget for the Ion tool loop, in characters of working
 /// conversation history.
 ///
@@ -108,6 +115,11 @@ pub struct LoopBudget {
     /// or daemon types here).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_context_chars: Option<usize>,
+    /// Tool calls the whole run may execute, across every round. Checked
+    /// before each call runs, so the call that would exceed it never does.
+    /// `None` disables the cap. Must be non-zero when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_calls: Option<usize>,
 }
 
 impl LoopBudget {
@@ -119,6 +131,7 @@ impl LoopBudget {
             max_repeated_call_streak: Some(ION_DEFAULT_REPEATED_CALL_STREAK),
             max_same_error_streak: Some(ION_DEFAULT_SAME_ERROR_STREAK),
             max_context_chars: Some(ION_DEFAULT_MAX_CONTEXT_CHARS),
+            max_tool_calls: Some(ION_DEFAULT_MAX_TOOL_CALLS),
         }
     }
 
@@ -131,7 +144,9 @@ impl LoopBudget {
     ///
     /// The context budget is disabled for the same reason: the daemon holds
     /// claim records, not the Builder's conversation, so it has no history to
-    /// measure or compact.
+    /// measure or compact. So is the tool-call cap, and leaving it `None`
+    /// also keeps the serialized budget, and with it every stored
+    /// `loop_report_digest`, unchanged.
     pub fn governed_builder() -> Self {
         Self {
             max_rounds: GOVERNED_BUILDER_MAX_CLAIM_CYCLES,
@@ -139,6 +154,7 @@ impl LoopBudget {
             max_repeated_call_streak: None,
             max_same_error_streak: Some(GOVERNED_BUILDER_SAME_FAILURE_STREAK),
             max_context_chars: None,
+            max_tool_calls: None,
         }
     }
 
@@ -210,6 +226,8 @@ pub enum LoopContractError {
     ZeroStreak { name: String, limit: &'static str },
     #[error("loop contract '{name}' context budget must be non-zero when set")]
     ZeroContextBudget { name: String },
+    #[error("loop contract '{name}' tool-call budget must be non-zero when set")]
+    ZeroToolCallBudget { name: String },
 }
 
 impl LoopContract {
@@ -258,6 +276,11 @@ impl LoopContract {
                 name: self.name.clone(),
             });
         }
+        if self.budget.max_tool_calls == Some(0) {
+            return Err(LoopContractError::ZeroToolCallBudget {
+                name: self.name.clone(),
+            });
+        }
         Ok(())
     }
 }
@@ -291,6 +314,9 @@ pub enum LoopTrip {
     /// budget. Unlike the other trips this one is reached only after
     /// compaction has already been tried and failed to recover enough room.
     ContextBudget { chars: usize, limit: usize },
+    /// The run had already executed [`LoopBudget::max_tool_calls`] tool
+    /// calls when the model requested another; that call did not run.
+    ToolCallBudget { calls: usize },
 }
 
 impl fmt::Display for LoopTrip {
@@ -321,6 +347,10 @@ impl fmt::Display for LoopTrip {
             LoopTrip::ContextBudget { chars, limit } => write!(
                 f,
                 "conversation history is {chars} characters after compaction, over the {limit}-character context budget"
+            ),
+            LoopTrip::ToolCallBudget { calls } => write!(
+                f,
+                "tool-call budget of {calls} spent; the next requested call did not run"
             ),
         }
     }
@@ -387,7 +417,7 @@ pub struct CallOutcome<'a> {
 
 /// Per-run breaker state. Create one per loop run. For each model round:
 /// [`LoopBreaker::begin_round`], then for each tool call the model requested
-/// [`LoopBreaker::dispatch_call`] before executing it and
+/// [`LoopBreaker::admit_call`] before executing it and
 /// [`LoopBreaker::observe_call`] after, then [`LoopBreaker::end_round`].
 /// Read [`LoopBreaker::report`] when the run ends.
 #[derive(Debug)]
@@ -462,11 +492,18 @@ impl LoopBreaker {
         Ok(index)
     }
 
-    /// Records that a tool call is about to execute. A call that is
-    /// dispatched but never observed (the run was cut off while it ran) is
-    /// reported as interrupted rather than silently missing.
-    pub fn dispatch_call(&mut self) {
+    /// Admits one tool call about to execute, or trips when the run's
+    /// tool-call budget is already spent (the call must then not run). A
+    /// call that is admitted but never observed (the run was cut off while
+    /// it ran) is reported as interrupted rather than silently missing.
+    pub fn admit_call(&mut self) -> Result<(), LoopTrip> {
+        if let Some(limit) = self.contract.budget.max_tool_calls {
+            if self.dispatched >= limit {
+                return Err(LoopTrip::ToolCallBudget { calls: limit });
+            }
+        }
         self.dispatched += 1;
+        Ok(())
     }
 
     /// Closes the current round and trips when the model has requested the
@@ -638,6 +675,7 @@ mod tests {
                 max_repeated_call_streak: repeated,
                 max_same_error_streak: same_error,
                 max_context_chars: None,
+                max_tool_calls: None,
             },
         }
     }
@@ -670,6 +708,7 @@ mod tests {
             max_repeated_call_streak: None,
             max_same_error_streak: None,
             max_context_chars: None,
+            max_tool_calls: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(
@@ -957,9 +996,9 @@ mod tests {
     fn test_dispatched_but_unobserved_calls_are_reported_as_interrupted() {
         let mut breaker = LoopBreaker::new(contract(5, None, None));
         breaker.begin_round().unwrap();
-        breaker.dispatch_call();
+        breaker.admit_call().unwrap();
         breaker.observe_call("t", &json!(1), OK);
-        breaker.dispatch_call();
+        breaker.admit_call().unwrap();
         // The second call never comes back: the run was cut off mid-flight.
         let report = breaker.report(LoopTermination::Tripped {
             trip: LoopTrip::WallClock { millis: 100 },
@@ -1292,6 +1331,7 @@ mod tests {
             max_repeated_call_streak: None,
             max_same_error_streak: None,
             max_context_chars: None,
+            max_tool_calls: None,
         };
         let observed = LoopObservation {
             rounds_used: 1,
@@ -1355,6 +1395,89 @@ mod tests {
         let mut contract = LoopContract::ion_tool_loop();
         contract.budget.max_context_chars = Some(1);
         assert!(contract.validate().is_ok());
+    }
+
+    #[test]
+    fn test_admit_call_trips_once_the_tool_call_budget_is_spent() {
+        let mut contract = contract(10, None, None);
+        contract.budget.max_tool_calls = Some(2);
+        let mut breaker = LoopBreaker::new(contract);
+        breaker.begin_round().unwrap();
+        for n in 0..2 {
+            breaker.admit_call().unwrap();
+            assert_eq!(breaker.observe_call("t", &json!(n), OK), None);
+        }
+        assert_eq!(
+            breaker.admit_call(),
+            Err(LoopTrip::ToolCallBudget { calls: 2 })
+        );
+        // The refused call was never dispatched, so nothing reads as
+        // interrupted.
+        let report = breaker.report(LoopTermination::Tripped {
+            trip: LoopTrip::ToolCallBudget { calls: 2 },
+        });
+        assert_eq!(report.tool_calls, 2);
+        assert_eq!(report.tool_calls_interrupted, 0);
+    }
+
+    #[test]
+    fn test_admit_call_is_unbounded_without_a_tool_call_budget() {
+        let mut breaker = LoopBreaker::new(contract(1, None, None));
+        breaker.begin_round().unwrap();
+        for _ in 0..1_000 {
+            breaker.admit_call().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_ion_default_caps_tool_calls_and_governed_builder_does_not() {
+        assert_eq!(
+            LoopBudget::ion_default().max_tool_calls,
+            Some(ION_DEFAULT_MAX_TOOL_CALLS)
+        );
+        assert_eq!(LoopBudget::governed_builder().max_tool_calls, None);
+        // Absent from the governed budget's JSON, so stored loop-report
+        // digests computed before the field existed still match.
+        let json = serde_json::to_value(LoopBudget::governed_builder()).unwrap();
+        assert!(json.get("max_tool_calls").is_none(), "{json}");
+    }
+
+    #[test]
+    fn test_loop_budget_without_max_tool_calls_deserializes_as_uncapped() {
+        let json = serde_json::json!({
+            "max_rounds": 3,
+            "wall_clock": {"secs": 1, "nanos": 0},
+        });
+        let budget: LoopBudget = serde_json::from_value(json).unwrap();
+        assert_eq!(budget.max_tool_calls, None);
+    }
+
+    #[test]
+    fn test_validate_rejects_a_zero_tool_call_budget() {
+        let mut contract = LoopContract::ion_tool_loop();
+        contract.budget.max_tool_calls = Some(0);
+        assert_eq!(
+            contract.validate(),
+            Err(LoopContractError::ZeroToolCallBudget {
+                name: "ion_tool_loop".to_string()
+            })
+        );
+        let rendered = format!(
+            "{}",
+            LoopContractError::ZeroToolCallBudget {
+                name: "ion_tool_loop".to_string()
+            }
+        );
+        assert!(rendered.contains("tool-call budget"), "got: {rendered}");
+    }
+
+    #[test]
+    fn test_tool_call_budget_trip_round_trips_and_displays() {
+        let trip = LoopTrip::ToolCallBudget { calls: 50 };
+        let json = serde_json::to_string(&trip).unwrap();
+        let recovered: LoopTrip = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, trip);
+        assert!(trip.to_string().contains("tool-call budget of 50"));
     }
 
     #[test]
