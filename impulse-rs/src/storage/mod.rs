@@ -112,7 +112,10 @@ impl Storage {
     /// them as separate writes. If the file ends without a newline (a write
     /// torn by a crash or a full disk), the record starts on a new line
     /// instead of being glued to the fragment and lost with it, and readers
-    /// skip the fragment. A failed write is left as it is: truncating the
+    /// skip the fragment. That check can race a concurrent appender (its
+    /// record may still be landing when the length is read), which adds an
+    /// empty line but never splits a record; readers skip empty lines too.
+    /// A failed write is left as it is: truncating the
     /// file back to the length seen before writing also removed records
     /// other processes had appended and synced in the meantime.
     pub fn append_jsonl_path(path: &Path, record: &impl Serialize) -> Result<()> {
@@ -616,10 +619,24 @@ mod tests {
             handle.join().unwrap();
         }
         let raw = std::fs::read_to_string(storage.path("log.jsonl")).unwrap();
-        assert_eq!(raw.lines().count(), 400);
-        assert!(raw
+        // The torn-line check can race a concurrent append and add an empty
+        // line (see `append_jsonl_path`), which readers skip. What must hold
+        // is that no record is split or lost.
+        let records: Vec<Numbered> = raw
             .lines()
-            .all(|line| serde_json::from_str::<Numbered>(line).is_ok()));
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("every line is one whole record"))
+            .collect();
+        let mut ids: Vec<_> = records.iter().map(|record| record.id).collect();
+        ids.sort_unstable();
+        let expected: Vec<_> = (0..16)
+            .flat_map(|thread| (0..25).map(move |i| thread * 100 + i))
+            .collect();
+        assert_eq!(ids, expected);
+        assert_eq!(
+            storage.read_jsonl::<Numbered>("log.jsonl").unwrap().len(),
+            400
+        );
     }
 
     #[test]
