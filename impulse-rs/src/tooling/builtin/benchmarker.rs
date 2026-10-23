@@ -291,9 +291,15 @@ mod tests {
 
     /// Round 3 (reviewer B): a run that started just before the deadline
     /// ran its whole sandbox budget past it (4.64 s under a 2 s limit).
+    ///
+    /// The deadline is far off so a slow CI host cannot reach it before the
+    /// third run: with a 200 ms deadline and 20 ms sleeps, macOS runners
+    /// sometimes overslept past it after two runs and the count came out 2.
+    /// The stop here comes only from the run reporting `OutOfTime`.
     #[test]
     fn test_time_runs_gives_each_run_only_the_time_left() {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let budget = std::time::Duration::from_secs(600);
+        let deadline = std::time::Instant::now() + budget;
         let mut given = Vec::new();
         let runs = time_runs(1_000, deadline, |remaining| {
             given.push(remaining);
@@ -301,14 +307,12 @@ mod tests {
                 // The sandbox stopped this run at the time it was given.
                 return RunOutcome::OutOfTime;
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::thread::sleep(std::time::Duration::from_millis(2));
             RunOutcome::Completed
         });
         assert!(runs.past_deadline);
         assert_eq!(given.len(), 3, "no run starts after one runs out of time");
-        assert!(given
-            .iter()
-            .all(|g| *g <= std::time::Duration::from_millis(200)));
+        assert!(given.iter().all(|g| *g <= budget));
         assert!(given.windows(2).all(|pair| pair[1] < pair[0]), "{given:?}");
         assert_eq!(runs.first_failure, None);
     }
