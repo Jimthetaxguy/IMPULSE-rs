@@ -901,7 +901,7 @@ struct ReplToolExecutor<'a> {
     file_versions: &'a FileVersions,
 }
 
-/// The files a session has read or written, with the modification time it
+/// The files a session has read in full or written, with the version it
 /// last saw for each, so `file_write` can refuse to replace a file the model
 /// has never seen or that changed since it looked (another agent, an editor,
 /// a `bash_exec`). Keyed by `tooling::resolve_for_write` of the resolved
@@ -909,14 +909,36 @@ struct ReplToolExecutor<'a> {
 /// (or a symlinked prefix) share one entry.
 #[derive(Debug, Default)]
 pub(crate) struct FileVersions(
-    std::sync::Mutex<std::collections::HashMap<PathBuf, Option<std::time::SystemTime>>>,
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Option<FileVersion>>>,
 );
 
+/// What identifies one version of a file. The mtime alone is not enough:
+/// `touch -r`, `cp -p` or `rsync -t` restore an old mtime over new content.
+/// On Unix the inode (a rename-replace gets a new one) and the ctime, which
+/// user space cannot set, catch those; the length catches the rest cheaply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileVersion {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    inode: (u64, u64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
 impl FileVersions {
-    fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
-        std::fs::metadata(path)
-            .and_then(|meta| meta.modified())
-            .ok()
+    fn modified(path: &std::path::Path) -> Option<FileVersion> {
+        let meta = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(FileVersion {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            #[cfg(unix)]
+            inode: (meta.dev(), meta.ino()),
+            #[cfg(unix)]
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
     }
 
     /// Remember `path` as seen at its current modification time.
@@ -966,6 +988,13 @@ impl FileVersions {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
     }
+}
+
+/// Whether a `file_read` payload holds the file's entire content.
+fn read_whole_file(payload: &Value) -> bool {
+    payload.get("content").is_some()
+        && payload.get("start_line").and_then(Value::as_u64) == Some(1)
+        && payload.get("truncated").and_then(Value::as_bool) == Some(false)
 }
 
 impl ReplToolExecutor<'_> {
@@ -1148,11 +1177,12 @@ impl ToolExecutor for ReplToolExecutor<'_> {
                     .flatten();
                 let result = match tool.run(input, self.ctx).await {
                     Ok(outcome) => {
-                        // A read counts only when it returned content: an
-                        // oversized file comes back Ok with an `error` and
-                        // nothing the model could have looked at.
-                        let saw_content =
-                            name != "file_read" || outcome.payload.get("content").is_some();
+                        // A read counts only when it returned the whole file:
+                        // from line 1 and not truncated. A window (200 lines
+                        // by default) would let the model replace lines it
+                        // never saw, and an oversized file comes back Ok with
+                        // an `error` and no content at all.
+                        let saw_content = name != "file_read" || read_whole_file(&outcome.payload);
                         if outcome.ok && saw_content {
                             if let Some(path) = &tracked_path {
                                 self.file_versions.record(path);
@@ -3024,6 +3054,77 @@ mod tests {
             std::fs::read_to_string(&target).unwrap(),
             "edited during the prompt\n"
         );
+    }
+
+    /// Adversarial review on #148: a windowed read, an empty read past the
+    /// end, and a change that keeps the old mtime all counted as "seen".
+    #[tokio::test]
+    async fn test_file_write_needs_a_whole_file_read_and_sees_mtime_preserving_edits() {
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+        let confirm = |_name: &str, _input: &Value, verdict: &GuardVerdict, _paths: &[PathBuf]| {
+            decide_approval(verdict, "y")
+        };
+        let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
+        let executor = ReplToolExecutor {
+            tools: &tools,
+            ctx: &ctx,
+            confirm: &confirm,
+            untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
+        };
+        let long = repo_root.path().join("long.txt");
+        let lines: String = (1..=500).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&long, &lines).unwrap();
+        let path = long.display().to_string();
+        let read = |args: Value| executor.execute("file_read", args);
+        let write = || {
+            executor.execute(
+                "file_write",
+                serde_json::json!({"path": path, "content": "new\n"}),
+            )
+        };
+
+        // The default 200-line window is not the whole file.
+        let partial = read(serde_json::json!({"path": path})).await;
+        assert!(partial.content.contains("truncated"), "{}", partial.content);
+        assert!(
+            write().await.is_error,
+            "a windowed read must not allow a rewrite"
+        );
+        // Nor is a read that starts past the end and returns nothing.
+        read(serde_json::json!({"path": path, "start_line": 9_999})).await;
+        assert!(
+            write().await.is_error,
+            "an empty read must not allow a rewrite"
+        );
+        assert_eq!(std::fs::read_to_string(&long).unwrap(), lines);
+
+        // A whole-file read does.
+        let whole = read(serde_json::json!({"path": path, "max_lines": 1_000})).await;
+        assert!(!whole.is_error, "{}", whole.content);
+        assert!(!write().await.is_error);
+        assert_eq!(std::fs::read_to_string(&long).unwrap(), "new\n");
+
+        // Another process rewrites it in place with content of the same
+        // length and restores the old mtime: only the ctime gives it away.
+        let seen_mtime = std::fs::metadata(&long).unwrap().modified().unwrap();
+        std::fs::write(&long, "NEW\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&long)
+            .unwrap()
+            .set_modified(seen_mtime)
+            .unwrap();
+        let stale = write().await;
+        assert!(stale.is_error, "{}", stale.content);
+        assert!(stale.content.contains("changed since"), "{}", stale.content);
+        assert_eq!(std::fs::read_to_string(&long).unwrap(), "NEW\n");
     }
 
     #[tokio::test]
