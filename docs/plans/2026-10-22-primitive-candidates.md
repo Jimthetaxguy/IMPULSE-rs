@@ -75,7 +75,14 @@ and the Grok-built `~/code/min-agent-rs` and `~/code/tools/context-lane`.
 10. **A calculator without Python.** `calculate()` still interpolates into a
     Python program and requires `Capability::PythonExec`, so voice policy
     classifies a calculator call as mutating. A pure-Rust parser for the
-    existing allowlisted grammar removes the over-gate.
+    allowlisted grammar would remove the over-gate, but it is not a drop-in.
+    The grammar admits `**` and `//`, so `2**1000` needs exact big integers,
+    and results are Python `str()` output (`5.0`, `1e+20`,
+    `0.30000000000000004`). A parser that differs silently changes answers,
+    and exact parity means a bignum dependency. Dropping `PythonExec` while
+    the expression still runs in the daemon's interpreter is a policy change
+    too: `9**9**9` is bounded only by Monty's limits. Decide the semantics
+    first.
 11. **Proposal-acceptor rules for context compiler v0** (Grok, 2026-10-21).
     The model proposes a lane document and a Rust acceptor refuses unsourced
     facts, reads without excerpts, and self-assigned ids or budgets.
@@ -111,6 +118,18 @@ that main fails to compile `impulse-desktop` (fixed).
   needs the Supervisor to get real evidence (a bounded diff, for example)
   instead of the claim. That changes the Supervisor contract and is James's
   call.
+
+## Two fencing designs exist
+
+`origin/feat/governed-fencing-generation` (a cloud agent, 2026-10-22, no PR)
+is a second implementation of blueprint change #2, stacked on #141's WIP
+commits. It advances the generation on every acknowledged launch
+(`launch_fencing_generation()`, already injected by the desktop launcher),
+where #140 advances it only on an explicit `TakeOverWorker`. Both answer an
+idempotent replay from its receipt before checking the fence. #140 now carries
+the review fixes (launch injection, no takeover while a claim is under review),
+so it is the one to land; keep the other branch as a reference until #140
+merges, then close it.
 
 ## Contradictions found between agents' notes and the code
 
