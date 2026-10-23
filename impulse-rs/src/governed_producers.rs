@@ -607,19 +607,19 @@ fn add_detached_worktree(
         match run_bounded_process(&mut command, &format!("{label} materialization"), timeout) {
             Ok(output) => output,
             Err(error) => {
-                let _ = cleanup_detached_worktree(source_workspace, checkout);
+                cleanup_partial_worktree(source_workspace, checkout);
                 return Err(error);
             }
         };
     let completed = match git_completed_successfully(&output, "git worktree add --detach") {
         Ok(completed) => completed,
         Err(error) => {
-            let _ = cleanup_detached_worktree(source_workspace, checkout);
+            cleanup_partial_worktree(source_workspace, checkout);
             return Err(error).with_context(|| format!("{label} materialization"));
         }
     };
     if !completed {
-        let _ = cleanup_detached_worktree(source_workspace, checkout);
+        cleanup_partial_worktree(source_workspace, checkout);
         anyhow::bail!("failed to materialize {label}");
     }
     Ok(())
@@ -630,6 +630,25 @@ struct DetachedVerificationWorkspace {
     checkout: PathBuf,
     target_dir: PathBuf,
     temporary_root: Option<tempfile::TempDir>,
+}
+
+/// Best-effort removal after a failed `git worktree add`. The failure itself is
+/// what the caller reports; a cleanup that also fails is logged with what Git
+/// still lists, because a leftover registration otherwise goes unnoticed.
+fn cleanup_partial_worktree(source_workspace: &Path, checkout: &Path) {
+    if !cleanup_detached_worktree(source_workspace, checkout) {
+        let listed = successful_git_text(
+            source_workspace,
+            &["worktree", "list", "--porcelain"],
+            "worktree list after failed cleanup",
+        )
+        .unwrap_or_else(|error| format!("<unavailable: {error:#}>"));
+        tracing::warn!(
+            checkout = %checkout.display(),
+            worktrees = %listed,
+            "failed to unregister a partial detached worktree"
+        );
+    }
 }
 
 fn cleanup_detached_worktree(source_workspace: &Path, checkout: &Path) -> bool {
@@ -3147,7 +3166,7 @@ mod tests {
                 .filter(|line| line.starts_with("worktree "))
                 .count(),
             1,
-            "failed materialization must unregister its partial worktree"
+            "failed materialization must unregister its partial worktree; git lists:\n{worktrees}"
         );
     }
 

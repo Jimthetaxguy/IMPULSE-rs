@@ -580,12 +580,18 @@ impl WriteQueue {
     /// Writes the entire buffer in a single lock acquisition to prevent interleaving.
     /// Returns `true` if the write happened, `false` if skipped.
     pub fn write_injection(&self, data: &[u8]) -> Result<bool, Box<dyn std::error::Error>> {
+        // The quiet check runs under the writer lock. Checked before it, a
+        // user write blocked on a child that is not reading could let the
+        // quiet period lapse, and the injection would then take the lock
+        // between two slices of one paste (impulse-desktop writes pastes in
+        // slices). Every user write stamps the time before releasing the
+        // lock, so here the stamp is always current.
+        let mut writer = self.writer.lock();
         let now = epoch_millis();
         let last = self.last_user_input.load(Ordering::Relaxed);
         if now.saturating_sub(last) < INJECTION_QUIET_MS {
             return Ok(false);
         }
-        let mut writer = self.writer.lock();
         writer.write_all(data)?;
         writer.flush()?;
         Ok(true)
@@ -756,6 +762,43 @@ mod tests {
         );
         // Only user input should be in the buffer.
         assert_eq!(&*buf.lock(), b"x");
+    }
+
+    /// A user write that blocks (the child is not reading) holds the lock
+    /// past the quiet period. An injection that started waiting meanwhile
+    /// must still see the write that just finished, not the stale stamp from
+    /// before it, or it lands between two slices of one paste.
+    #[test]
+    fn test_write_queue_injection_waiting_on_a_slow_user_write_is_skipped() {
+        struct SlowBuf(Arc<Mutex<Vec<u8>>>);
+        impl Write for SlowBuf {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> =
+            Arc::new(Mutex::new(Box::new(SlowBuf(Arc::clone(&buf)))));
+        let wq = WriteQueue::new(writer);
+        // No earlier user input: the stamp is 0, so a check made before the
+        // lock would pass and the injection would be written.
+        let user = {
+            let wq = wq.clone();
+            std::thread::spawn(move || wq.write_user_input(b"paste-slice").unwrap())
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let injected = wq.write_injection(b"context").unwrap();
+        user.join().unwrap();
+        assert!(
+            !injected,
+            "an injection must not follow a user write it waited on"
+        );
+        assert_eq!(&*buf.lock(), b"paste-slice");
     }
 
     #[test]
