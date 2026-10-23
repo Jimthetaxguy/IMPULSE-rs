@@ -852,4 +852,129 @@ mod tests {
             "{err}"
         );
     }
+
+    // ---- Serde round-trips for manifests loaded from `.impulse/tools.d` ----
+
+    #[test]
+    fn round_trip_external_tool_spec() {
+        let original = ExternalToolSpec {
+            id: "lint_json".into(),
+            name: "Lint JSON".into(),
+            description: "Lints a JSON file".into(),
+            source: ExternalToolSource::Process,
+            command: "jq".into(),
+            args: vec![".".into(), "{path}".into()],
+            env_allowlist: vec!["JQ_COLORS".into()],
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "format": "file-path"}
+                },
+                "required": ["path"]
+            }),
+            output_mode: ExternalToolOutputMode::Json,
+            capabilities: vec![Capability::FileSystemRead, Capability::ShellExec],
+            timeout_ms: Some(2500),
+            cwd_policy: CwdPolicy::ImpulseDir,
+        };
+        let json = serde_json::to_string_pretty(&original).unwrap();
+        let recovered: ExternalToolSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            serde_json::to_value(&original).unwrap(),
+            serde_json::to_value(&recovered).unwrap()
+        );
+        assert_eq!(recovered.output_mode, ExternalToolOutputMode::Json);
+        assert_eq!(recovered.cwd_policy, CwdPolicy::ImpulseDir);
+        assert_eq!(recovered.timeout_ms, Some(2500));
+    }
+
+    #[test]
+    fn test_minimal_manifest_deserializes_with_defaults() {
+        let manifest = r#"{
+            "id": "echo",
+            "name": "Echo",
+            "description": "Echo text",
+            "command": "echo",
+            "input_schema": {"type": "object", "properties": {}}
+        }"#;
+        let spec: ExternalToolSpec = serde_json::from_str(manifest).unwrap();
+        assert_eq!(spec.source, ExternalToolSource::Process);
+        assert!(spec.args.is_empty());
+        assert!(spec.env_allowlist.is_empty());
+        assert_eq!(spec.output_mode, ExternalToolOutputMode::Text);
+        assert!(spec.capabilities.is_empty());
+        assert_eq!(spec.timeout_ms, None);
+        assert_eq!(spec.cwd_policy, CwdPolicy::Current);
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn test_manifest_without_input_schema_is_refused() {
+        let manifest = r#"{"id":"echo","name":"Echo","description":"d","command":"echo"}"#;
+        let error = serde_json::from_str::<ExternalToolSpec>(manifest).unwrap_err();
+        assert!(error.to_string().contains("input_schema"), "{error}");
+    }
+
+    #[test]
+    fn test_external_tool_enum_wire_names_are_pinned() {
+        assert_eq!(
+            serde_json::to_string(&ExternalToolSource::Process).unwrap(),
+            "\"process\""
+        );
+        for (mode, wire) in [
+            (ExternalToolOutputMode::Text, "\"text\""),
+            (ExternalToolOutputMode::Json, "\"json\""),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<ExternalToolOutputMode>(wire).unwrap(),
+                mode
+            );
+        }
+        for (policy, wire) in [
+            (CwdPolicy::Current, "\"current\""),
+            (CwdPolicy::ImpulseDir, "\"impulse_dir\""),
+        ] {
+            assert_eq!(serde_json::to_string(&policy).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<CwdPolicy>(wire).unwrap(), policy);
+        }
+    }
+
+    #[test]
+    fn test_capability_wire_names_are_pinned() {
+        // Manifests name capabilities by variant (no serde rename).
+        for (capability, wire) in [
+            (Capability::FileSystemRead, "\"FileSystemRead\""),
+            (Capability::FileSystemWrite, "\"FileSystemWrite\""),
+            (Capability::Network, "\"Network\""),
+            (Capability::PythonExec, "\"PythonExec\""),
+            (Capability::SystemInfo, "\"SystemInfo\""),
+            (Capability::ShellExec, "\"ShellExec\""),
+        ] {
+            assert_eq!(serde_json::to_string(&capability).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<Capability>(wire).unwrap(),
+                capability
+            );
+        }
+    }
+
+    #[test]
+    fn round_trip_manifest_validation_report() {
+        let original = ManifestValidationReport {
+            valid_tools: 2,
+            invalid_tools: 1,
+            issues: vec![ManifestValidationIssue {
+                file: "bad.json".into(),
+                error: "missing field `command`".into(),
+            }],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let recovered: ManifestValidationReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            serde_json::to_value(&original).unwrap(),
+            serde_json::to_value(&recovered).unwrap()
+        );
+        assert_eq!(recovered.issues[0].file, "bad.json");
+    }
 }

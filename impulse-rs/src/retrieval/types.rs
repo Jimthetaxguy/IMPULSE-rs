@@ -313,4 +313,155 @@ mod tests {
         assert_eq!(back.results.len(), 1);
         assert_eq!(back.results[0].score, 0.91);
     }
+
+    // ---- Serde round-trips for the persisted index state ----
+    //
+    // `IndexState` is read back from disk by `retrieval::status`; these types
+    // lack PartialEq, so round-trips compare the serialized JSON values.
+
+    fn fixed_time(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn assert_json_round_trip<T>(original: &T) -> T
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let json = serde_json::to_string(original).unwrap();
+        let recovered: T = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            serde_json::to_value(original).unwrap(),
+            serde_json::to_value(&recovered).unwrap()
+        );
+        recovered
+    }
+
+    fn sample_index_state() -> IndexState {
+        IndexState {
+            version: "1".into(),
+            schema_version: 3,
+            indexed_at: fixed_time("2026-06-01T12:00:00Z"),
+            history_count: 42,
+            genome_count: 7,
+            vector_enabled: true,
+            vector_available: false,
+            last_index_duration_ms: 1500,
+            last_integrity_check: Some(fixed_time("2026-06-01T12:01:00Z")),
+            last_error_code: Some("sqlite_vec_unavailable".into()),
+            backend_health: vec!["keyword_fts:ok".into(), "sqlite_vec:missing".into()],
+            notes: vec!["rebuilt after schema bump".into()],
+        }
+    }
+
+    #[test]
+    fn round_trip_index_state() {
+        let recovered = assert_json_round_trip(&sample_index_state());
+        assert_eq!(recovered.schema_version, 3);
+        assert_eq!(
+            recovered.last_integrity_check,
+            Some(fixed_time("2026-06-01T12:01:00Z"))
+        );
+    }
+
+    #[test]
+    fn test_index_state_from_before_optional_fields_existed_deserializes_with_defaults() {
+        let json = r#"{"version":"1","indexed_at":"2026-02-25T00:00:00Z","history_count":1,"genome_count":2,"vector_enabled":false,"vector_available":false,"notes":[]}"#;
+        let state: IndexState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.schema_version, default_schema_version());
+        assert_eq!(state.last_index_duration_ms, 0);
+        assert_eq!(state.last_integrity_check, None);
+        assert_eq!(state.last_error_code, None);
+        assert!(state.backend_health.is_empty());
+        assert_eq!(state.history_count, 1);
+    }
+
+    #[test]
+    fn round_trip_retrieval_status() {
+        let original = RetrievalStatus {
+            db_path: "/repo/.impulse/retrieval.db".into(),
+            db_exists: true,
+            db_size_bytes: 4096,
+            integrity_ok: Some(true),
+            integrity_message: Some("ok".into()),
+            vector_extension_available: false,
+            python_available: true,
+            index_state: sample_index_state(),
+            injection: InjectionStatus {
+                config_mode: "auto".into(),
+                config_scope: "history".into(),
+                emit_artifacts: false,
+                staged_artifact_count: 2,
+                last_staged_at: Some("2026-06-01T12:02:00Z".into()),
+                last_staged_surface: Some("claude".into()),
+                last_staged_status: Some("staged".into()),
+                last_staged_artifact: Some("ctx-1.md".into()),
+            },
+        };
+        let recovered = assert_json_round_trip(&original);
+        assert_eq!(recovered.injection.staged_artifact_count, 2);
+        assert_eq!(recovered.index_state.history_count, 42);
+    }
+
+    #[test]
+    fn test_retrieval_status_without_injection_uses_default_injection() {
+        let mut value = serde_json::to_value(RetrievalStatus {
+            db_path: "p".into(),
+            db_exists: false,
+            db_size_bytes: 0,
+            integrity_ok: None,
+            integrity_message: None,
+            vector_extension_available: false,
+            python_available: false,
+            index_state: sample_index_state(),
+            injection: InjectionStatus::default(),
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("injection");
+        let status: RetrievalStatus = serde_json::from_value(value).unwrap();
+        assert_eq!(status.injection.config_mode, "review");
+        assert_eq!(status.injection.config_scope, "both");
+        assert!(status.injection.emit_artifacts);
+    }
+
+    #[test]
+    fn test_retrieval_mode_wire_names_are_pinned() {
+        // Serde uses the variant name, not `as_str`'s lowercase form.
+        for (mode, wire) in [
+            (RetrievalMode::Keyword, "\"Keyword\""),
+            (RetrievalMode::Semantic, "\"Semantic\""),
+        ] {
+            assert_eq!(serde_json::to_string(&mode).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<RetrievalMode>(wire).unwrap(), mode);
+        }
+    }
+
+    #[test]
+    fn test_search_backend_wire_names_are_pinned() {
+        for (backend, wire) in [
+            (SearchBackend::Auto, "\"Auto\""),
+            (SearchBackend::SqliteVec, "\"SqliteVec\""),
+            (SearchBackend::RustCosine, "\"RustCosine\""),
+            (SearchBackend::Keyword, "\"Keyword\""),
+        ] {
+            assert_eq!(serde_json::to_string(&backend).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<SearchBackend>(wire).unwrap(),
+                backend
+            );
+        }
+    }
+
+    #[test]
+    fn test_index_scope_wire_names_are_pinned() {
+        for (scope, wire) in [
+            (IndexScope::History, "\"History\""),
+            (IndexScope::Genome, "\"Genome\""),
+            (IndexScope::All, "\"All\""),
+        ] {
+            assert_eq!(serde_json::to_string(&scope).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<IndexScope>(wire).unwrap(), scope);
+        }
+    }
 }
