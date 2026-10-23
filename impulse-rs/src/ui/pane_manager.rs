@@ -229,3 +229,173 @@ impl Drop for PaneManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn size() -> PtySize {
+        PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
+    /// A real PTY pane: `alive` keeps a child running, otherwise the child
+    /// exits at once so the pane goes dead.
+    fn spawn(manager: &mut PaneManager, name: &str, alive: bool) -> usize {
+        let script = if alive { "sleep 60" } else { "true" };
+        manager
+            .create_pane(PaneCreateRequest {
+                name: name.to_string(),
+                command: "sh",
+                args: &["-c", script],
+                working_dir: None,
+                size: size(),
+                project_index: 0,
+                impulse_home: None,
+                scrollback_lines: None,
+                session_id: None,
+                platform: None,
+            })
+            .expect("spawn a PTY pane")
+    }
+
+    fn wait_until_dead(manager: &PaneManager, index: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while manager.get_pane(index).is_some_and(TerminalPane::is_alive) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pane {index} never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn test_pane_manager_new_is_empty_with_no_active_pane() {
+        let manager = PaneManager::new();
+        assert!(manager.is_empty());
+        assert_eq!(manager.len(), 0);
+        assert!(manager.active_pane().is_none());
+    }
+
+    #[test]
+    fn test_create_pane_assigns_increasing_ids_and_activates_the_new_pane() {
+        let mut manager = PaneManager::new();
+        let first = spawn(&mut manager, "a", true);
+        let second = spawn(&mut manager, "b", true);
+        assert!(second > first);
+        assert_eq!(manager.len(), 2);
+        assert_eq!(manager.active_pane_index, 1);
+        assert_eq!(manager.active_pane().map(|p| p.id), Some(second));
+        assert_eq!(manager.find_by_id(first).map(|p| p.id), Some(first));
+        assert!(manager.find_by_id(second + 100).is_none());
+    }
+
+    #[test]
+    fn test_next_and_prev_pane_wrap_around() {
+        let mut manager = PaneManager::new();
+        for name in ["a", "b", "c"] {
+            spawn(&mut manager, name, true);
+        }
+        manager.select_pane(2);
+        manager.next_pane();
+        assert_eq!(manager.active_pane_index, 0, "next wraps to the first pane");
+        manager.prev_pane();
+        assert_eq!(manager.active_pane_index, 2, "prev wraps to the last pane");
+        manager.prev_pane();
+        assert_eq!(manager.active_pane_index, 1);
+    }
+
+    #[test]
+    fn test_navigation_on_an_empty_manager_is_a_no_op() {
+        let mut manager = PaneManager::new();
+        manager.next_pane();
+        manager.prev_pane();
+        manager.select_pane(3);
+        assert_eq!(manager.active_pane_index, 0);
+        assert!(manager.inject_to_active("ignored").is_ok());
+    }
+
+    #[test]
+    fn test_select_pane_ignores_an_out_of_range_index() {
+        let mut manager = PaneManager::new();
+        spawn(&mut manager, "a", true);
+        spawn(&mut manager, "b", true);
+        manager.select_pane(0);
+        manager.select_pane(5);
+        assert_eq!(manager.active_pane_index, 0);
+    }
+
+    #[test]
+    fn test_close_pane_out_of_range_returns_error() {
+        let mut manager = PaneManager::new();
+        spawn(&mut manager, "a", true);
+        let err = manager.close_pane(1).unwrap_err();
+        assert!(err.to_string().contains("out of range"), "{err}");
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_close_pane_clamps_the_active_index() {
+        let mut manager = PaneManager::new();
+        for name in ["a", "b", "c"] {
+            spawn(&mut manager, name, true);
+        }
+        assert_eq!(manager.active_pane_index, 2);
+        manager.close_pane(2).unwrap();
+        assert_eq!(manager.len(), 2);
+        assert_eq!(
+            manager.active_pane_index, 1,
+            "active moves to the new last pane"
+        );
+        manager.close_pane(0).unwrap();
+        manager.close_pane(0).unwrap();
+        assert!(manager.is_empty());
+        assert_eq!(manager.active_pane_index, 0);
+    }
+
+    #[test]
+    fn test_cleanup_dead_keeps_the_active_pane_by_id() {
+        let mut manager = PaneManager::new();
+        spawn(&mut manager, "dead", false);
+        let keep = spawn(&mut manager, "alive", true);
+        wait_until_dead(&manager, 0);
+        assert_eq!(manager.dead_indices(), vec![0]);
+        assert_eq!((manager.active_count(), manager.dead_count()), (1, 1));
+
+        // The live pane is active at index 1; removing the dead pane before it
+        // must keep it active at its new index.
+        manager.cleanup_dead();
+        assert_eq!(manager.len(), 1);
+        assert_eq!(manager.active_pane_index, 0);
+        assert_eq!(manager.active_pane().map(|p| p.id), Some(keep));
+        assert!(manager.dead_indices().is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_dead_clamps_when_the_active_pane_died() {
+        let mut manager = PaneManager::new();
+        let survivor = spawn(&mut manager, "alive", true);
+        spawn(&mut manager, "dead", false);
+        assert_eq!(manager.active_pane_index, 1);
+        wait_until_dead(&manager, 1);
+        manager.cleanup_dead();
+        assert_eq!(manager.len(), 1);
+        assert_eq!(manager.active_pane_index, 0);
+        assert_eq!(manager.active_pane().map(|p| p.id), Some(survivor));
+    }
+
+    #[test]
+    fn test_set_default_scrollback_applies_to_new_panes() {
+        let mut manager = PaneManager::new();
+        manager.set_default_scrollback(123);
+        assert_eq!(manager.default_scrollback, 123);
+        spawn(&mut manager, "a", true);
+        assert_eq!(manager.len(), 1);
+        assert!(manager.resize_all(size()).is_ok());
+    }
+}
