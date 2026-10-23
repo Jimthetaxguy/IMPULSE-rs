@@ -90,6 +90,21 @@ and the Grok-built `~/code/min-agent-rs` and `~/code/tools/context-lane`.
 12. **License mismatch.** `LICENSE` is Apache-2.0 but every `Cargo.toml` says
     MIT. James needs to pick one.
 
+13. **Token and cost budgets per loop run** (ChatGPT research, rebuilt by
+    Gemini on 2026-10-22 as
+    `~/code/chatgpt-analysis/output/v2_surfaces/extracted_kits/impulse_contracts_kit`,
+    from the "Tighten IMPULSE Contracts" conversations). Its
+    `ResourceBudget` independently lands on 50 tool calls per run, and adds
+    `model_input_tokens`/`model_output_tokens`/`model_cost_microunits`.
+    `LoopBudget` has none of these, yet every `ChatResponse` already carries
+    `Usage`, so a token budget is the natural next slice after the tool-call
+    cap. The same kit's `RequestedInvocation → PreparedInvocation →
+    AuthorizedInvocation` typestate is the full form of the "AuthorizedOp vs
+    RequestedOp" gap in the 2026-09-18 map. Do not port its
+    `InvocationService::authorize` as written: it loads and then subtracts the
+    atomic budget in two steps, so two concurrent authorizations can both pass
+    the check.
+
 Also noted: `ToolRegistry::with_defaults` logs an error and returns an empty
 registry. Its production callers (agent discovery, voice adapter) could
 therefore advertise zero tools silently; `try_with_defaults()?` would fail
