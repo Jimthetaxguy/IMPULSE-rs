@@ -56,6 +56,69 @@ mod tests {
         assert!(GuardEngine::has_blocking(&results.unwrap()));
     }
 
+    fn blocks(command: &str, target: &str) -> bool {
+        let results = evaluate_action(command, target, &GuardConfig::default()).unwrap();
+        GuardEngine::has_blocking(&results)
+    }
+
+    #[test]
+    fn test_evaluate_action_blocks_quote_split_force_push_of_main() {
+        for command in [
+            "git push -f origin ma''in",
+            "git push -f origin m\"ain\"",
+            "git push -f origin ma\\in",
+            "git push -f origin HEAD:ma''in",
+            "git push origin \"+HEAD\":main",
+            "git push origin '+'HEAD:main",
+            "git push origin \\+HEAD:main",
+        ] {
+            assert!(blocks(command, "bash"), "`{command}` force-pushes main");
+        }
+    }
+
+    #[test]
+    fn test_evaluate_action_blocks_hidden_bulk_git_add() {
+        for command in [
+            "git add --al",
+            "git add ./*",
+            "git add ./.",
+            "git add \":(top)\"",
+            "git add ''.",
+            "git add \\.",
+        ] {
+            assert!(blocks(command, "bash"), "`{command}` stages the whole tree");
+        }
+        assert!(!blocks("git add src/main.rs", "bash"));
+        assert!(!blocks("git add ./src/lib.rs", "bash"));
+    }
+
+    #[test]
+    fn test_evaluate_action_blocks_quoted_or_split_recursive_rm_of_root() {
+        for command in [
+            "'rm' -rf ~",
+            "\"rm\" -rf /",
+            "r\\m -rf /",
+            "rm${IFS}-rf${IFS}/",
+            "rm \\\n-rf /",
+            "rm -rf \"\"/",
+        ] {
+            assert!(blocks(command, "bash"), "`{command}` deletes from the root");
+        }
+        assert!(!blocks("rm -rf ./target", "bash"));
+    }
+
+    #[test]
+    fn test_evaluate_action_blocks_json_and_suffixed_secret_writes() {
+        for content in [
+            r#"{"anthropic_api_key": "sk-ant-api03-abcdefghijklmnopqrstuvwxyz"}"#,
+            r#"{"password": "abcdefghijklmnopqrstuvwxyz"}"#,
+            "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        ] {
+            assert!(blocks(content, "file_write"), "`{content}` writes a secret");
+        }
+        assert!(!blocks(r#"{"token_count": 12}"#, "file_write"));
+    }
+
     #[test]
     fn test_evaluate_action_allows_safe() {
         let config = GuardConfig::default();

@@ -93,11 +93,12 @@ fn force_push_pattern() -> String {
 }
 
 /// `git add` of everything: `-A` (alone or in a cluster such as `-vA`),
-/// `--all`, or a whole-tree pathspec (`.`, `./`, `:/`, `*`, quoted or not)
+/// `--all` (or its abbreviation `--al`), or a whole-tree pathspec (`.`, `./`,
+/// `./.`, `./*`, `:/`, `:(top)`, `*`, quoted or not)
 /// that ends its token, so `./src/main.rs` and `.gitignore` pass.
 fn bulk_git_add_pattern() -> String {
     format!(
-        r#"{add}{same}\s(?:-[a-zA-Z]*A[a-zA-Z]*|--all|["']?(?:\.|\./|:/|\*)["']?)(?:$|[\s;|&)`>])"#,
+        r#"{add}{same}\s(?:-[a-zA-Z]*A[a-zA-Z]*|--all?|["']?(?:\.|\./|\./\.|\./\*|:/|:\(top\)/?|\*)["']?)(?:$|[\s;|&)`>])"#,
         add = git_subcommand("add"),
         same = SAME_COMMAND,
     )
@@ -179,7 +180,9 @@ pub fn builtin_rules() -> Vec<GuardRule> {
         GuardRule {
             id: "block-write-secret".to_string(),
             // Matches `key_name = "value"`/`key_name: "value"`/`key_name=value`
-            // shapes for common credential-bearing names, with a long-enough
+            // shapes for common credential-bearing names, also with a suffix
+            // (`aws_secret_access_key =`) or a quoted JSON key
+            // (`"api_key": "..."`), with a long-enough
             // value (16+ chars) to avoid flagging short placeholders/examples.
             // Ported from a sibling project's `guard::RULES` (which itself
             // ported this exact pattern from an earlier version of this
@@ -188,7 +191,7 @@ pub fn builtin_rules() -> Vec<GuardRule> {
             // wires file_write's `content` to GuardTarget::FileWrite but had
             // no FileWrite-targeted rule to actually match against.
             pattern:
-                r#"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['"]?[A-Za-z0-9/\+_\-]{16,}"#
+                r#"(?i)(api[_-]?key|secret|token|password)[A-Za-z0-9_\-]*['"]?\s*[:=]\s*['"]?[A-Za-z0-9/\+_\-]{16,}"#
                     .to_string(),
             action: GuardAction::Block,
             target: GuardTarget::FileWrite,
@@ -312,7 +315,7 @@ pub fn builtin_rules() -> Vec<GuardRule> {
             // content ion itself is about to write -- lower certainty that
             // the human should be stopped outright.
             pattern:
-                r#"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['"]?[A-Za-z0-9/\+_\-]{16,}"#
+                r#"(?i)(api[_-]?key|secret|token|password)[A-Za-z0-9_\-]*['"]?\s*[:=]\s*['"]?[A-Za-z0-9/\+_\-]{16,}"#
                     .to_string(),
             action: GuardAction::Warn,
             target: GuardTarget::ToolCall,

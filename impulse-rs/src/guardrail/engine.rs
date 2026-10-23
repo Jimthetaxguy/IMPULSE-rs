@@ -17,6 +17,31 @@ struct CompiledRule {
 // Guard Engine
 // ============================================================================
 
+/// The words a shell would see in `command`, approximately: quote characters
+/// and backslash escapes removed, line continuations joined, and `$IFS`
+/// treated as a space. Not a shell parser; it only undoes the quoting that
+/// splits or hides a word a rule names.
+fn remove_shell_quoting(command: &str) -> String {
+    let joined = command
+        .replace("\\\n", "")
+        .replace("${IFS}", " ")
+        .replace("$IFS", " ");
+    let mut words = String::with_capacity(joined.len());
+    let mut chars = joined.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' => {}
+            '\\' => {
+                if let Some(escaped) = chars.next() {
+                    words.push(escaped);
+                }
+            }
+            _ => words.push(c),
+        }
+    }
+    words
+}
+
 /// Regex-based pattern matching engine for guardrail evaluation.
 ///
 /// Compiles rule patterns once at construction, then evaluates inputs
@@ -62,6 +87,13 @@ impl GuardEngine {
     /// Results are sorted by severity: Block, then Warn, then Log.
     pub fn evaluate(&self, input: &str, target: &GuardTarget) -> Vec<GuardResult> {
         let mut results = Vec::new();
+        // Shell quoting rebuilds a word the rule names (`ma''in`, `'rm'`,
+        // `r\m`, `rm${IFS}-rf`), so a shell command is also checked with that
+        // quoting removed. A match on the unquoted form errs toward stopping
+        // the command, which a rule that blocks or asks for `CONFIRM` wants.
+        let unquoted = matches!(target, GuardTarget::Bash | GuardTarget::Any)
+            .then(|| remove_shell_quoting(input))
+            .filter(|unquoted| unquoted != input);
 
         for compiled in &self.rules {
             // Skip rules that don't apply to this target
@@ -69,7 +101,11 @@ impl GuardEngine {
                 continue;
             }
 
-            if compiled.regex.is_match(input) {
+            if compiled.regex.is_match(input)
+                || unquoted
+                    .as_deref()
+                    .is_some_and(|unquoted| compiled.regex.is_match(unquoted))
+            {
                 results.push(GuardResult {
                     rule_id: compiled.rule.id.clone(),
                     action: compiled.rule.action,

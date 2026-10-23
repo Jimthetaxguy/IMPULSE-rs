@@ -748,13 +748,21 @@ fn bash_command_escape_candidates(command: &str, tool_ctx: &ToolContext) -> Vec<
 
     let tokens = split_shell_tokens(command);
     let mut flagged: Vec<String> = Vec::new();
+    if bare_cd_reaches_home(command) {
+        flagged.push("cd (to $HOME)".to_string());
+    }
     for (index, token) in tokens.iter().enumerate() {
-        let bare = unquoted(token).trim_start_matches(SHELL_METACHARS);
+        // Also step over an escape or brace before the path (`\/etc`,
+        // `{/etc/passwd,}`), which the shell drops.
+        let bare = unquoted(token).trim_start_matches(|c: char| {
+            SHELL_METACHARS.contains(&c) || matches!(c, '\\' | '{' | '"' | '\'')
+        });
         if bare.starts_with('/')
             || bare.contains("..")
             || bare.contains('~')
             || bare.contains("$HOME")
-            || bare.contains("${HOME}")
+            // Every `${HOME...}` form: `${HOME}`, `${HOME:-}`, `${HOME%/}`.
+            || bare.contains("${HOME")
         {
             flagged.push(token.clone());
         }
@@ -771,6 +779,31 @@ fn bash_command_escape_candidates(command: &str, tool_ctx: &ToolContext) -> Vec<
     flagged.sort();
     flagged.dedup();
     flagged
+}
+
+/// Whether `command` runs a `cd` with no target (or `cd --`), which goes to
+/// `$HOME`. [`split_shell_tokens`] drops the `;`/`&&` after it, so the token
+/// scan would read the *next command's* name as the `cd` target.
+fn bare_cd_reaches_home(command: &str) -> bool {
+    let mut segments = command.split(|c: char| SHELL_METACHARS.contains(&c) || c == '\n');
+    segments.any(|segment| {
+        let mut parts = segment.split_whitespace();
+        while let Some(word) = parts.next() {
+            if word == "cd" {
+                return match parts.next() {
+                    None => true,
+                    Some("--") => parts.next().is_none(),
+                    Some(_) => false,
+                };
+            }
+            // `cd` only matters as the segment's command word, after any
+            // `VAR=value` assignments.
+            if !word.contains('=') {
+                return false;
+            }
+        }
+        false
+    })
 }
 
 /// Shell metacharacters that can sit directly against a path with no
@@ -2421,6 +2454,47 @@ mod tests {
             split_shell_tokens("cmd1&&cmd2"),
             vec!["cmd1".to_string(), "cmd2".to_string()]
         );
+    }
+
+    #[test]
+    fn test_bash_command_escape_candidates_flags_bare_cd_to_home() {
+        let ctx = ToolContext::default();
+        for command in [
+            "cd && rm -rf ./*",
+            "cd; cat .ssh/id_rsa .aws/credentials",
+            "cd",
+            "cd -- ; ls",
+            "X=1 cd\nls",
+        ] {
+            assert!(
+                !bash_command_escape_candidates(command, &ctx).is_empty(),
+                "`{command}` changes to $HOME and must be flagged"
+            );
+        }
+        for command in ["cd src && ls", "cd -- src", "echo cd", "abcd; ls"] {
+            assert!(
+                !bare_cd_reaches_home(command),
+                "`{command}` does not change to $HOME"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bash_command_escape_candidates_flags_hidden_home_and_root_forms() {
+        let ctx = ToolContext::default();
+        for command in [
+            "rm -rf ${HOME:-}",
+            "rm -rf ${HOME%/}/x",
+            "cat ${HOME:?}/.ssh/id_rsa",
+            "cat \\/etc/passwd",
+            "cat {/etc/passwd,}",
+        ] {
+            assert!(
+                !bash_command_escape_candidates(command, &ctx).is_empty(),
+                "`{command}` reaches outside the repo and must be flagged"
+            );
+        }
+        assert!(bash_command_escape_candidates("cargo test --lib", &ctx).is_empty());
     }
 
     #[test]
