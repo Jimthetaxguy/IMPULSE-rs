@@ -245,79 +245,42 @@ impl State {
     /// Reconcile the independently persisted review queue from authoritative
     /// accepted tasks. Missing candidates are recoverable; orphaned or
     /// digest-mismatched candidates fail closed.
+    ///
+    /// Runs in every process that opens the project, hooks included. A repair
+    /// is written only after re-reading the ledger and then the governed tasks
+    /// under the storage lock: a hook's copy can predate a decision the daemon
+    /// committed since, and writing a repair computed from it rolled that
+    /// decision back. The daemon persists a task before its candidate, so
+    /// tasks read after the ledger always cover every candidate in it.
     pub(super) fn reconcile_accepted_run_memory_candidates(&self) -> Result<()> {
-        let tasks = self.all_governed_tasks()?;
-        let expected = tasks
-            .iter()
-            .filter(|task| task.is_accepted())
-            .map(derive_accepted_run_memory_candidate)
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .map(|candidate| (candidate.id.clone(), candidate))
-            .collect::<BTreeMap<_, _>>();
-
+        let expected = expected_accepted_run_candidates(&self.all_governed_tasks()?)?;
         let mut ledger = self
             .memory_candidates
             .lock()
             .map_err(|error| anyhow::anyhow!("memory candidate ledger lock poisoned: {error}"))?;
-        for (candidate_id, stored) in &ledger.candidates {
-            let expected_candidate = expected.get(candidate_id).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "memory candidate `{candidate_id}` is orphaned from accepted governed-task truth"
-                )
-            })?;
-            // The review status is operator state, not derived state, so the
-            // comparison against governed-task truth deliberately ignores it.
-            // Everything else must still match byte for byte.
-            if !matches_ignoring_status(stored, expected_candidate) {
-                anyhow::bail!(
-                    "memory candidate `{candidate_id}` does not match its accepted governed-task source"
-                );
-            }
+        // Checked against this process's copy first, so a project that needs
+        // no repair is never locked (which would create `.impulse/`). An error
+        // here is not final: this copy's tasks can predate a candidate the
+        // daemon added since, so the locked re-check below decides.
+        if matches!(reconciled_candidate_ledger(&ledger, &expected), Ok(None)) {
+            return Ok(());
         }
-
-        let mut repaired = ledger.clone();
-        for (candidate_id, mut candidate) in expected {
-            if repaired.candidates.contains_key(&candidate_id) {
-                continue;
+        let _lock = self
+            .storage()
+            .lock_exclusive()
+            .context("Failed to lock project state to reconcile memory candidates")?;
+        let current = MemoryCandidateLedger::load(self.storage())?;
+        let expected = expected_accepted_run_candidates(
+            &super::governed_task::governed_tasks_on_disk(self.storage())?,
+        )?;
+        match reconciled_candidate_ledger(&current, &expected)? {
+            Some(repaired) => {
+                self.storage()
+                    .write_private_json(MEMORY_CANDIDATES_FILE, &repaired)
+                    .context("Failed to persist reconciled accepted-run memory candidates")?;
+                *ledger = repaired;
             }
-            // A decision parked by a derivation-version migration rejoins its
-            // re-derived candidate here, keyed by the governed task id, which
-            // survives re-derivation.
-            if let Some(status) = repaired
-                .pending_status_migrations
-                .remove(&candidate.governed_task_id)
-            {
-                carry_status_forward(&status, &mut candidate);
-            }
-            repaired.candidates.insert(candidate_id, candidate);
-        }
-        // A migration whose accepted task is gone cannot be reapplied. A parked
-        // *pending* status carries nothing, so drop it. A parked decision is
-        // operator state: keep it, say so loudly, and let it name itself in the
-        // orphan error if its record is still in the log — silently clearing it
-        // would turn a recoverable situation into an error pointing nowhere.
-        repaired
-            .pending_status_migrations
-            .retain(|governed_task_id, status| {
-                if status.is_pending() {
-                    return false;
-                }
-                tracing::warn!(
-                    governed_task_id = %governed_task_id,
-                    status = status.label(),
-                    "a parked memory review decision has no accepted governed task to reattach to; \
-                     keeping it so its record is not reported as an unexplained orphan"
-                );
-                true
-            });
-        if repaired.candidates != ledger.candidates
-            || repaired.pending_status_migrations != ledger.pending_status_migrations
-        {
-            self.storage()
-                .write_private_json(MEMORY_CANDIDATES_FILE, &repaired)
-                .context("Failed to persist reconciled accepted-run memory candidates")?;
-            *ledger = repaired;
+            None => *ledger = current,
         }
         Ok(())
     }
@@ -363,54 +326,66 @@ impl State {
                     "adopting a checked-out promoted memory log: this machine had no candidate \
                      ledger, so the verified log is recorded as committed"
                 );
-                let mut repaired = ledger.clone();
-                repaired.memory_log_head = Some(adopted);
-                // Recording the head is not enough. The review statuses lived
-                // only in the ledger that is missing, so without reattachment
-                // every adopted record would be an orphan on the *next*
-                // start-up, and its candidate would sit pending and be
-                // promotable a second time into a duplicate record.
-                //
-                // The record carries its own provenance, so the status is
-                // rebuilt from it. `decided_by` says plainly that this machine
-                // did not witness the decision: the log is the authority for
-                // what was promoted, not for who approved it.
-                for entry in log.committed() {
-                    let record = &entry.record;
-                    let MemorySource::CandidateRef {
-                        candidate_id,
-                        governed_task_id,
-                        ..
-                    } = &record.source
-                    else {
-                        continue;
-                    };
-                    let status = MemoryCandidateStatus::Promoted {
-                        record_id: record.id.clone(),
-                        decided_at: record.valid_from.clone(),
-                        decided_by: adopted_decision_actor(),
-                    };
-                    match repaired.candidates.get_mut(candidate_id) {
-                        Some(candidate) if candidate.status.is_pending() => {
-                            candidate.status = status;
-                        }
-                        Some(_) => {}
-                        // The candidate was re-derived under a different id, or
-                        // its accepted task is not present here. Park the
-                        // rebuilt decision the same way a derivation migration
-                        // would, so a later start-up reattaches it — or names
-                        // the lost task instead of reporting a bare orphan.
-                        None => {
-                            repaired
-                                .pending_status_migrations
-                                .insert(governed_task_id.clone(), status);
+                // Re-read under the lock: another process opening the same
+                // fresh clone may have adopted the log (and the daemon may have
+                // decided since), and its ledger must not be replaced.
+                let _lock = self
+                    .storage()
+                    .lock_exclusive()
+                    .context("Failed to lock project state to adopt the memory log")?;
+                let current = MemoryCandidateLedger::load(self.storage())?;
+                if current.memory_log_head.is_some() {
+                    *ledger = current;
+                } else {
+                    let mut repaired = current;
+                    repaired.memory_log_head = Some(adopted);
+                    // Recording the head is not enough. The review statuses lived
+                    // only in the ledger that is missing, so without reattachment
+                    // every adopted record would be an orphan on the *next*
+                    // start-up, and its candidate would sit pending and be
+                    // promotable a second time into a duplicate record.
+                    //
+                    // The record carries its own provenance, so the status is
+                    // rebuilt from it. `decided_by` says plainly that this machine
+                    // did not witness the decision: the log is the authority for
+                    // what was promoted, not for who approved it.
+                    for entry in log.committed() {
+                        let record = &entry.record;
+                        let MemorySource::CandidateRef {
+                            candidate_id,
+                            governed_task_id,
+                            ..
+                        } = &record.source
+                        else {
+                            continue;
+                        };
+                        let status = MemoryCandidateStatus::Promoted {
+                            record_id: record.id.clone(),
+                            decided_at: record.valid_from.clone(),
+                            decided_by: adopted_decision_actor(),
+                        };
+                        match repaired.candidates.get_mut(candidate_id) {
+                            Some(candidate) if candidate.status.is_pending() => {
+                                candidate.status = status;
+                            }
+                            Some(_) => {}
+                            // The candidate was re-derived under a different id, or
+                            // its accepted task is not present here. Park the
+                            // rebuilt decision the same way a derivation migration
+                            // would, so a later start-up reattaches it — or names
+                            // the lost task instead of reporting a bare orphan.
+                            None => {
+                                repaired
+                                    .pending_status_migrations
+                                    .insert(governed_task_id.clone(), status);
+                            }
                         }
                     }
+                    self.storage()
+                        .write_private_json(MEMORY_CANDIDATES_FILE, &repaired)
+                        .context("Failed to record the adopted promoted-memory log head")?;
+                    *ledger = repaired;
                 }
-                self.storage()
-                    .write_private_json(MEMORY_CANDIDATES_FILE, &repaired)
-                    .context("Failed to record the adopted promoted-memory log head")?;
-                *ledger = repaired;
             }
         }
         for (governed_task_id, record_id) in
@@ -480,6 +455,13 @@ impl State {
             .memory_candidates
             .lock()
             .map_err(|error| anyhow::anyhow!("memory candidate ledger lock poisoned: {error}"))?;
+        // Checked and written against the ledger as it is on disk, so a
+        // reconcile another process wrote since is kept.
+        let _lock = self
+            .storage()
+            .lock_exclusive()
+            .context("Failed to lock project state to record a memory candidate")?;
+        *ledger = MemoryCandidateLedger::load(self.storage())?;
         if let Some(stored) = ledger.candidates.get(&candidate.id) {
             // The derived candidate is always `PendingReview`, while a decided
             // one is stored as promoted or dismissed; compare everything else,
@@ -589,6 +571,20 @@ impl State {
             .memory_log
             .lock()
             .map_err(|error| anyhow::anyhow!("promoted memory log lock poisoned: {error}"))?;
+        // The revision check, the append and the commit run against the
+        // ledger and log as they are on disk, under the storage lock, so a
+        // repair another process wrote since is neither lost nor rolled back.
+        let _lock = self
+            .storage()
+            .lock_exclusive()
+            .context("Failed to lock project state for a memory decision")?;
+        *ledger = MemoryCandidateLedger::load(self.storage())?;
+        *log = MemoryLog::load(
+            self.storage(),
+            ledger.memory_log_head.as_ref(),
+            LedgerOrigin::Local,
+        )
+        .context("Failed to load the promoted memory log")?;
 
         if let Some(recorded) = ledger.processed_decisions.get(&input.request_id) {
             require_idempotent_decision(recorded, &input)?;
@@ -861,6 +857,85 @@ impl State {
 }
 
 /// The candidate a log entry was promoted from, when it names one.
+/// The candidate every accepted task derives, keyed by candidate id.
+fn expected_accepted_run_candidates(
+    tasks: &[GovernedTaskRun],
+) -> Result<BTreeMap<MemoryCandidateId, AcceptedRunMemoryCandidate>> {
+    Ok(tasks
+        .iter()
+        .filter(|task| task.is_accepted())
+        .map(derive_accepted_run_memory_candidate)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .map(|candidate| (candidate.id.clone(), candidate))
+        .collect())
+}
+
+/// `ledger` repaired against `expected`, or `None` when it needs no write.
+///
+/// Fails closed on a stored candidate with no accepted source or whose content
+/// no longer matches it.
+fn reconciled_candidate_ledger(
+    ledger: &MemoryCandidateLedger,
+    expected: &BTreeMap<MemoryCandidateId, AcceptedRunMemoryCandidate>,
+) -> Result<Option<MemoryCandidateLedger>> {
+    for (candidate_id, stored) in &ledger.candidates {
+        let expected_candidate = expected.get(candidate_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "memory candidate `{candidate_id}` is orphaned from accepted governed-task truth"
+            )
+        })?;
+        // The review status is operator state, not derived state, so the
+        // comparison against governed-task truth deliberately ignores it.
+        // Everything else must still match byte for byte.
+        if !matches_ignoring_status(stored, expected_candidate) {
+            anyhow::bail!(
+                "memory candidate `{candidate_id}` does not match its accepted governed-task source"
+            );
+        }
+    }
+
+    let mut repaired = ledger.clone();
+    for (candidate_id, candidate) in expected {
+        if repaired.candidates.contains_key(candidate_id) {
+            continue;
+        }
+        let mut candidate = candidate.clone();
+        // A decision parked by a derivation-version migration rejoins its
+        // re-derived candidate here, keyed by the governed task id, which
+        // survives re-derivation.
+        if let Some(status) = repaired
+            .pending_status_migrations
+            .remove(&candidate.governed_task_id)
+        {
+            carry_status_forward(&status, &mut candidate);
+        }
+        repaired.candidates.insert(candidate_id.clone(), candidate);
+    }
+    // A migration whose accepted task is gone cannot be reapplied. A parked
+    // *pending* status carries nothing, so drop it. A parked decision is
+    // operator state: keep it, say so loudly, and let it name itself in the
+    // orphan error if its record is still in the log — silently clearing it
+    // would turn a recoverable situation into an error pointing nowhere.
+    repaired
+        .pending_status_migrations
+        .retain(|governed_task_id, status| {
+            if status.is_pending() {
+                return false;
+            }
+            tracing::warn!(
+                governed_task_id = %governed_task_id,
+                status = status.label(),
+                "a parked memory review decision has no accepted governed task to reattach to; \
+                 keeping it so its record is not reported as an unexplained orphan"
+            );
+            true
+        });
+    let changed = repaired.candidates != ledger.candidates
+        || repaired.pending_status_migrations != ledger.pending_status_migrations;
+    Ok(changed.then_some(repaired))
+}
+
 fn tail_candidate_id(
     entry: &impulse_ops::memory_candidate::MemoryLogEntry,
 ) -> Option<&MemoryCandidateId> {
@@ -1198,6 +1273,69 @@ pub(in crate::state) mod tests {
     ) -> MemoryCandidateDecisionInput {
         input.project_id = state.governed_project_id();
         input
+    }
+
+    /// Reviewer finding: every process reconciles on open, and a hook whose
+    /// copy predated a daemon decision wrote that copy back when it needed a
+    /// repair, rolling the decision and its committed log head back.
+    #[test]
+    fn test_a_stale_copy_repairing_the_ledger_keeps_a_newer_decision() {
+        let (_root, daemon, candidate_id) = state_with_candidate();
+        let stale = State::new(daemon.storage().base_path().to_path_buf()).unwrap();
+        daemon
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-1", 0), &daemon),
+                OperatorAuthentication::CapabilityAuthenticated,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        // Make the stale copy need a repair, as a hook that loaded the ledger
+        // before the daemon added a candidate would.
+        stale.memory_candidates.lock().unwrap().candidates.clear();
+
+        stale.reconcile_accepted_run_memory_candidates().unwrap();
+
+        let reopened = State::new(daemon.storage().base_path().to_path_buf()).unwrap();
+        let candidates = reopened
+            .list_accepted_run_memory_candidates(&reopened.governed_project_id())
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].status.is_promoted());
+        assert_eq!(reopened.memory_candidates.lock().unwrap().revision, 1);
+        assert!(
+            stale.memory_candidates.lock().unwrap().candidates[&candidate_id]
+                .status
+                .is_promoted()
+        );
+    }
+
+    /// The daemon's decision must see a repair a hook wrote since its own copy
+    /// was loaded, and not replace it.
+    #[test]
+    fn test_a_decision_keeps_a_repair_written_by_another_process() {
+        let (_root, daemon, candidate_id) = state_with_candidate();
+        let ledger_path = daemon.storage().path(MEMORY_CANDIDATES_FILE);
+        let mut on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
+        on_disk["revision"] = serde_json::json!(7);
+        std::fs::write(&ledger_path, serde_json::to_vec(&on_disk).unwrap()).unwrap();
+
+        // Planned against the daemon's stale revision 0: refused, because the
+        // ledger on disk moved on.
+        let stale_plan = daemon.decide_memory_candidate(
+            with_project(promote(&candidate_id, "decide-1", 0), &daemon),
+            OperatorAuthentication::CapabilityAuthenticated,
+            "2026-09-12T10:00:00Z",
+        );
+        assert!(stale_plan.is_err());
+        let outcome = daemon
+            .decide_memory_candidate(
+                with_project(promote(&candidate_id, "decide-2", 7), &daemon),
+                OperatorAuthentication::CapabilityAuthenticated,
+                "2026-09-12T10:00:00Z",
+            )
+            .unwrap();
+        assert_eq!(outcome.decision.resulting_ledger_revision, 8);
     }
 
     #[test]

@@ -82,7 +82,7 @@ When working on files in these paths, auto-surface the corresponding skills:
 | `src/guardrail/**` | `plugin-hooks-guardrails` |
 | `src/tooling/**` | `rust-trait-design` |
 | `src/main.rs` (CLI dispatch) | `rust-programming` (complex CLI section) |
-| `src/state/**` | `rust-programming` (atomic I/O + dirty flag sections) |
+| `src/state/**` | `rust-programming` (atomic I/O sections) |
 | `src/injection/**` | `ai-sidecar-patterns` + `context-engineering` |
 
 ---
@@ -94,7 +94,7 @@ When working on files in these paths, auto-surface the corresponding skills:
 | Module | Purpose | Primary File |
 |---|---|---|
 | `daemon` | Unix socket IPC server | `src/daemon/mod.rs` |
-| `state` | In-memory state with dirty flag + atomic sync | `src/state/mod.rs` |
+| `state` | In-memory copies updated by locked read-modify-write | `src/state/mod.rs` |
 | `tooling` | DynamicTool trait + registry + execution | `src/tooling/mod.rs` |
 | `injection` | Context injection staging + surfaces | `src/injection/staging.rs` |
 | `guardrail` | Pre-execution gating engine | `src/guardrail/engine.rs` |
@@ -227,8 +227,10 @@ All four must pass. Never skip with `--no-verify`. Crate-local checks (`cargo te
 3. **Atomic writes are mandatory**: Never write directly to `.impulse/` files.
    Always temp + rename. See `src/state/mod.rs`.
 
-4. **Dirty flag on every mutation**: If you add a new mutation to `State`, set
-   `self.dirty = true`. Forgetting this causes data loss on shutdown.
+4. **Locked read-modify-write for every mutation**: A new mutation to `State`
+   goes through `update_live_state` / `update_config` (or re-reads its file under
+   `Storage::lock_exclusive`). Saving the in-memory copy whole overwrites what
+   other processes (hooks, the daemon) wrote since it was loaded.
 
 5. **Daemon request/response pairs**: Every new `DaemonRequest` variant needs a
    corresponding `DaemonResponse` variant and a match arm in the handler.
