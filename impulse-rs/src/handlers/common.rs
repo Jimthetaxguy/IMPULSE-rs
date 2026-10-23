@@ -3,7 +3,7 @@
 //! Extracted from `mod.rs` to keep handler-specific code separate from
 //! the utility functions that multiple handlers depend on.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
@@ -227,7 +227,8 @@ pub(crate) fn persist_claude_env_var_at(
     };
 
     let mut existing = if path.exists() {
-        std::fs::read_to_string(path)?
+        std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read the Claude env file {}", path.display()))?
     } else {
         String::new()
     };
@@ -1014,6 +1015,19 @@ mod tests {
     fn test_persist_claude_env_var_noop_when_no_env_file() {
         let result = persist_claude_env_var_at(None, "MY_KEY", "my_value");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_persist_claude_env_var_unreadable_env_file_names_the_path() {
+        // A directory where the env file should be cannot be read as text.
+        let tmp = TempDir::new().unwrap();
+        let err = persist_claude_env_var_at(Some(tmp.path()), "MY_KEY", "v").unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("Claude env file"), "{rendered}");
+        assert!(
+            rendered.contains(&tmp.path().display().to_string()),
+            "{rendered}"
+        );
     }
 
     #[test]

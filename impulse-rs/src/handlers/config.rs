@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -171,7 +171,8 @@ fn ensure_repo_runtime_ignores(impulse_dir: &Path) -> Result<()> {
 
     let gitignore_path = repo_root.join(".gitignore");
     let existing = if gitignore_path.exists() {
-        std::fs::read_to_string(&gitignore_path)?
+        std::fs::read_to_string(&gitignore_path)
+            .with_context(|| format!("Failed to read {}", gitignore_path.display()))?
     } else {
         String::new()
     };

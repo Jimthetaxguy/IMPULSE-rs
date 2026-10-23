@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::path::Path;
 
 use super::types::*;
@@ -50,11 +50,14 @@ pub fn list_pending(base_path: &Path) -> Result<Vec<CleanupProposal>> {
     }
 
     let mut proposals = Vec::new();
-    for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
+    for entry in
+        std::fs::read_dir(&dir).with_context(|| format!("Failed to list {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("Failed to list {}", dir.display()))?;
         let path = entry.path();
         if path.extension().map(|e| e == "yaml").unwrap_or(false) {
-            let content = std::fs::read_to_string(&path)?;
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read proposal {}", path.display()))?;
             if let Ok(proposal) = serde_yaml::from_str::<CleanupProposal>(&content) {
                 proposals.push(proposal);
             }
@@ -77,17 +80,27 @@ pub fn approve_proposal(base_path: &Path, proposal_id: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    let content = std::fs::read_to_string(&pending_path)?;
-    let mut proposal: CleanupProposal = serde_yaml::from_str(&content)?;
+    let content = std::fs::read_to_string(&pending_path)
+        .with_context(|| format!("Failed to read proposal {}", pending_path.display()))?;
+    let mut proposal: CleanupProposal = serde_yaml::from_str(&content)
+        .with_context(|| format!("Failed to parse proposal {}", pending_path.display()))?;
     proposal.status = ProposalStatus::Approved;
 
     let applied_dir = base_path.join(STEWARDSHIP_DIR).join(APPLIED_DIR);
-    std::fs::create_dir_all(&applied_dir)?;
+    std::fs::create_dir_all(&applied_dir)
+        .with_context(|| format!("Failed to create {}", applied_dir.display()))?;
 
     let applied_path = applied_dir.join(format!("{}.yaml", safe_id));
-    let yaml = serde_yaml::to_string(&proposal)?;
+    let yaml =
+        serde_yaml::to_string(&proposal).context("Failed to serialize the approved proposal")?;
     super::atomic_write_file(&applied_path, yaml.as_bytes())?;
-    std::fs::remove_file(&pending_path)?;
+    std::fs::remove_file(&pending_path).with_context(|| {
+        format!(
+            "Approved proposal written to {}, but the pending copy {} could not be removed",
+            applied_path.display(),
+            pending_path.display()
+        )
+    })?;
 
     Ok(true)
 }
@@ -104,7 +117,8 @@ pub fn reject_proposal(base_path: &Path, proposal_id: &str) -> Result<bool> {
         return Ok(false);
     }
 
-    std::fs::remove_file(&pending_path)?;
+    std::fs::remove_file(&pending_path)
+        .with_context(|| format!("Failed to remove proposal {}", pending_path.display()))?;
     Ok(true)
 }
 
@@ -169,6 +183,18 @@ mod tests {
     use super::super::cross_project::ensure_dirs;
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn test_approve_a_malformed_proposal_names_the_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let pending = tmp.path().join(STEWARDSHIP_DIR).join(PENDING_DIR);
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::write(pending.join("broken.yaml"), ": not: [valid").unwrap();
+        let err = approve_proposal(tmp.path(), "broken").unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("Failed to parse proposal"), "{rendered}");
+        assert!(rendered.contains("broken.yaml"), "{rendered}");
+    }
 
     fn make_proposal(id: &str) -> CleanupProposal {
         CleanupProposal {
