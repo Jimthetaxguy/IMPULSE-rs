@@ -71,7 +71,11 @@ and the Grok-built `~/code/min-agent-rs` and `~/code/tools/context-lane`.
 9. **Run Monty in a subprocess worker (`monty-pool`).** ADR-0021 records that
    `max_memory` does not bound gradual growth, and the interpreter runs inside
    the daemon. The first slice is one worker under a parent-side hard timeout,
-   tested so that a crashing program leaves the daemon alive.
+   tested so that a crashing program leaves the daemon alive. Upstream now
+   publishes `monty-pool` 1.3.0 (async `Pool` → `Checkout`, mounts, snapshot
+   restore), but its `MontyTransport::Subprocess` spawns a separate `monty`
+   child binary, so adopting it means building, shipping and locating that
+   binary next to `impulse-rs`. That packaging decision comes first.
 10. **A calculator without Python.** `calculate()` still interpolates into a
     Python program and requires `Capability::PythonExec`, so voice policy
     classifies a calculator call as mutating. A pure-Rust parser for the
