@@ -105,6 +105,33 @@ and the Grok-built `~/code/min-agent-rs` and `~/code/tools/context-lane`.
     atomic budget in two steps, so two concurrent authorizations can both pass
     the check.
 
+### Full recheck of Codex, Gemini and Claude sources
+
+The recheck covered 30 Codex rollouts, 32 Gemini brain notes and 13
+transcripts, 12 Claude IMPULSE sessions, and the memory, plans and `.remember`
+files. Nothing in them contradicts the work above. Additions:
+
+- **Ledger in one transaction** (Gemini primitives note §2.3), refining
+  candidates 2 and 5: write each governed event and its state change in one
+  SQLite transaction, export JSONL from it, and use `STRICT` tables with
+  `CHECK` on status columns.
+- **Staged compaction** (Gemini, 2026-10-11 learnings): deterministic elision
+  at ~60% of the context budget and an LLM summary at ~85%. Today only the
+  deterministic stub pass exists.
+- **Compact compiler errors**: parse `cargo --message-format=json` into short
+  diagnostics for the model. Not on main.
+- **Read-before-write**: refuse `file_write` to an existing file the session
+  has not read. Not on main.
+- **Semantic interaction checks for parallel lanes** (Codex research report):
+  separate worktrees isolate lanes but do not prove their edits compose; run
+  one final verification on the combined tree.
+- **Planner hook before the first mutation** (Codex research report),
+  evaluated against no plan and a self-plan.
+- **Monty**: `monty-alloc` must be the global allocator for `max_memory` to
+  bound gradual growth (Codex, 2026-10-20). Upstream 1.2.0 shipped
+  2026-10-18; main pins 1.0.0. A pool must also discard a worker after any
+  resource-limit failure. This sharpens candidate 9.
+
 Also noted: `ToolRegistry::with_defaults` logs an error and returns an empty
 registry. Its production callers (agent discovery, voice adapter) could
 therefore advertise zero tools silently; `try_with_defaults()?` would fail
