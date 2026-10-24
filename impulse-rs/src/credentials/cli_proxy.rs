@@ -39,6 +39,25 @@ impl CliProxyProvider {
         }
     }
 
+    /// A key is passed to the CLI as an argument, so one that starts with
+    /// `-` would be parsed as a flag (`--help`, or an output option) rather
+    /// than a secret name. No secrets manager names a secret that way.
+    fn validate_key(&self, key: &str) -> Result<(), CredentialError> {
+        let reason = if key.trim().is_empty() {
+            "must not be empty"
+        } else if key.starts_with('-') {
+            "must not start with '-', which the CLI would read as a flag"
+        } else if key.chars().any(char::is_control) {
+            "must not contain control characters"
+        } else {
+            return Ok(());
+        };
+        Err(CredentialError::InvalidKey {
+            provider: self.cli_tool.clone(),
+            reason: reason.to_string(),
+        })
+    }
+
     pub fn is_tool_available(&self) -> bool {
         let mut command = Command::new(&self.cli_tool);
         command.arg("--version");
@@ -58,6 +77,7 @@ impl CredentialProvider for CliProxyProvider {
     }
 
     fn get(&self, key: &str) -> Result<String, CredentialError> {
+        self.validate_key(key)?;
         match self.cli_tool.as_str() {
             "infisical" => {
                 let mut args = vec!["secrets", "get", key];
@@ -191,5 +211,67 @@ impl CredentialProvider for CliProxyProvider {
 
     fn is_available(&self) -> bool {
         self.is_tool_available()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_refuses_a_key_the_cli_would_read_as_a_flag() {
+        // The tool name never runs: validation comes first.
+        let provider = CliProxyProvider::new("infisical".into(), None);
+        for key in ["--help", "-o", "", "   ", "bad\nkey"] {
+            match provider.get(key) {
+                Err(CredentialError::InvalidKey { provider, reason }) => {
+                    assert_eq!(provider, "infisical");
+                    assert!(!reason.is_empty());
+                }
+                other => panic!("key {key:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_invalid_key_display_names_the_provider_and_reason() {
+        let err = CredentialError::InvalidKey {
+            provider: "doppler".into(),
+            reason: "must not be empty".into(),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("doppler"), "{rendered}");
+        assert!(rendered.contains("must not be empty"), "{rendered}");
+    }
+
+    #[test]
+    fn test_get_with_an_unsupported_tool_is_not_supported() {
+        let provider = CliProxyProvider::new("not-a-secrets-cli".into(), None);
+        assert!(matches!(
+            provider.get("API_TOKEN"),
+            Err(CredentialError::NotSupported(_))
+        ));
+    }
+
+    #[test]
+    fn test_set_and_delete_are_not_supported() {
+        let provider = CliProxyProvider::new("vault".into(), None);
+        assert!(matches!(
+            provider.set("k", "v"),
+            Err(CredentialError::NotSupported(_))
+        ));
+        assert!(matches!(
+            provider.delete("k"),
+            Err(CredentialError::NotSupported(_))
+        ));
+        assert_eq!(provider.name(), "vault");
+        assert_eq!(provider.provider_type(), CredentialProviderType::CliProxy);
+    }
+
+    #[test]
+    fn test_a_missing_cli_binary_is_unavailable_and_errors_instead_of_panicking() {
+        let missing = CliProxyProvider::new("/nonexistent/impulse-test/op".into(), None);
+        assert!(!missing.is_tool_available());
+        assert!(missing.run_cli(&["get", "item", "x"]).is_err());
     }
 }
