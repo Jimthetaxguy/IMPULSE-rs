@@ -357,6 +357,44 @@ mod python_sandbox_tests {
         assert!(!marker.exists(), "subprocess.run must not reach the host");
     }
 
+    /// Monty 1.2.0 added `os.path`, file objects, `Path.scan`, `json.load` and
+    /// `tomllib`. With no host or mounts wired, every one of them must still
+    /// fail without touching the host filesystem.
+    #[test]
+    fn test_execute_python_new_filesystem_calls_cannot_reach_the_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "SENTINEL-CONTENT").unwrap();
+        let written = dir.path().join("written.txt");
+        let secret = secret.display().to_string();
+        let dir_path = dir.path().display().to_string();
+        let programs = [
+            format!("import os.path\nprint(os.path.exists({secret:?}))\n"),
+            format!("import os.path\nprint(os.path.getsize({secret:?}))\n"),
+            format!("from pathlib import Path\nprint(Path({secret:?}).read_text())\n"),
+            format!("from pathlib import Path\nprint(list(Path({dir_path:?}).iterdir()))\n"),
+            format!("import json\nprint(json.load(open({secret:?})))\n"),
+            format!("import tomllib\nprint(tomllib.load(open({secret:?}, 'rb')))\n"),
+            format!(
+                "f = open({:?}, 'w')\nf.write('x')\nf.close()\n",
+                written.display().to_string()
+            ),
+        ];
+        for code in &programs {
+            let result = execute_python(code).expect("sandbox faults are results, not errors");
+            assert!(result.fault.is_some(), "must fault: {code}\ngot {result:?}");
+            assert!(
+                !result.output.contains("SENTINEL") && !result.output.contains("True"),
+                "host state leaked for {code}: {:?}",
+                result.output
+            );
+        }
+        assert!(
+            !written.exists(),
+            "open(..., 'w') must not create a host file"
+        );
+    }
+
     #[test]
     fn test_execute_python_open_etc_passwd_returns_fault_and_reads_nothing() {
         let result = execute_python("print(open(\"/etc/passwd\").read())\n").expect("result");
