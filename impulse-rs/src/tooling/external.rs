@@ -702,6 +702,9 @@ mod tests {
     /// a wrapped CLI that itself requires an API key) must still see that
     /// var — the scrub must not silently defeat the manifest's own opt-in.
     #[tokio::test]
+    // clippy: the lock is a test-only std::sync::Mutex<()> held across the
+    // whole execute().await so no sibling test mutates the env mid-spawn;
+    // same pattern as bash_exec's secret-env tests.
     #[allow(clippy::await_holding_lock)]
     async fn test_execute_forwards_explicitly_allowlisted_manifest_vars() {
         let _lock = secret_env_lock();

@@ -5487,7 +5487,6 @@ dependencies = [
  "pdf-extract",
  "portable-pty",
  "proptest",
- "pyo3",
  "quick-xml 0.31.0",
  "ratatui",
  "regex",

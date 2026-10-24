@@ -135,7 +135,7 @@ Choose the simplest solution that works. Prefer editing existing files over crea
 | State | `RwLock` + dirty flag + sync on Drop |
 | Naming | `PascalCase` types, `snake_case` functions, `SCREAMING_SNAKE` constants |
 | Tests | Unit tests in `mod tests`, integration tests use `DaemonGuard` RAII |
-| Features | `office-support`, `monty-support`, `datafusion-support` (all opt-in) |
+| Features | `office-support` and `photon-subagent` (default); `datafusion-support` (opt-in). `calc`/`exec` use the `monty` crate and are not feature-gated. |
 | egui imports | `impulse-gui` uses `eframe::egui::*`, NEVER bare `egui::*` — **legacy only** |
 
 ---

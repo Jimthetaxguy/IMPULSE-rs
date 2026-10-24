@@ -142,5 +142,7 @@ passing.
 | Flag | Default | Commands Affected |
 |------|---------|-------------------|
 | `office-support` | Yes | `office` |
-| `monty-support` | No | `extract`, `compute-injection`, `calc`, `exec` |
+| `photon-subagent` | Yes | Ion `photon` |
 | `datafusion-support` | No | Advanced analytics |
+
+`calc` and `exec` run through the in-process Monty sandbox in `src/tools/python.rs`. They are not behind a feature flag. `extract` and `compute-injection` use the always-compiled keyword helpers in `src/monty/`.
