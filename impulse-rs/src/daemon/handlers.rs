@@ -1364,6 +1364,9 @@ pub(crate) async fn handle_governed_producer_request(
                     mutation: impulse_ops::governed_task::GovernedTaskMutation::SubmitClaim {
                         claim,
                     },
+                    // The worker's own lease token, never derived here: the
+                    // ledger fences a claim whose generation is stale.
+                    fencing_generation: request.generation,
                 };
                 (_producer_guard, mutation_request)
             }
@@ -2999,6 +3002,7 @@ mod governed_producer_handler_tests {
                                 id: "desktop-runtime".to_string(),
                             },
                         },
+                        fencing_generation: None,
                     },
                 },
                 &state,
@@ -3025,6 +3029,7 @@ mod governed_producer_handler_tests {
                             reason: Some("fixture exited".to_string()),
                             exit_kind: Default::default(),
                         },
+                        fencing_generation: None,
                     },
                 },
                 &mutation_state,
@@ -3102,6 +3107,7 @@ mod governed_producer_handler_tests {
                                 id: "desktop-runtime".to_string(),
                             },
                         },
+                        fencing_generation: None,
                     },
                 },
                 &state,
@@ -3130,6 +3136,7 @@ mod governed_producer_handler_tests {
                             diff_ref: None,
                         },
                     },
+                    fencing_generation: None,
                 },
             },
             &state,
@@ -3145,6 +3152,7 @@ mod governed_producer_handler_tests {
             expected_revision: running.revision,
             summary: "fixture implementation is complete".to_string(),
             artifact_ids: vec!["artifact-1".to_string()],
+            generation: None,
         };
         std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
         let dirty = handle_governed_producer_request(
@@ -3216,6 +3224,7 @@ mod governed_producer_handler_tests {
                             notes: None,
                         },
                     },
+                    fencing_generation: None,
                 },
             },
             &state,
@@ -3335,6 +3344,7 @@ mod governed_producer_handler_tests {
                             rationale: "forged".to_string(),
                         },
                     },
+                    fencing_generation: None,
                 },
             },
             &state,
@@ -3433,6 +3443,7 @@ mod governed_producer_handler_tests {
                                 rationale: "verified evidence accepted".to_string(),
                             },
                         },
+                        fencing_generation: None,
                     },
                 },
                 &state,
@@ -3485,6 +3496,7 @@ mod governed_producer_handler_tests {
             expected_revision: task.revision,
             summary: "implementation complete".into(),
             artifact_ids: Vec::new(),
+            generation: None,
         };
         let error = super::preflight_claim(&task, &request)
             .expect_err("a discarded staged checkout is not claimable");

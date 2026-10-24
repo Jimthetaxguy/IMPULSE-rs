@@ -548,4 +548,88 @@ mod tests {
             Some(std::ffi::OsStr::new("7"))
         );
     }
+
+    #[test]
+    fn test_format_bytes_switches_units_at_each_power_of_1024() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.00 KB");
+        assert_eq!(format_bytes(1024 * 1024 - 1), "1024.00 KB");
+        assert_eq!(format_bytes(1024 * 1024), "1.00 MB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
+    }
+
+    #[test]
+    fn test_output_stats_formatting_and_scrollback_usage() {
+        let stats = |lines: u64, used: usize, capacity: usize| PaneOutputStats {
+            bytes: 2048,
+            lines,
+            scrollback_used: used,
+            scrollback_capacity: capacity,
+        };
+        assert_eq!(stats(999, 0, 0).lines_formatted(), "999 lines");
+        assert_eq!(stats(1_500, 0, 0).lines_formatted(), "1.5K lines");
+        assert_eq!(stats(2_500_000, 0, 0).lines_formatted(), "2.5M lines");
+        assert_eq!(stats(0, 0, 0).bytes_formatted(), "2.00 KB");
+        assert_eq!(stats(0, 5, 0).scrollback_usage_pct(), 0.0, "no capacity");
+        assert!((stats(0, 25, 100).scrollback_usage_pct() - 0.25).abs() < f64::EPSILON);
+        assert_eq!(stats(0, 300, 100).scrollback_usage_pct(), 1.0, "clamped");
+    }
+
+    fn spawn_pane(script: &str) -> TerminalPane {
+        TerminalPane::spawn(TerminalSpawnRequest {
+            id: 1,
+            name: "test".to_string(),
+            command: "sh",
+            args: &["-c", script],
+            working_dir: None,
+            size: PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            project_index: 0,
+            impulse_home: None,
+            scrollback_lines: None,
+        })
+        .expect("spawn a PTY pane")
+    }
+
+    #[test]
+    fn test_pane_counts_output_and_shows_it_on_screen() {
+        let pane = spawn_pane("printf 'alpha\\nbeta\\n'; sleep 60");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !pane.screen_snapshot().contents().contains("beta") {
+            assert!(std::time::Instant::now() < deadline, "output never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let contents = pane.screen_snapshot().contents();
+        assert!(
+            contents.contains("alpha") && contents.contains("beta"),
+            "{contents}"
+        );
+        assert!(pane.output_bytes() >= "alpha\nbeta\n".len() as u64);
+        assert!(pane.output_lines() >= 2);
+        assert!(pane.had_recent_output(60));
+        assert!(pane.is_alive());
+        pane.kill().unwrap();
+        assert!(!pane.is_alive());
+    }
+
+    #[test]
+    fn test_set_scrollback_clamps_to_the_allowed_range() {
+        let mut pane = spawn_pane("sleep 60");
+        pane.set_scrollback(0).unwrap();
+        assert_eq!(
+            pane.output_stats().scrollback_capacity,
+            MIN_SCROLLBACK_LINES
+        );
+        pane.set_scrollback(usize::MAX).unwrap();
+        assert_eq!(
+            pane.output_stats().scrollback_capacity,
+            MAX_SCROLLBACK_LINES
+        );
+        pane.kill().unwrap();
+    }
 }

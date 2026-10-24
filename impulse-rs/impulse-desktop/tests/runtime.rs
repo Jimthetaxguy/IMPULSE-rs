@@ -250,6 +250,7 @@ impl GovernedTaskGateway for TestGovernedGateway {
             task_id: task_id.clone(),
             expected_revision: current.revision,
             mutation,
+            fencing_generation: None,
         })
     }
 
@@ -610,7 +611,7 @@ fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_direc
         .build();
     let mut request = shell_spawn(
         "canonical-workspace-agent",
-        "printf '%s|%s|%s|%s|%s|%s|%s' \"$PWD\" \"$IMPULSE_WORKSPACE_ROOT\" \"$IMPULSE_GOVERNED_TASK_ID\" \"$IMPULSE_PROJECT_ID\" \"$IMPULSE_SOCKET_PATH\" \"$IMPULSE_CONTROL_CLI\" \"$IMPULSE_GOVERNED_VERIFICATION_PROFILE\"",
+        "printf '%s|%s|%s|%s|%s|%s|%s|%s' \"$PWD\" \"$IMPULSE_WORKSPACE_ROOT\" \"$IMPULSE_GOVERNED_TASK_ID\" \"$IMPULSE_PROJECT_ID\" \"$IMPULSE_SOCKET_PATH\" \"$IMPULSE_CONTROL_CLI\" \"$IMPULSE_GOVERNED_VERIFICATION_PROFILE\" \"$IMPULSE_GOVERNED_LEASE_GENERATION\"",
     );
     request.cwd = Some(alias.display().to_string());
     request.workspace = Some(WorkspaceTarget {
@@ -641,7 +642,7 @@ fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_direc
     assert_eq!(telemetry.governed_task_id, snapshot.governed_task_id);
 
     let expected_output = format!(
-        "{canonical_text}|{canonical_text}|{}|workspace|/tmp/impulse-test.sock|/tmp/impulse-test-cli|rust_workspace_v1",
+        "{canonical_text}|{canonical_text}|{}|workspace|/tmp/impulse-test.sock|/tmp/impulse-test-cli|rust_workspace_v1|0",
         snapshot
             .governed_task_id
             .as_ref()

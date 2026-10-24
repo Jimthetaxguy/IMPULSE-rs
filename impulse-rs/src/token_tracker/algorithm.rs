@@ -302,26 +302,12 @@ impl TokenTracker {
             1.0
         };
 
-        // Find most common compaction type
-        let mut type_counts: HashMap<CompactionType, u32> = HashMap::new();
-        for c in &self.compactions {
-            *type_counts.entry(c.compaction_type).or_insert(0) += 1;
-        }
-        let most_common = type_counts
-            .into_iter()
-            .max_by_key(|(_, v)| *v)
-            .map(|(t, _)| t)
-            .unwrap_or(CompactionType::None);
-
-        // Find most active platform
-        let mut platform_counts: HashMap<Platform, u32> = HashMap::new();
-        for c in &self.compactions {
-            *platform_counts.entry(c.platform).or_insert(0) += 1;
-        }
-        let most_active = platform_counts
-            .into_iter()
-            .max_by_key(|(_, v)| *v)
-            .map(|(p, _)| p)
+        // Most common compaction type and most active platform. Ties go to
+        // the one seen first; a HashMap's max picked a random one.
+        let most_common =
+            most_frequent_first_seen(self.compactions.iter().map(|c| c.compaction_type))
+                .unwrap_or(CompactionType::None);
+        let most_active = most_frequent_first_seen(self.compactions.iter().map(|c| c.platform))
             .unwrap_or(Platform::ClaudeCode);
 
         TokenTrackerStats {
@@ -403,8 +389,52 @@ impl Default for TokenTracker {
     }
 }
 
+/// The most frequent item, with ties going to the item seen first.
+fn most_frequent_first_seen<T: PartialEq + Copy>(items: impl Iterator<Item = T>) -> Option<T> {
+    let mut counts: Vec<(T, u32)> = Vec::new();
+    for item in items {
+        match counts.iter_mut().find(|(seen, _)| *seen == item) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((item, 1)),
+        }
+    }
+    counts
+        .into_iter()
+        .fold(None, |best: Option<(T, u32)>, (item, count)| match best {
+            Some((_, best_count)) if count <= best_count => best,
+            _ => Some((item, count)),
+        })
+        .map(|(item, _)| item)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_most_frequent_first_seen_breaks_ties_by_first_appearance() {
+        let items = [
+            Platform::Gemini,
+            Platform::Codex,
+            Platform::Codex,
+            Platform::Gemini,
+        ];
+        for _ in 0..50 {
+            assert_eq!(
+                most_frequent_first_seen(items.into_iter()),
+                Some(Platform::Gemini)
+            );
+        }
+        assert_eq!(
+            most_frequent_first_seen(
+                [Platform::Codex, Platform::Gemini, Platform::Gemini].into_iter()
+            ),
+            Some(Platform::Gemini)
+        );
+        assert_eq!(
+            most_frequent_first_seen(std::iter::empty::<Platform>()),
+            None
+        );
+    }
+
     use super::*;
 
     #[test]

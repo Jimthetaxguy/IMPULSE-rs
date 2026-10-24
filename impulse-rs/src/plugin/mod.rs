@@ -112,7 +112,15 @@ pub enum PluginError {
 pub struct PluginInput {
     pub path: Option<PathBuf>,
     pub query: Option<String>,
+    /// Defaults to `{}` like [`PluginInput::new`]: a client that sends
+    /// `{"path": ...}` without options got "missing field `options`" from
+    /// the daemon's InvokePlugin request.
+    #[serde(default = "empty_options")]
     pub options: serde_json::Value,
+}
+
+fn empty_options() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 impl PluginInput {
@@ -197,6 +205,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_plugin_input_without_options_defaults_to_an_empty_object() {
+        let input: PluginInput = serde_json::from_str(r#"{"path": "/a"}"#).unwrap();
+        assert_eq!(input.path, Some(PathBuf::from("/a")));
+        assert_eq!(input.options, serde_json::json!({}));
+        assert_eq!(input.options, PluginInput::new().options);
+        let recovered: PluginInput =
+            serde_json::from_str(&serde_json::to_string(&input).unwrap()).unwrap();
+        assert_eq!(recovered.options, input.options);
+    }
+
+    #[test]
     fn test_plugin_category_str() {
         assert_eq!(PluginCategory::ContextProvider.as_str(), "context_provider");
         assert_eq!(PluginCategory::ActionHandler.as_str(), "action_handler");
@@ -237,5 +256,19 @@ mod tests {
 
         assert_eq!(output.content, "extracted content");
         assert_eq!(output.chunks.len(), 2);
+    }
+
+    #[test]
+    fn test_plugin_category_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                PluginCategory::ContextProvider,
+                PluginCategory::ActionHandler,
+                PluginCategory::RetrievalSource,
+                PluginCategory::AnalysisModule,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
     }
 }

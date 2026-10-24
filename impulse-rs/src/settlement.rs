@@ -1569,4 +1569,17 @@ mod tests {
         .to_string();
         assert!(fatal.contains("`build`") && fatal.contains("same fatal flag"));
     }
+
+    #[test]
+    fn test_check_outcome_wire_names_match_display() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                CheckOutcome::Passed,
+                CheckOutcome::Failed,
+                CheckOutcome::Inconclusive,
+            ],
+            None,
+            |v| v.to_string(),
+        );
+    }
 }

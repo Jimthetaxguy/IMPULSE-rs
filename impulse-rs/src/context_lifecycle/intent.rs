@@ -896,4 +896,70 @@ mod tests {
             history.last().map(|i| i.timestamp)
         );
     }
+
+    #[test]
+    fn test_agent_type_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                AgentType::Claude,
+                AgentType::Codex,
+                AgentType::OpenCode,
+                AgentType::Gemini,
+                AgentType::Cursor,
+                AgentType::Minimax,
+                AgentType::Gpt,
+                AgentType::Shell,
+            ],
+            None,
+            |v| {
+                assert_eq!(AgentType::from_str(v.as_str()).as_ref(), Some(v));
+                v.as_str().to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn test_intent_category_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                IntentCategory::Refactoring,
+                IntentCategory::Implementing,
+                IntentCategory::Testing,
+                IntentCategory::Debugging,
+                IntentCategory::Documenting,
+                IntentCategory::Analyzing,
+                IntentCategory::Configuring,
+                IntentCategory::Deploying,
+                IntentCategory::Unknown,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+    }
+
+    #[test]
+    fn test_complexity_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[Complexity::Low, Complexity::Medium, Complexity::High],
+            None,
+            |v| v.as_str().to_string(),
+        );
+    }
+
+    #[test]
+    fn test_activity_type_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                ActivityType::FileEdit,
+                ActivityType::FileCreate,
+                ActivityType::FileDelete,
+                ActivityType::ToolCall,
+                ActivityType::CommandRun,
+                ActivityType::Output,
+                ActivityType::Error,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+    }
 }

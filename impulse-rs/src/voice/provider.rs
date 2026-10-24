@@ -7,7 +7,13 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum VoiceProvider {
     /// ElevenLabs Conversational Agent with client/webhook tools (default).
+    ///
+    /// Written as "eleven_labs_agent" (snake_case), but every surface that
+    /// names it (`as_str`, `voice status`, `IMPULSE_VOICE_PROVIDER`) says
+    /// "elevenlabs_agent". The alias keeps that spelling from falling
+    /// through to `Other`.
     #[default]
+    #[serde(alias = "elevenlabs_agent")]
     ElevenLabsAgent,
     /// Deferred / non-default — not prioritized for tool calling into Impulse.
     #[serde(other)]
@@ -52,5 +58,38 @@ mod tests {
         let p = VoiceProvider::default();
         assert!(p.is_primary());
         assert_eq!(p.as_str(), "elevenlabs_agent");
+    }
+
+    #[test]
+    fn test_voice_provider_wire_name_and_as_str_spelling_both_parse() {
+        // snake_case splits ElevenLabsAgent into "eleven_labs_agent", but
+        // `as_str`, `voice status`, the tool-server responses and
+        // `IMPULSE_VOICE_PROVIDER` all say "elevenlabs_agent". Without the
+        // alias, `#[serde(other)]` turned that spelling into `Other`, which
+        // silently demoted the primary provider. The written name is unchanged.
+        let rows = crate::test_support::wire_vs_str_api(
+            &[VoiceProvider::ElevenLabsAgent, VoiceProvider::Other],
+            None,
+            |v| v.as_str().to_string(),
+        );
+        assert_eq!(
+            rows,
+            crate::test_support::expected_rows(&[
+                ("eleven_labs_agent", "elevenlabs_agent", true),
+                ("other", "other", true),
+            ])
+        );
+        assert_eq!(
+            serde_json::from_str::<VoiceProvider>("\"elevenlabs_agent\"").unwrap(),
+            VoiceProvider::ElevenLabsAgent
+        );
+        assert_eq!(
+            serde_json::from_str::<VoiceProvider>("\"eleven_labs_agent\"").unwrap(),
+            VoiceProvider::ElevenLabsAgent
+        );
+        assert_eq!(
+            serde_json::from_str::<VoiceProvider>("\"something_else\"").unwrap(),
+            VoiceProvider::Other
+        );
     }
 }

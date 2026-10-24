@@ -423,17 +423,31 @@ pub fn detect_delegation_events(insights: &[ExtractedInsight]) -> Vec<Recommenda
 }
 
 /// Compute the dominant intent across all insights that carry one.
-/// Returns `None` if no insight has a classified intent.
+/// Returns `None` if no insight has a classified intent. A tie goes to the
+/// intent that appeared first: counting into a HashMap and taking its max
+/// made a tie resolve to a random intent, so identical insights could
+/// reprioritize recommendations differently on each call.
 fn dominant_intent(insights: &[ExtractedInsight]) -> Option<IntentCategory> {
-    let mut counts: HashMap<IntentCategory, usize> = HashMap::new();
-    for insight in insights {
-        if let Some(cat) = &insight.intent {
-            if *cat != IntentCategory::Unknown {
-                *counts.entry(*cat).or_default() += 1;
-            }
+    let mut counts: Vec<(IntentCategory, usize)> = Vec::new();
+    for cat in insights.iter().filter_map(|insight| insight.intent) {
+        if cat == IntentCategory::Unknown {
+            continue;
+        }
+        match counts.iter_mut().find(|(seen, _)| *seen == cat) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((cat, 1)),
         }
     }
-    counts.into_iter().max_by_key(|(_, c)| *c).map(|(k, _)| k)
+    counts
+        .into_iter()
+        .fold(
+            None,
+            |best: Option<(IntentCategory, usize)>, (cat, count)| match best {
+                Some((_, best_count)) if count <= best_count => best,
+                _ => Some((cat, count)),
+            },
+        )
+        .map(|(cat, _)| cat)
 }
 
 /// Priority score for a recommendation given the dominant intent.
@@ -935,6 +949,39 @@ mod tests {
     }
 
     #[test]
+    fn test_dominant_intent_tie_goes_to_the_first_intent_seen() {
+        let insights = vec![
+            make_insight_with_intent(
+                1,
+                InsightType::FileModified,
+                "a",
+                Some(IntentCategory::Deploying),
+            ),
+            make_insight_with_intent(
+                2,
+                InsightType::FileModified,
+                "b",
+                Some(IntentCategory::Testing),
+            ),
+            make_insight_with_intent(
+                3,
+                InsightType::FileModified,
+                "c",
+                Some(IntentCategory::Testing),
+            ),
+            make_insight_with_intent(
+                4,
+                InsightType::FileModified,
+                "d",
+                Some(IntentCategory::Deploying),
+            ),
+        ];
+        for _ in 0..50 {
+            assert_eq!(dominant_intent(&insights), Some(IntentCategory::Deploying));
+        }
+    }
+
+    #[test]
     fn test_deploying_intent_boosts_conflict_priority() {
         let now = Utc::now();
         // Create insights with Deploying intent + a file conflict + a cross-pane error
@@ -1248,6 +1295,35 @@ mod tests {
         assert_eq!(
             parsed.recommendations[0].recommendation_type,
             RecommendationType::FileConflict
+        );
+    }
+
+    #[test]
+    fn test_conflict_resolution_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                ConflictResolution::Merge,
+                ConflictResolution::AcceptTheirs,
+                ConflictResolution::AcceptMine,
+                ConflictResolution::Rebase,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+    }
+
+    #[test]
+    fn test_recommendation_type_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                RecommendationType::FileConflict,
+                RecommendationType::ErrorAssist,
+                RecommendationType::CrossPaneSync,
+                RecommendationType::TaskComplete,
+                RecommendationType::DelegationReady,
+            ],
+            None,
+            |v| v.as_str().to_string(),
         );
     }
 }

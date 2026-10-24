@@ -12,7 +12,12 @@ use std::hash::Hash;
 pub enum Platform {
     ClaudeCode,
     Codex,
+    // snake_case alone would write "open_code" and "chat_g_p_t", which
+    // `as_str` and `parse` do not know. The wire names match `as_str`; the
+    // old spellings are still read.
+    #[serde(rename = "opencode", alias = "open_code")]
     OpenCode,
+    #[serde(rename = "chatgpt", alias = "chat_g_p_t")]
     ChatGPT,
     Gemini,
 }
@@ -307,4 +312,100 @@ pub struct TokenTrackerStats {
     pub most_common_compaction: CompactionType,
     /// Platform with most compactions
     pub most_active_platform: Platform,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PLATFORMS: [Platform; 5] = [
+        Platform::ClaudeCode,
+        Platform::Codex,
+        Platform::OpenCode,
+        Platform::ChatGPT,
+        Platform::Gemini,
+    ];
+
+    #[test]
+    fn test_platform_wire_name_matches_as_str_and_parses_back() {
+        for platform in PLATFORMS {
+            let wire = serde_json::to_string(&platform).unwrap();
+            assert_eq!(wire, format!("\"{}\"", platform.as_str()));
+            assert_eq!(Platform::parse(platform.as_str()), Some(platform));
+            let recovered: Platform = serde_json::from_str(&wire).unwrap();
+            assert_eq!(recovered, platform);
+        }
+    }
+
+    #[test]
+    fn test_platform_reads_the_old_snake_case_spellings() {
+        let open: Platform = serde_json::from_str("\"open_code\"").unwrap();
+        assert_eq!(open, Platform::OpenCode);
+        let chat: Platform = serde_json::from_str("\"chat_g_p_t\"").unwrap();
+        assert_eq!(chat, Platform::ChatGPT);
+    }
+
+    #[test]
+    fn test_platform_parse_is_case_insensitive_and_rejects_unknown_names() {
+        assert_eq!(Platform::parse("Claude"), Some(Platform::ClaudeCode));
+        assert_eq!(Platform::parse("CHATGPT"), Some(Platform::ChatGPT));
+        assert_eq!(Platform::parse("copilot"), None);
+        assert_eq!(Platform::parse(""), None);
+    }
+
+    #[test]
+    fn test_memory_tier_budgets_shrink_from_hot_to_cold() {
+        assert_eq!(MemoryTier::Hot.default_budget(), 0, "hot is not compressed");
+        assert!(MemoryTier::Warm.default_budget() > MemoryTier::Cold.default_budget());
+        for tier in [MemoryTier::Hot, MemoryTier::Warm, MemoryTier::Cold] {
+            let json = serde_json::to_string(&tier).unwrap();
+            assert_eq!(serde_json::from_str::<MemoryTier>(&json).unwrap(), tier);
+        }
+    }
+
+    #[test]
+    fn test_default_budgets_and_platform_configs_are_consistent() {
+        let budget = TokenBudget::default();
+        assert!(budget.soft_threshold < budget.hard_threshold);
+        assert!(budget.normal_budget > budget.aggressive_budget);
+        assert!(budget.aggressive_budget > budget.micro_budget);
+        let recovered: TokenBudget =
+            serde_json::from_str(&serde_json::to_string(&budget).unwrap()).unwrap();
+        assert_eq!(recovered.micro_budget, budget.micro_budget);
+
+        for platform in PLATFORMS {
+            let config = PlatformConfig::for_platform(platform);
+            assert_eq!(config.platform, platform);
+            assert!(config.default_context_window > 0);
+            assert!((0.0..=1.0).contains(&config.default_threshold));
+            let recovered: PlatformConfig =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(recovered.platform, platform);
+            assert_eq!(
+                recovered.default_context_window,
+                config.default_context_window
+            );
+        }
+
+        let decay = ConfidenceDecayConfig::default();
+        assert!(decay.decay_rate > 0.0 && decay.min_confidence < 1.0);
+    }
+
+    #[test]
+    fn round_trip_compaction_type() {
+        for kind in [
+            CompactionType::Prune,
+            CompactionType::Extract,
+            CompactionType::Summarize,
+            CompactionType::FullRewrite,
+            CompactionType::None,
+        ] {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serde_json::from_str::<CompactionType>(&json).unwrap(), kind);
+        }
+        assert_eq!(
+            serde_json::to_string(&CompactionType::FullRewrite).unwrap(),
+            "\"full_rewrite\""
+        );
+    }
 }
