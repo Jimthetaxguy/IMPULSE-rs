@@ -510,11 +510,6 @@ sources:
     hash: "blake3:b3c799a1d2890800c7b328de0d09ec90727785539094de22cb5b4996859857cf"
     retrieved_at: "2026-08-29T03:23:15Z"
     permission: public
-  - uri: src/monty/python.rs
-    id: source.a5a1b9c152bc
-    hash: "blake3:d922604e5a0b09420f3661e81e3a854d4de58a1ecf5bcaeca721dc43ce4fcece"
-    retrieved_at: "2026-08-29T03:23:15Z"
-    permission: public
   - uri: src/monty/routing.rs
     id: source.b15131e20091
     hash: "blake3:79805b80dc8d87f1de10bec072e5ac607ca2d08f4b8f1749275200b68bd3e8cd"
@@ -1503,7 +1498,6 @@ SQLite indexes and daemon/runtime state complement those human-readable artifact
 - [src/monty/datafusion.rs](../../src/monty/datafusion.rs)
 - [src/monty/kdb.rs](../../src/monty/kdb.rs)
 - [src/monty/mod.rs](../../src/monty/mod.rs)
-- [src/monty/python.rs](../../src/monty/python.rs)
 - [src/monty/routing.rs](../../src/monty/routing.rs)
 - [src/monty/swarm.rs](../../src/monty/swarm.rs)
 - [src/notification/mod.rs](../../src/notification/mod.rs)

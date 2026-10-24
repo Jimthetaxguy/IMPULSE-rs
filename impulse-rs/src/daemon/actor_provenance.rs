@@ -334,6 +334,10 @@ pub fn authorize_governed_mutation(
         GovernedTaskMutation::MaterializeStagedWorktree { .. } => Some("MaterializeStagedWorktree"),
         GovernedTaskMutation::DiscardStagedWorktree { .. } => Some("DiscardStagedWorktree"),
         GovernedTaskMutation::RecordPromotion { .. } => Some("RecordPromotion"),
+        // Blueprint 2.1 change #2. Raising the lease generation fences the
+        // current worker; a Builder that could issue it would fence out its
+        // successor (or reset its own lease), so it is operator-only.
+        GovernedTaskMutation::TakeOverWorker { .. } => Some("TakeOverWorker"),
         GovernedTaskMutation::SubmitClaim { .. }
         | GovernedTaskMutation::RecordVerification { .. }
         | GovernedTaskMutation::RecordSupervisorVerdict { .. } => None,
