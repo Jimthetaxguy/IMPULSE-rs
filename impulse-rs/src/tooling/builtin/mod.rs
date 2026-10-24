@@ -154,3 +154,49 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<(), ToolError> {
     registry.register(Box::new(WipeTool))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod path_param_guard {
+    use crate::tooling::{ParamType, ToolRegistry};
+
+    /// The executor's path sandbox (`validate_paths`) only checks params
+    /// declared `ParamType::FilePath`. A path-like param declared `String`
+    /// skips it, which is how `scan_paths` reached outside its roots. Each
+    /// exception below validates the value inside the tool itself.
+    const VALIDATED_IN_TOOL: &[(&str, &str)] = &[
+        // parse_hygiene_config checks every entry with is_path_allowed.
+        ("build_health", "scan_paths"),
+        ("sweep", "scan_paths"),
+        ("wipe", "scan_paths"),
+        ("clean_all", "scan_paths"),
+        // resolve_and_validate_memory_dir allows a closed set of dirs.
+        ("genome_read", "impulse_dir"),
+        ("memory_search", "impulse_dir"),
+    ];
+
+    #[test]
+    fn test_path_like_params_are_declared_as_file_paths() {
+        let registry = ToolRegistry::with_defaults();
+        for descriptor in registry.list() {
+            for param in &descriptor.params {
+                let name = param.name.to_lowercase();
+                let path_like = ["path", "dir", "root"]
+                    .iter()
+                    .any(|word| name.contains(word))
+                    && !name.starts_with("create_");
+                if !path_like || param.param_type == ParamType::FilePath {
+                    continue;
+                }
+                assert!(
+                    VALIDATED_IN_TOOL.contains(&(descriptor.id.as_str(), param.name.as_str())),
+                    "{}.{} looks like a path but is {:?}: declare it FilePath so the \
+                     executor sandboxes it, or validate it in the tool and add it to \
+                     VALIDATED_IN_TOOL",
+                    descriptor.id,
+                    param.name,
+                    param.param_type
+                );
+            }
+        }
+    }
+}

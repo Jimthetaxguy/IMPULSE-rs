@@ -63,8 +63,12 @@ impl Default for BuildHygieneConfig {
 }
 
 impl BuildHygieneConfig {
-    /// Expand ~ in scan paths to the user's home directory
-    pub fn expanded_scan_paths(&self) -> Vec<PathBuf> {
+    /// Expand `~` in configured scan paths without requiring them to exist.
+    ///
+    /// Callers that enforce a filesystem boundary must check these candidates
+    /// before filtering missing paths, so a missing default cannot become an
+    /// unchecked path if it appears later.
+    pub fn scan_path_candidates(&self) -> Vec<PathBuf> {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
         self.scan_paths
             .iter()
@@ -77,7 +81,14 @@ impl BuildHygieneConfig {
                     PathBuf::from(p)
                 }
             })
-            .filter(|p| p.exists())
+            .collect()
+    }
+
+    /// Expand `~` in scan paths and return only paths that currently exist.
+    pub fn expanded_scan_paths(&self) -> Vec<PathBuf> {
+        self.scan_path_candidates()
+            .into_iter()
+            .filter(|path| path.exists())
             .collect()
     }
 }
