@@ -155,3 +155,75 @@ pub fn known_tools() -> Vec<CliTool> {
         ),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The trust boundary in the module docs: `check_cmd`, `install_cmd` and
+    /// `update_cmd` run through `sh -c`, which is safe only while every one
+    /// is a plain compiled-in command. Pin that a registry edit cannot add
+    /// shell control syntax without this test being changed on purpose.
+    #[test]
+    fn test_known_tool_commands_hold_no_shell_control_syntax() {
+        const CONTROL: [char; 10] = [';', '|', '&', '$', '`', '>', '<', '(', ')', '\n'];
+        for tool in known_tools() {
+            for (field, command) in [
+                ("check_cmd", &tool.check_cmd),
+                ("install_cmd", &tool.install_cmd),
+                ("update_cmd", &tool.update_cmd),
+            ] {
+                assert!(!command.trim().is_empty(), "{} {field} is empty", tool.id);
+                assert!(
+                    !command.contains(CONTROL),
+                    "{} {field} has shell control syntax: {command}",
+                    tool.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_known_tools_have_unique_ids_and_https_docs() {
+        let tools = known_tools();
+        assert!(!tools.is_empty());
+        let mut ids: Vec<_> = tools.iter().map(|tool| tool.id.as_str()).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "duplicate tool id");
+        for tool in &tools {
+            assert!(tool.docs_url.starts_with("https://"), "{}", tool.docs_url);
+            assert!(!tool.installed, "a fresh registry entry is not installed");
+        }
+    }
+
+    #[test]
+    fn test_status_label_distinguishes_unknown_from_not_installed() {
+        let mut tool = CliTool::new("t", "T", "i", "u", "c", "https://example.test");
+        assert_eq!(tool.status_label(), "not installed");
+        tool.installed = true;
+        assert_eq!(tool.status_label(), "installed");
+        tool.check_error = Some("check timed out".into());
+        assert_eq!(tool.status_label(), "unknown", "a failed check wins");
+    }
+
+    #[test]
+    fn round_trip_cli_tool_and_legacy_record() {
+        let mut original = CliTool::new("t", "T", "i", "u", "c", "https://example.test");
+        original.installed = true;
+        original.version = Some("1.2.3".into());
+        let json = serde_json::to_value(&original).unwrap();
+        assert!(json.get("check_error").is_none(), "absent error is omitted");
+        let recovered: CliTool = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(recovered.id, original.id);
+        assert_eq!(recovered.version, original.version);
+        assert!(recovered.installed);
+
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("installed");
+        let recovered: CliTool = serde_json::from_value(legacy).unwrap();
+        assert!(!recovered.installed);
+        assert_eq!(recovered.check_error, None);
+    }
+}

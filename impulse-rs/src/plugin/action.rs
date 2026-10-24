@@ -92,3 +92,74 @@ impl ValidationResult {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn execution() -> ActionExecution {
+        ActionExecution::new("exec-1".into(), "formatter".into(), PluginInput::new())
+    }
+
+    #[test]
+    fn test_action_execution_lifecycle_sets_status_output_and_completion() {
+        let mut run = execution();
+        assert_eq!(run.status, ActionStatus::Pending);
+        assert!(run.completed_at.is_none());
+        run.mark_running();
+        assert_eq!(run.status, ActionStatus::Running);
+        assert!(run.completed_at.is_none(), "running is not complete");
+        run.mark_completed(PluginOutput::new("done"));
+        assert_eq!(run.status, ActionStatus::Completed);
+        assert_eq!(
+            run.output.as_ref().map(|o| o.content.as_str()),
+            Some("done")
+        );
+        assert!(run.completed_at.unwrap() >= run.started_at);
+    }
+
+    #[test]
+    fn test_action_execution_failure_and_rollback_record_completion() {
+        let mut failed = execution();
+        failed.mark_failed("disk full".into());
+        assert_eq!(failed.status, ActionStatus::Failed);
+        assert_eq!(failed.error.as_deref(), Some("disk full"));
+        assert!(failed.completed_at.is_some());
+
+        let mut rolled_back = execution();
+        rolled_back.mark_rolled_back();
+        assert_eq!(rolled_back.status, ActionStatus::RolledBack);
+        assert!(rolled_back.completed_at.is_some());
+        assert!(rolled_back.output.is_none());
+    }
+
+    #[test]
+    fn round_trip_action_execution_and_status_names() {
+        let mut original = execution();
+        original.mark_completed(PluginOutput::new("ok"));
+        let json = serde_json::to_string(&original).unwrap();
+        let recovered: ActionExecution = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.id, original.id);
+        assert_eq!(recovered.status, original.status);
+        assert_eq!(recovered.completed_at, original.completed_at);
+        assert_eq!(recovered.output.map(|o| o.content), Some("ok".to_string()));
+        assert_eq!(
+            serde_json::to_string(&ActionStatus::RolledBack).unwrap(),
+            "\"rolled_back\""
+        );
+    }
+
+    #[test]
+    fn test_validation_result_valid_invalid_and_warnings() {
+        let ok = ValidationResult::valid().with_warning("slow");
+        assert!(ok.valid && ok.errors.is_empty());
+        assert_eq!(ok.warnings, vec!["slow".to_string()]);
+        let bad = ValidationResult::invalid(vec!["missing path".into()]);
+        assert!(!bad.valid);
+        assert_eq!(bad.errors.len(), 1);
+        let recovered: ValidationResult =
+            serde_json::from_str(&serde_json::to_string(&bad).unwrap()).unwrap();
+        assert_eq!(recovered.errors, bad.errors);
+        assert!(!recovered.valid);
+    }
+}

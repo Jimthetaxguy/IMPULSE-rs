@@ -220,3 +220,74 @@ impl TuiState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_project_new_names_the_project_after_its_directory() {
+        let project = Project::new(PathBuf::from("/work/impulse-rs"));
+        assert_eq!(project.name, "impulse-rs");
+        assert_eq!(project.path, PathBuf::from("/work/impulse-rs"));
+    }
+
+    #[test]
+    fn test_project_new_without_a_file_name_is_unknown() {
+        assert_eq!(Project::new(PathBuf::from("/")).name, "Unknown");
+        assert_eq!(Project::new(PathBuf::from("")).name, "Unknown");
+    }
+
+    #[test]
+    fn round_trip_project() {
+        let original = Project::new(PathBuf::from("/work/impulse-rs"));
+        let json = serde_json::to_string(&original).unwrap();
+        let recovered: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.path, original.path);
+        assert_eq!(recovered.name, original.name);
+        assert_eq!(recovered.last_accessed, original.last_accessed);
+    }
+
+    #[test]
+    fn round_trip_terminal_tab_and_legacy_tab_without_pane_id() {
+        let original = TerminalTab {
+            id: "tab-1".to_string(),
+            name: "claude".to_string(),
+            session_id: Some("session-1".to_string()),
+            platform: Some(Platform::ClaudeCode),
+            is_active: true,
+            last_output: "ready".to_string(),
+            pane_id: Some(3),
+        };
+        let json = serde_json::to_value(&original).unwrap();
+        let recovered: TerminalTab = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(recovered.id, original.id);
+        assert_eq!(recovered.session_id, original.session_id);
+        assert_eq!(recovered.platform, original.platform);
+        assert_eq!(recovered.pane_id, Some(3));
+
+        // Tabs saved before pane_id existed still load.
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("pane_id");
+        let recovered: TerminalTab = serde_json::from_value(legacy).unwrap();
+        assert_eq!(recovered.pane_id, None);
+    }
+
+    #[test]
+    fn test_tui_state_new_starts_on_the_first_tab_with_the_current_project() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().join("my-project");
+        std::fs::create_dir_all(&base).unwrap();
+        let state = std::sync::Arc::new(crate::state::State::new(base).unwrap());
+        let tui = TuiState::new(state);
+        assert_eq!(tui.active_tab, 0);
+        assert_eq!(tui.projects.len(), 1);
+        assert_eq!(tui.projects[0].name, "my-project");
+        assert_eq!(tui.active_project_index, 0);
+        assert!(tui.terminal_tabs.is_empty());
+        assert!(tui.pane_manager.is_none());
+        assert!(!tui.input_mode && !tui.menu_open);
+        assert_eq!(tui.chat_history.len(), 1, "one welcome message");
+        assert!(tui.chat_history[0].1.starts_with("Welcome to Impulse"));
+    }
+}

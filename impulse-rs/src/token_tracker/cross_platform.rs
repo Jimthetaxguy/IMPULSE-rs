@@ -75,9 +75,13 @@ impl CrossPlatformAnalyzer {
     /// Run cross-platform analysis
     pub fn analyze(&self) -> CrossPlatformBenchmark {
         let mut results = HashMap::new();
-        let mut efficiencies = HashMap::new();
-        let mut intervals = HashMap::new();
-        let mut compressions = HashMap::new();
+        // Vecs in the fixed platform order below, not HashMaps: iterating a
+        // HashMap made every tie (all platforms empty, say) resolve to a
+        // random platform, so the same input gave a different "most stable"
+        // and a different ranking on each call.
+        let mut efficiencies = Vec::new();
+        let mut intervals = Vec::new();
+        let mut compressions = Vec::new();
 
         for platform in [
             Platform::ClaudeCode,
@@ -139,30 +143,22 @@ impl CrossPlatformAnalyzer {
                 },
             );
 
-            efficiencies.insert(platform, efficiency);
-            intervals.insert(platform, avg_interval);
-            compressions.insert(platform, avg_compression);
+            efficiencies.push((platform, efficiency));
+            intervals.push((platform, avg_interval));
+            compressions.push((platform, avg_compression));
         }
 
-        // Determine rankings and comparisons
-        let mut rankings: Vec<(Platform, f64)> =
-            efficiencies.iter().map(|(p, e)| (*p, *e)).collect();
+        // Determine rankings and comparisons. The sort is stable, so equal
+        // scores keep the fixed platform order.
+        let mut rankings = efficiencies;
         rankings.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let most_efficient = rankings
             .first()
             .map(|(p, _)| *p)
             .unwrap_or(Platform::ClaudeCode);
-        let most_stable = intervals
-            .iter()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(p, _)| *p)
-            .unwrap_or(Platform::ClaudeCode);
-        let best_compression = compressions
-            .iter()
-            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(p, _)| *p)
-            .unwrap_or(Platform::ClaudeCode);
+        let most_stable = first_extreme(&intervals, |candidate, best| candidate > best);
+        let best_compression = first_extreme(&compressions, |candidate, best| candidate < best);
 
         CrossPlatformBenchmark {
             results,
@@ -214,6 +210,23 @@ impl CrossPlatformAnalyzer {
 
         recs
     }
+}
+
+/// The first platform whose value `beats` every earlier one, so ties go to
+/// the earliest platform in `values`' order (and NaN never wins).
+fn first_extreme(values: &[(Platform, f64)], beats: impl Fn(f64, f64) -> bool) -> Platform {
+    values
+        .iter()
+        .fold(
+            None::<(Platform, f64)>,
+            |best, &(platform, value)| match best {
+                Some((_, best_value)) if !beats(value, best_value) => best,
+                _ if value.is_nan() => best,
+                _ => Some((platform, value)),
+            },
+        )
+        .map(|(platform, _)| platform)
+        .unwrap_or(Platform::ClaudeCode)
 }
 
 impl Default for CrossPlatformAnalyzer {
@@ -302,6 +315,101 @@ mod tests {
         let rate = calculate_growth_rate(&events);
         // 10000 tokens / 10 seconds = 1000 tokens/second
         assert!((rate - 1000.0).abs() < 1.0);
+    }
+
+    /// Before: the same input gave a different "most stable" platform and a
+    /// different ranking on each call (all five platforms and 39 distinct
+    /// orders over 50 calls on an empty analyzer).
+    #[test]
+    fn test_analyze_is_deterministic_and_breaks_ties_in_platform_order() {
+        let analyzer = CrossPlatformAnalyzer::new();
+        let first = analyzer.analyze();
+        for _ in 0..50 {
+            let again = analyzer.analyze();
+            assert_eq!(again.comparison.most_stable, first.comparison.most_stable);
+            assert_eq!(
+                again.comparison.best_compression,
+                first.comparison.best_compression
+            );
+            assert_eq!(
+                again
+                    .comparison
+                    .rankings
+                    .iter()
+                    .map(|(p, _)| *p)
+                    .collect::<Vec<_>>(),
+                first
+                    .comparison
+                    .rankings
+                    .iter()
+                    .map(|(p, _)| *p)
+                    .collect::<Vec<_>>()
+            );
+        }
+        // With no data every platform ties, so the first in order wins.
+        assert_eq!(first.comparison.most_stable, Platform::ClaudeCode);
+        assert_eq!(first.comparison.best_compression, Platform::ClaudeCode);
+        assert_eq!(first.results.len(), 5);
+    }
+
+    #[test]
+    fn test_first_extreme_prefers_the_earliest_tie_and_skips_nan() {
+        let values = [
+            (Platform::Codex, 2.0),
+            (Platform::Gemini, 5.0),
+            (Platform::ChatGPT, 5.0),
+            (Platform::OpenCode, f64::NAN),
+        ];
+        assert_eq!(first_extreme(&values, |a, b| a > b), Platform::Gemini);
+        assert_eq!(first_extreme(&values, |a, b| a < b), Platform::Codex);
+        assert_eq!(first_extreme(&[], |a, b| a > b), Platform::ClaudeCode);
+    }
+
+    #[test]
+    fn test_recommendations_without_data_and_with_high_usage() {
+        let mut analyzer = CrossPlatformAnalyzer::new();
+        assert!(analyzer.recommendations(Platform::Codex)[0].contains("No data"));
+        let mut event = TokenEvent {
+            id: "e".to_string(),
+            platform: Platform::Codex,
+            session_id: "s".to_string(),
+            timestamp: Utc::now(),
+            context_tokens: 100_000,
+            max_context: 110_000,
+            usage_ratio: 0.9,
+            message_count: 1,
+            tool_call_count: 0,
+        };
+        analyzer.add_events(Platform::Codex, vec![event.clone()]);
+        let recs = analyzer.recommendations(Platform::Codex);
+        assert!(
+            recs.iter().any(|r| r.contains("High context usage")),
+            "{recs:?}"
+        );
+        event.usage_ratio = 0.1;
+        let mut low = CrossPlatformAnalyzer::new();
+        low.add_events(Platform::Codex, vec![event]);
+        assert!(low.recommendations(Platform::Codex).is_empty());
+    }
+
+    #[test]
+    fn test_growth_rate_needs_two_events_with_time_between_them() {
+        assert_eq!(calculate_growth_rate(&[]), 0.0);
+        let now = Utc::now();
+        let event = |tokens: u32| TokenEvent {
+            id: tokens.to_string(),
+            platform: Platform::Gemini,
+            session_id: "s".to_string(),
+            timestamp: now,
+            context_tokens: tokens,
+            max_context: 1_000_000,
+            usage_ratio: 0.0,
+            message_count: 0,
+            tool_call_count: 0,
+        };
+        assert_eq!(calculate_growth_rate(&[event(10)]), 0.0);
+        // Same timestamp: no elapsed time, so no rate.
+        assert_eq!(calculate_growth_rate(&[event(10), event(500)]), 0.0);
     }
 
     #[test]

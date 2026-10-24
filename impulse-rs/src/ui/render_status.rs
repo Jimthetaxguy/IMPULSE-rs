@@ -560,3 +560,67 @@ pub(crate) fn render_conflicts_panel(f: &mut Frame, area: Rect, state: &mut TuiS
 
     f.render_widget(Paragraph::new(content).block(block), area);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn draw(width: u16, height: u16, render: impl FnOnce(&mut Frame)) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(render).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn empty_state() -> (tempfile::TempDir, TuiState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state =
+            std::sync::Arc::new(crate::state::State::new(dir.path().to_path_buf()).unwrap());
+        (dir, TuiState::new(state))
+    }
+
+    #[test]
+    fn test_render_chat_shows_the_pipeline_and_chat_panes_with_no_sessions() {
+        let (_dir, mut state) = empty_state();
+        let screen = draw(100, 40, |f| render_chat(f, f.area(), &mut state, &[]));
+        assert!(screen.contains("MIER Pipeline"), "{screen}");
+        assert!(screen.contains("Chat"), "{screen}");
+        assert!(screen.contains("Agent:"), "{screen}");
+    }
+
+    #[test]
+    fn test_render_stewardship_renders_from_an_empty_impulse_dir() {
+        let (_dir, state) = empty_state();
+        let screen = draw(100, 40, |f| render_stewardship(f, f.area(), &state));
+        assert!(screen.contains("STEWARDSHIP"), "{screen}");
+        assert!(screen.contains("Stewardship"), "block title: {screen}");
+    }
+
+    #[test]
+    fn test_render_conflicts_panel_lists_shortcuts_with_no_conflicts() {
+        let (_dir, mut state) = empty_state();
+        state.mier_recommendations.clear();
+        let screen = draw(100, 30, |f| render_conflicts_panel(f, f.area(), &mut state));
+        assert!(screen.contains("CONFLICT RESOLUTION"), "{screen}");
+        assert!(screen.contains("Active Conflicts"), "{screen}");
+        assert!(screen.contains("=merge"), "{screen}");
+    }
+
+    #[test]
+    fn test_status_panels_survive_an_area_too_small_to_show_them() {
+        let (_dir, mut state) = empty_state();
+        let screen = draw(3, 2, |f| {
+            render_chat(f, f.area(), &mut state, &[]);
+            render_stewardship(f, f.area(), &state);
+            render_conflicts_panel(f, f.area(), &mut state);
+        });
+        assert_eq!(screen.chars().count(), 6);
+    }
+}

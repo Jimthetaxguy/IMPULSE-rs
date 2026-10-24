@@ -976,6 +976,7 @@ mod tests {
                         id: "desktop".into(),
                     },
                 },
+                fencing_generation: None,
             },
         });
         assert_shared_request_compatible(
@@ -990,6 +991,7 @@ mod tests {
                     expected_revision: 1,
                     summary: "done".into(),
                     artifact_ids: Vec::new(),
+                    generation: None,
                 },
             },
         );

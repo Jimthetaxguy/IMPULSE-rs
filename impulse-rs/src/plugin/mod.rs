@@ -112,7 +112,15 @@ pub enum PluginError {
 pub struct PluginInput {
     pub path: Option<PathBuf>,
     pub query: Option<String>,
+    /// Defaults to `{}` like [`PluginInput::new`]: a client that sends
+    /// `{"path": ...}` without options got "missing field `options`" from
+    /// the daemon's InvokePlugin request.
+    #[serde(default = "empty_options")]
     pub options: serde_json::Value,
+}
+
+fn empty_options() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 impl PluginInput {
@@ -195,6 +203,17 @@ impl ContentChunk {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_plugin_input_without_options_defaults_to_an_empty_object() {
+        let input: PluginInput = serde_json::from_str(r#"{"path": "/a"}"#).unwrap();
+        assert_eq!(input.path, Some(PathBuf::from("/a")));
+        assert_eq!(input.options, serde_json::json!({}));
+        assert_eq!(input.options, PluginInput::new().options);
+        let recovered: PluginInput =
+            serde_json::from_str(&serde_json::to_string(&input).unwrap()).unwrap();
+        assert_eq!(recovered.options, input.options);
+    }
 
     #[test]
     fn test_plugin_category_str() {

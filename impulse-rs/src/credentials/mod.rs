@@ -35,6 +35,9 @@ pub enum CredentialError {
 
     #[error("Protocol error ({provider}): {message}")]
     ProtocolError { provider: String, message: String },
+
+    #[error("Invalid secret key for {provider}: {reason}")]
+    InvalidKey { provider: String, reason: String },
 }
 
 /// Unified trait for all credential providers
