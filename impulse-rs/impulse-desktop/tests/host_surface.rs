@@ -404,7 +404,9 @@ async fn test_host_review_queue_apply_writes_only_after_review_decision_and_audi
     .expect("apply review payload");
 
     assert!(decision.ok);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    // Returns as soon as the output arrives; 10 s only bounds a failure on a
+    // slow CI runner (see READY_DEADLINE in tests/runtime.rs).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         if sink.output_for("review-agent").contains("approved context") {
             break;
