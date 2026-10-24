@@ -200,3 +200,76 @@ mod path_param_guard {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tooling::Capability::{
+        FileSystemRead, FileSystemWrite, PythonExec, ShellExec, SystemInfo,
+    };
+
+    /// Every built-in and the capabilities it declares (deny-by-default,
+    /// CLAUDE.md principle 5). Changing what a tool may do should mean
+    /// changing this table on purpose, not drifting in a refactor.
+    const EXPECTED: &[(&str, &[crate::tooling::Capability])] = &[
+        ("bash_exec", &[ShellExec]),
+        ("benchmark", &[PythonExec]),
+        ("build_health", &[FileSystemRead]),
+        ("calculator", &[PythonExec]),
+        ("clean_all", &[FileSystemRead, FileSystemWrite]),
+        ("config_get", &[FileSystemRead]),
+        ("file_read", &[FileSystemRead]),
+        ("file_write", &[FileSystemWrite]),
+        ("genome_read", &[FileSystemRead]),
+        ("handoff", &[FileSystemRead, FileSystemWrite]),
+        ("health_check", &[FileSystemRead]),
+        ("memory_search", &[FileSystemRead]),
+        ("python_exec", &[PythonExec]),
+        ("sccache_setup", &[FileSystemWrite]),
+        ("sccache_status", &[SystemInfo]),
+        ("session_query", &[FileSystemRead]),
+        ("steward_status", &[FileSystemRead]),
+        ("sweep", &[FileSystemRead, FileSystemWrite]),
+        ("system_info", &[SystemInfo]),
+        ("tool_availability", &[SystemInfo]),
+        ("wipe", &[FileSystemRead, FileSystemWrite]),
+    ];
+
+    fn registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        register_all(&mut registry).expect("built-ins register");
+        registry
+    }
+
+    #[test]
+    fn test_register_all_registers_exactly_the_expected_tools() {
+        let registry = registry();
+        let mut registered: Vec<String> = registry.list().into_iter().map(|d| d.id).collect();
+        registered.sort();
+        let mut expected: Vec<&str> = EXPECTED.iter().map(|(id, _)| *id).collect();
+        expected.sort_unstable();
+        assert_eq!(registered, expected);
+    }
+
+    #[test]
+    fn test_each_builtin_declares_its_expected_capabilities() {
+        let registry = registry();
+        for (id, capabilities) in EXPECTED {
+            let tool = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} not registered"));
+            assert_eq!(tool.id(), *id);
+            assert_eq!(tool.descriptor().id, *id, "descriptor id for {id}");
+            assert_eq!(&tool.required_capabilities(), capabilities, "{id}");
+        }
+    }
+
+    #[test]
+    fn test_register_all_twice_is_refused() {
+        let mut registry = registry();
+        assert!(
+            register_all(&mut registry).is_err(),
+            "a second registration must not silently replace a built-in"
+        );
+    }
+}

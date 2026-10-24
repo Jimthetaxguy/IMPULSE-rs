@@ -324,3 +324,82 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect) {
 
     f.render_widget(Paragraph::new(footer).block(block), area);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn draw(width: u16, height: u16, render: impl FnOnce(&mut Frame)) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(render).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn empty_state() -> (tempfile::TempDir, TuiState) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state =
+            std::sync::Arc::new(crate::state::State::new(dir.path().to_path_buf()).unwrap());
+        (dir, TuiState::new(state))
+    }
+
+    #[test]
+    fn test_render_tabs_shows_every_view() {
+        let screen = draw(160, 3, |f| render_tabs(f, f.area(), 0));
+        for label in [
+            "Dashboard",
+            "Sessions",
+            "Timeline",
+            "History",
+            "Genome",
+            "Search",
+            "Analytics",
+            "Chat",
+            "Config",
+            "Stewardship",
+        ] {
+            assert!(screen.contains(label), "missing tab {label}: {screen}");
+        }
+    }
+
+    #[test]
+    fn test_render_footer_lists_the_key_hints() {
+        let screen = draw(120, 3, |f| render_footer(f, f.area()));
+        for hint in ["Nav", "Switch", "New", "End", "Search", "Chat", "Quit"] {
+            assert!(screen.contains(hint), "missing hint {hint}: {screen}");
+        }
+    }
+
+    #[test]
+    fn test_tab_rows_survive_an_area_too_small_to_show_them() {
+        // A tiny terminal must clip, not panic.
+        let screen = draw(4, 1, |f| {
+            render_tabs(f, f.area(), 9);
+            render_footer(f, f.area());
+        });
+        assert_eq!(screen.chars().count(), 4);
+    }
+
+    #[test]
+    fn test_render_terminal_tabs_shows_a_placeholder_without_terminals() {
+        let (_dir, state) = empty_state();
+        assert!(state.terminal_tabs.is_empty());
+        let screen = draw(100, 4, |f| render_terminal_tabs(f, f.area(), &state));
+        assert!(screen.contains("No terminals open"), "{screen}");
+    }
+
+    #[test]
+    fn test_render_project_tabs_draws_nothing_without_projects() {
+        let (_dir, mut state) = empty_state();
+        state.projects.clear();
+        let screen = draw(40, 3, |f| render_project_tabs(f, f.area(), &state));
+        assert!(screen.trim().is_empty(), "{screen:?}");
+    }
+}
