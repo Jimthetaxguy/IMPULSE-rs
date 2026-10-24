@@ -38,6 +38,7 @@ pub use external::{
     ExternalToolSpec, ManifestValidationIssue, ManifestValidationReport, ProcessTool,
 };
 pub use registry::ToolRegistry;
+pub(crate) use traits::resolve_for_write;
 pub use traits::{
     Capability, DynamicTool, ExecutionOrigin, ManifestTool, ParamType, ToolCategory, ToolContext,
     ToolDescriptor, ToolParam, ToolResult, ToolSource,
