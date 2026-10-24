@@ -121,10 +121,10 @@ pub(crate) fn render_sessions(
         .style(Style::default().fg(COLOR_ACCENT).bg(COLOR_PANEL)),
     )
     .block(block)
-    .highlight_style(Style::default().fg(COLOR_TEXT_BRIGHT).bg(COLOR_PANEL));
+    .row_highlight_style(Style::default().fg(COLOR_TEXT_BRIGHT).bg(COLOR_PANEL));
 
     // Map the selected session id onto a row index within the filtered list so the
-    // highlight follows navigation. Without a stateful render the highlight_style
+    // highlight follows navigation. Without a stateful render the row_highlight_style
     // above never applies.
     let selected_index = state
         .selected_session
