@@ -2409,6 +2409,7 @@ fn supervisor_mutation(
                 rationale: rationale.trim().to_string(),
             },
         },
+        fencing_generation: None,
     })
 }
 
@@ -2435,6 +2436,7 @@ fn operator_mutation(
                 rationale: rationale.trim().to_string(),
             },
         },
+        fencing_generation: None,
     })
 }
 

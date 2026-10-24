@@ -1007,6 +1007,7 @@ mod tests {
                             id: "daemon-handler-test".to_string(),
                         },
                     },
+                    fencing_generation: None,
                 },
             },
             &state,

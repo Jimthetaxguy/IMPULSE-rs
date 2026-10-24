@@ -458,6 +458,7 @@ impl State {
                 actor,
                 reason: detail,
             },
+            fencing_generation: None,
         };
         self.mutate_governed_task(mutation_request)?;
         Ok(())
