@@ -4724,11 +4724,17 @@ mod tests {
             refused.to_string().contains("bytes are already queued"),
             "{refused}"
         );
-        runtime
-            .close_agent(TerminalCloseRequest {
-                session_id: "agent-1".to_string(),
-            })
-            .expect("close the busy pane");
+        // Cleanup only. A child killed while megabytes of input sit in its
+        // terminal can take longer than the reap deadline to exit on a loaded
+        // macOS runner; the runtime reports that as a typed termination
+        // failure by design (see `TerminalBackend::kill`), which is not what
+        // this test checks.
+        match runtime.close_agent(TerminalCloseRequest {
+            session_id: "agent-1".to_string(),
+        }) {
+            Ok(_) | Err(DesktopBridgeError::TerminalTerminationFailed { .. }) => {}
+            Err(error) => panic!("close the busy pane: {error:?}"),
+        }
     }
 
     /// Round 3 on 84493f1: writes a failed writer left in the channel stay

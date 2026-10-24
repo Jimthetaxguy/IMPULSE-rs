@@ -899,7 +899,10 @@ async fn run_tool_loop(
 
             let mut results = Vec::with_capacity(response.tool_calls.len());
             for call in &response.tool_calls {
-                breaker.dispatch_call();
+                // A spent tool-call budget stops the batch before this call
+                // runs; like every trip, the partial batch never reaches
+                // history.
+                breaker.admit_call().map_err(LoopExit::Tripped)?;
                 let outcome = executor.execute(&call.name, call.input.clone()).await;
                 let trip = breaker.observe_call(
                     &call.name,
@@ -1708,6 +1711,76 @@ mod tests {
                 trip: LoopTrip::RepeatedCall { .. }
             }
         ));
+    }
+
+    /// Requests eight distinct calls every round, so no streak detector
+    /// fires and only the tool-call budget can stop it.
+    struct FanOutProvider {
+        rounds: std::sync::Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for FanOutProvider {
+        fn name(&self) -> &str {
+            "fan-out-fake"
+        }
+        fn default_model(&self) -> &str {
+            "fan-out-fake-model"
+        }
+        async fn chat(&self, request: ChatRequest) -> AgentResult<ChatResponse> {
+            let mut rounds = self.rounds.lock().expect("lock is never poisoned in tests");
+            *rounds += 1;
+            let round = *rounds;
+            Ok(ChatResponse {
+                content: String::new(),
+                model: request.model,
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+                stop_reason: StopReason::ToolUse,
+                tool_calls: (0..8)
+                    .map(|n| ToolCall {
+                        id: format!("call_{round}_{n}"),
+                        name: "echo_tool".to_string(),
+                        input: serde_json::json!({"round": round, "n": n}),
+                    })
+                    .collect(),
+            })
+        }
+        fn supported_models(&self) -> Vec<&str> {
+            vec!["fan-out-fake-model"]
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chat_with_tools_stops_wide_fan_out_at_the_tool_call_budget() {
+        let mut agent = test_agent(FanOutProvider {
+            rounds: std::sync::Mutex::new(0),
+        });
+        let executor = EchoExecutor::new();
+
+        let result = agent
+            .chat_with_tools("survey everything", &[], &executor)
+            .await;
+
+        match result {
+            Err(AgentError::ToolLoopStalled {
+                trip: LoopTrip::ToolCallBudget { calls },
+            }) => assert_eq!(calls, crate::loop_contract::ION_DEFAULT_MAX_TOOL_CALLS),
+            other => panic!("expected a tool-call budget stall, got: {other:?}"),
+        }
+        // Six full rounds of eight, then two of round seven's: call 51
+        // never ran, though it is well inside the ten-round cap.
+        assert_eq!(
+            executor.invocations.lock().unwrap().len(),
+            crate::loop_contract::ION_DEFAULT_MAX_TOOL_CALLS
+        );
+        assert!(agent.history.is_empty(), "history untouched on a trip");
+        let report = agent.last_loop_report().expect("the trip leaves a report");
+        assert_eq!(report.rounds_used, 7);
+        assert_eq!(report.tool_calls, 50);
+        assert_eq!(report.tool_calls_interrupted, 0);
     }
 
     #[tokio::test]
@@ -2641,6 +2714,7 @@ mod tests {
                 max_repeated_call_streak: None,
                 max_same_error_streak: None,
                 max_context_chars: Some(1),
+                max_tool_calls: None,
             },
         };
         let mut agent = test_agent(OneShotToolProvider::new())
@@ -2778,6 +2852,7 @@ mod tests {
                 max_repeated_call_streak: None,
                 max_same_error_streak: None,
                 max_context_chars: Some(chars),
+                max_tool_calls: None,
             },
         }
     }
