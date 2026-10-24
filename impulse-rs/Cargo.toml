@@ -43,8 +43,8 @@ long_description = "Feed the impulse to build with a local harness manager for g
 tokio = { version = "1", features = ["full"] }
 
 # Terminal UI
-ratatui = "0.28"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # HTTP/API calls
 reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
