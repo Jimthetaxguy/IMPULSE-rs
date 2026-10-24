@@ -1873,6 +1873,7 @@ fn test_host_manifest_and_bridge_expose_acknowledged_governed_task_mutation() {
                 rationale: "Evidence satisfies the acceptance criteria".to_string(),
             },
         },
+        fencing_generation: None,
     };
     let script = governed_task_mutation_bridge_script(&request);
 

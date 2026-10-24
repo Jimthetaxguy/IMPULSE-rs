@@ -27,6 +27,19 @@ pub const MAX_PROFILED_TASK_BYTES: usize = 2 * 1024;
 pub const MAX_PROFILED_ACCEPTANCE_CRITERIA: usize = 16;
 pub const MAX_PROFILED_ACCEPTANCE_CRITERION_BYTES: usize = 512;
 pub const MAX_PROFILED_CLAIM_SUMMARY_BYTES: usize = 4 * 1024;
+/// Environment variable carrying the worker-lease generation a governed worker
+/// was launched under. Claim clients forward it as
+/// [`GovernedClaimRequest::generation`].
+pub const GOVERNED_LEASE_GENERATION_ENV: &str = "IMPULSE_GOVERNED_LEASE_GENERATION";
+
+/// The lease generation this process was launched under, if any. An absent or
+/// unparsable value reads as `None`, which the daemon admits only while the
+/// task has never been taken over, so a malformed token fails closed.
+pub fn lease_generation_from_env() -> Option<u64> {
+    std::env::var(GOVERNED_LEASE_GENERATION_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GovernedTaskContractError {
@@ -1122,8 +1135,26 @@ pub enum GovernedTaskMutation {
     RecordPromotion {
         promotion: GovernedPromotionInput,
     },
+    /// Hands the task's worker lease to a new worker and raises the task's
+    /// lease generation by one (blueprint 2.1 change #2, "fencing generation").
+    ///
+    /// Only the daemon (`System`) or an operator may take a lease over; a
+    /// worker can never raise its own generation. Every claim, verification
+    /// and promotion presented afterwards must carry the new generation in
+    /// [`GovernedTaskMutationRequest::fencing_generation`]; anything still
+    /// carrying the old one is refused with a typed `Fenced` error. `reason`
+    /// is recorded verbatim as the event detail so replay can rebuild the
+    /// mutation from history, like `MarkLaunchFailed`.
+    TakeOverWorker {
+        actor: GovernedActor,
+        reason: String,
+    },
 }
 
+/// The fencing generation is presented here, on the request rather than inside
+/// the mutation payload, so that it never enters the idempotency fingerprint:
+/// ledgers written before fencing replay byte-for-byte, and a retried request
+/// is matched on what it does, not on which token carried it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GovernedTaskMutationRequest {
     pub request_id: GovernedRequestId,
@@ -1131,6 +1162,13 @@ pub struct GovernedTaskMutationRequest {
     pub task_id: GovernedTaskId,
     pub expected_revision: u64,
     pub mutation: GovernedTaskMutation,
+    /// The worker-lease generation the caller was issued (see
+    /// [`GovernedTaskRun::lease_generation`]). Required on claims,
+    /// verifications and promotions once the task's lease has ever been taken
+    /// over; `None` is accepted only while the generation is still zero, so a
+    /// pre-fencing client keeps working until the first takeover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fencing_generation: Option<u64>,
 }
 
 /// Agent-facing claim request. Actor identity and subject revision are
@@ -1146,6 +1184,11 @@ pub struct GovernedClaimRequest {
     pub summary: String,
     #[serde(default)]
     pub artifact_ids: Vec<String>,
+    /// The worker-lease generation this worker was launched under
+    /// ([`GOVERNED_LEASE_GENERATION_ENV`]). A worker that resumes after its
+    /// lease was taken over presents a stale generation and is fenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 impl GovernedClaimRequest {
@@ -1259,6 +1302,10 @@ pub enum GovernedTaskEventKind {
     /// `review_state`.
     ProducerReservationInterrupted,
     PromotionRecorded,
+    /// The worker lease was taken over and the lease generation raised by
+    /// one. The generation is derived from the count of these events, so it
+    /// cannot drift from history.
+    WorkerTakenOver,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1269,6 +1316,62 @@ pub struct GovernedTaskEvent {
     pub actor: GovernedActor,
     pub detail: String,
     pub created_at: String,
+}
+
+/// What a worker *published* about its own work. A worker claim is a promise
+/// that the work is done; the worker can say nothing else through it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromiseClaimedStatus {
+    Done,
+}
+
+/// What independent evidence says about a published promise (blueprint 2.1
+/// change #4: "only verifier or execution events set `evidenced_status`").
+///
+/// There is no `Broken`: a failed or inconclusive verification does not close
+/// the promise either way, it simply leaves it `Open` (the blueprint's
+/// "false completion" test). Only a passing verification by a `Verifier` actor
+/// against the claim's own subject revision makes it `Kept`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromiseEvidencedStatus {
+    Open,
+    Kept,
+}
+
+/// One worker promise, with its claimed and evidenced status side by side.
+///
+/// This is a read-only projection derived from `claims` and `verifications`;
+/// it is never stored and has no setter, so the only way to move
+/// `evidenced_status` is to record a verification, which the ledger admits
+/// only from a `Verifier` actor through the daemon's verification producer. A
+/// worker cannot mark its own promise kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GovernedPromise {
+    pub claim_id: GovernedRecordId,
+    pub promised_by: GovernedActor,
+    pub summary: String,
+    pub subject_revision: String,
+    pub claimed_status: PromiseClaimedStatus,
+    pub evidenced_status: PromiseEvidencedStatus,
+    /// Verification records that bear on this promise, oldest first.
+    pub evidence: Vec<GovernedRecordId>,
+    /// Outcome of the newest bearing verification, if any.
+    pub latest_evidence_outcome: Option<GovernedVerificationOutcome>,
+    /// A later claim replaced this one (after changes were requested or a
+    /// verification failed). Only the current promise can diverge.
+    pub superseded: bool,
+}
+
+impl GovernedPromise {
+    /// Claimed done, but evidence has not kept it: the gap the operator
+    /// surface must show instead of trusting the claim.
+    pub fn diverges(&self) -> bool {
+        !self.superseded
+            && self.claimed_status == PromiseClaimedStatus::Done
+            && self.evidenced_status != PromiseEvidencedStatus::Kept
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1326,6 +1429,20 @@ pub struct GovernedTaskRun {
 }
 
 impl GovernedTaskRun {
+    /// The worker-lease fencing generation: zero at registration, plus one per
+    /// recorded [`GovernedTaskEventKind::WorkerTakenOver`]. It covers the
+    /// staged worktree and every governed producer that writes to the task.
+    ///
+    /// Derived from the append-only event chain rather than stored beside it,
+    /// so a ledger written before fencing existed loads at generation zero and
+    /// the value can never disagree with the history it summarizes.
+    pub fn lease_generation(&self) -> u64 {
+        self.events
+            .iter()
+            .filter(|event| event.kind == GovernedTaskEventKind::WorkerTakenOver)
+            .count() as u64
+    }
+
     pub fn latest_claim(&self) -> Option<&WorkerCompletionClaim> {
         self.claims.last()
     }
@@ -1356,6 +1473,55 @@ impl GovernedTaskRun {
 
     pub fn latest_promotion(&self) -> Option<&GovernedPromotion> {
         self.promotions.last()
+    }
+
+    /// Every worker promise on this run, claimed status beside evidenced
+    /// status. Derived on read; see [`GovernedPromise`].
+    pub fn promises(&self) -> Vec<GovernedPromise> {
+        let latest = self.claims.len().checked_sub(1);
+        self.claims
+            .iter()
+            .enumerate()
+            .map(|(index, claim)| {
+                let bearing = self
+                    .verifications
+                    .iter()
+                    .filter(|verification| {
+                        // Evidence counts only when it comes from the
+                        // verifier and is about exactly what was promised.
+                        verification.actor.kind == GovernedActorKind::Verifier
+                            && verification.claim_id == claim.id
+                            && verification.subject_revision == claim.subject_revision
+                    })
+                    .collect::<Vec<_>>();
+                let latest_evidence_outcome =
+                    bearing.last().map(|verification| verification.outcome);
+                let evidenced_status = match latest_evidence_outcome {
+                    Some(GovernedVerificationOutcome::Passed) => PromiseEvidencedStatus::Kept,
+                    _ => PromiseEvidencedStatus::Open,
+                };
+                GovernedPromise {
+                    claim_id: claim.id.clone(),
+                    promised_by: claim.actor.clone(),
+                    summary: claim.summary.clone(),
+                    subject_revision: claim.subject_revision.clone(),
+                    claimed_status: PromiseClaimedStatus::Done,
+                    evidenced_status,
+                    evidence: bearing
+                        .iter()
+                        .map(|verification| verification.id.clone())
+                        .collect(),
+                    latest_evidence_outcome,
+                    superseded: Some(index) != latest,
+                }
+            })
+            .collect()
+    }
+
+    /// The current promise when the worker claims done but the evidence does
+    /// not (yet) agree. `None` when there is no claim or evidence kept it.
+    pub fn claim_evidence_divergence(&self) -> Option<GovernedPromise> {
+        self.promises().into_iter().find(GovernedPromise::diverges)
     }
 
     /// The staged worktree while it is still usable, or `None` once it has been
@@ -2241,5 +2407,83 @@ mod tests {
         assert_eq!(cancelled_json["data"]["exit_kind"], "operator_cancelled");
         let recovered: GovernedTaskMutation = serde_json::from_value(cancelled_json).unwrap();
         assert_eq!(recovered, cancelled);
+    }
+
+    #[test]
+    fn test_claim_request_generation_round_trips_and_defaults_to_none() {
+        let request = GovernedClaimRequest {
+            request_id: GovernedRequestId::try_new("claim-fenced").unwrap(),
+            project_id: "workspace".to_string(),
+            task_id: GovernedTaskId::try_new("task-1").unwrap(),
+            expected_revision: 3,
+            summary: "done".to_string(),
+            artifact_ids: Vec::new(),
+            generation: Some(2),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["generation"], 2);
+        let recovered: GovernedClaimRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(recovered, request);
+
+        // A pre-fencing client omits the field; it reads as None and is not
+        // written back out.
+        let legacy = GovernedClaimRequest {
+            generation: None,
+            ..request
+        };
+        let json = serde_json::to_value(&legacy).unwrap();
+        assert!(json.get("generation").is_none());
+        let recovered: GovernedClaimRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(recovered.generation, None);
+    }
+
+    #[test]
+    fn test_governed_promise_round_trips_through_serde() {
+        for (evidenced_status, latest_evidence_outcome, evidence) in [
+            (PromiseEvidencedStatus::Open, None, Vec::new()),
+            (
+                PromiseEvidencedStatus::Open,
+                Some(GovernedVerificationOutcome::Failed),
+                vec![GovernedRecordId::try_new("verification-1").unwrap()],
+            ),
+            (
+                PromiseEvidencedStatus::Kept,
+                Some(GovernedVerificationOutcome::Passed),
+                vec![
+                    GovernedRecordId::try_new("verification-1").unwrap(),
+                    GovernedRecordId::try_new("verification-2").unwrap(),
+                ],
+            ),
+        ] {
+            let promise = GovernedPromise {
+                claim_id: GovernedRecordId::try_new("claim-1").unwrap(),
+                promised_by: GovernedActor {
+                    kind: GovernedActorKind::Worker,
+                    id: "worker-1".to_string(),
+                },
+                summary: "implemented the change".to_string(),
+                subject_revision: oid('a'),
+                claimed_status: PromiseClaimedStatus::Done,
+                evidenced_status,
+                evidence,
+                latest_evidence_outcome,
+                superseded: false,
+            };
+            let json = serde_json::to_value(&promise).unwrap();
+            assert_eq!(json["claimed_status"], "done");
+            let recovered: GovernedPromise = serde_json::from_value(json).unwrap();
+            assert_eq!(recovered, promise);
+        }
+        for (status, wire) in [
+            (PromiseEvidencedStatus::Open, "\"open\""),
+            (PromiseEvidencedStatus::Kept, "\"kept\""),
+        ] {
+            assert_eq!(serde_json::to_string(&status).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_str::<PromiseEvidencedStatus>(wire).unwrap(),
+                status
+            );
+        }
+        assert!(serde_json::from_str::<PromiseEvidencedStatus>("\"broken\"").is_err());
     }
 }
