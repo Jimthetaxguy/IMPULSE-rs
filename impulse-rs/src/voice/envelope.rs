@@ -132,3 +132,94 @@ impl ElevenLabsToolResult {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_request_without_confirmed_is_not_confirmed() {
+        // A payload that omits the flag must never approve a mutating tool.
+        let request: ElevenLabsClientToolRequest =
+            serde_json::from_value(json!({"tool": "bash_exec", "params": {"command": "ls"}}))
+                .unwrap();
+        assert!(!request.confirmed);
+        assert!(request.wait_for_response);
+        assert_eq!(request.source, VoiceToolCallSource::ClientTool);
+        assert_eq!(request.tool_call_id, None);
+    }
+
+    #[test]
+    fn test_request_accepts_the_elevenlabs_field_aliases() {
+        for payload in [
+            json!({"tool_call_id": "c1", "tool_name": "system_info", "parameters": {"a": 1}}),
+            json!({"id": "c1", "name": "system_info", "arguments": {"a": 1}}),
+            json!({"tool_call_id": "c1", "tool": "system_info", "params": {"a": 1}}),
+        ] {
+            let request: ElevenLabsClientToolRequest = serde_json::from_value(payload).unwrap();
+            assert_eq!(request.tool_call_id.as_deref(), Some("c1"));
+            assert_eq!(request.tool, "system_info");
+            assert_eq!(request.params, json!({"a": 1}));
+        }
+    }
+
+    #[test]
+    fn test_request_without_a_tool_name_is_rejected() {
+        let result = serde_json::from_value::<ElevenLabsClientToolRequest>(json!({"params": {}}));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn round_trip_client_tool_request() {
+        let mut original = ElevenLabsClientToolRequest::new("file_read", json!({"path": "a"}));
+        original.tool_call_id = Some("c2".into());
+        original.confirmed = true;
+        original.wait_for_response = false;
+        original.source = VoiceToolCallSource::Webhook;
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("\"source\":\"webhook\""), "{json}");
+        let recovered: ElevenLabsClientToolRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn test_tool_result_constructors_set_status_error_and_payload() {
+        let ok = ElevenLabsToolResult::ok("system_info", Some("c1".into()), json!({"os": "x"}));
+        assert_eq!(ok.status, ElevenLabsToolResultStatus::Ok);
+        assert_eq!(ok.error, None);
+        assert_eq!(ok.provider, "elevenlabs_agent");
+
+        let denied = ElevenLabsToolResult::denied("bash_exec", None, "needs confirmation");
+        assert_eq!(denied.status, ElevenLabsToolResultStatus::Denied);
+        assert_eq!(denied.error.as_deref(), Some("needs confirmation"));
+        assert_eq!(denied.result["denied"], true);
+
+        let error = ElevenLabsToolResult::error("file_read", None, "not found");
+        assert_eq!(error.status, ElevenLabsToolResultStatus::Error);
+        assert_eq!(error.result["error"], "not found");
+    }
+
+    #[test]
+    fn round_trip_tool_result_omits_absent_optionals() {
+        for original in [
+            ElevenLabsToolResult::ok("system_info", None, json!({"os": "x"})),
+            ElevenLabsToolResult::denied("bash_exec", Some("c3".into()), "no"),
+            ElevenLabsToolResult::error("file_read", None, "boom"),
+        ] {
+            let json = serde_json::to_value(&original).unwrap();
+            if original.tool_call_id.is_none() {
+                assert!(json.get("tool_call_id").is_none(), "{json}");
+            }
+            if original.error.is_none() {
+                assert!(json.get("error").is_none(), "{json}");
+            }
+            let recovered: ElevenLabsToolResult = serde_json::from_value(json).unwrap();
+            assert_eq!(recovered, original);
+        }
+        assert_eq!(
+            serde_json::to_string(&ElevenLabsToolResultStatus::Denied).unwrap(),
+            "\"denied\""
+        );
+    }
+}
