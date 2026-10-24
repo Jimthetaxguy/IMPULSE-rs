@@ -3,7 +3,7 @@ date: 2026-10-22
 kind: point-in-time map
 author: Claude Code (overnight /goal run), from a read-only sweep of Codex, Gemini/Antigravity, Claude, and ledger notes
 against: main at ff867b0, open PRs #140-#144
-status: proposals only; nothing here is decided
+status: draft
 ---
 
 # Primitive candidates after blueprint 2.1 (2026-10-22)

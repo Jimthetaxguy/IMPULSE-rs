@@ -3,7 +3,7 @@ date: 2026-09-18
 kind: point-in-time map
 source: James paste — Building Agentic Harnesses in Rust (Harness Handlers)
 against: ADR-0011, ADR-0014, ADR-0015, ADR-0017, ADR-0018, ion-tool-sandbox spec, open PR #65
-status: HOLD for stamp before any follow-on write
+status: review
 ---
 
 # Rust agentic-harness note → Impulse. Keep / port / hold (2026-09-18)

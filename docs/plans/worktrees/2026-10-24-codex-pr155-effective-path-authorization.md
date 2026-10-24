@@ -5,7 +5,7 @@ created: 2026-10-24
 updated: 2026-10-24
 author: James Pustorino
 agent: codex/Codex
-type: work-card
+type: doc
 status: active
 summary: Rebase the scan-path sandbox change onto the merged CI foundation, validate the exact paths each operation consumes, and verify both bypasses through ToolExecutor.
 next_steps:
