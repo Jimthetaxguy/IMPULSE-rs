@@ -180,29 +180,23 @@ Keep these two capability universes conceptually separate: the verify gate's
 closed read-only allowlist vs. the REPL's full coding-agent tool registry.
 
 **Candidate ReplTool: sandboxed Python via Monty (2026-07-11, James's idea).**
-`src/monty/python.rs` currently stubs pydantic-monty integration (pyo3,
-behind the `monty-support` feature) as a *computed-routing* sandbox — an
-external-function registry (`route_to`, `search_history`,
-`get_genome_decisions`, `inject`, `extract_findings`, `search_similar`) that
-Monty's Python code can call, and nothing else. That deny-by-default,
-explicit-registration shape is structurally the same pattern as
-`src/tooling::Tool` and the `ReplTool` trait above — which makes Monty a
-natural fit for a sandboxed Python code-interpreter `ReplTool` (e.g.
-`python_eval` or `run_python`) in T7+: the chat loop hands Monty a snippet,
-Monty can only touch the functions Impulse explicitly registers, and the
-result comes back through the same `ToolOutcome` shape as every other
-ReplTool. Not scoped for T6/T7 — flagging as a concrete future ReplTool
-candidate once `monty-support` is built out past its current stub.
+The 2026-07 note described `src/monty/python.rs` as a PyO3 stub behind
+`monty-support`: an external-function registry and nothing else. That file
+and feature were removed on 2026-10-21. They never compiled an extension.
+`calc`, `exec`, `calculator`, and `python_exec` run in the in-process `monty`
+crate (`src/tools/python.rs`, ADR-0021) with no host functions wired.
+`src/monty/` is keyword routing. A separate `python_eval` ReplTool that
+registers host functions for Monty to call was not built.
 
 **Researched and deferred (2026-07-11, same day, after T9 landed).** Verified
 Monty is real (`github.com/pydantic/monty`, a from-scratch Rust bytecode-VM
 Python interpreter built by the Pydantic team) but explicitly
 "experimental... not ready for prime time" per its own README (v0.0.18,
 no classes/match/generators/context-managers, only a handful of stdlib
-modules, no third-party packages). `src/monty/python.rs`'s stub also targets
-the `pydantic-monty` PyPI package via PyO3 + `pip install`, not the native
-`monty`/`monty-pool` Rust crates — so even finishing the stub wouldn't avoid
-a Python runtime dependency. More importantly: `bash_exec` (T7, hardened
+modules, no third-party packages). The removed stub targeted the
+`pydantic-monty` PyPI package via PyO3, not the native `monty` crate.
+ADR-0021 later adopted that native crate for `calc` and `exec`, with no host
+functions wired. More importantly: `bash_exec` (T7, hardened
 same-day with env-scrubbing + a confirmation gate) already lets the model
 run `python3 -c '...'` for the kind of short LLM-generated
 calculation/CSV-manipulation snippets this was meant to cover — Monty's

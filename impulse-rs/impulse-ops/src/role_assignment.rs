@@ -767,4 +767,82 @@ mod tests {
             Err(RoleAssignmentError::DuplicateRuntimeCapability(_))
         ));
     }
+
+    #[test]
+    fn test_enforcement_strength_wire_names() {
+        for (strength, wire) in [
+            (EnforcementStrength::Unsupported, "unsupported"),
+            (EnforcementStrength::Advisory, "advisory"),
+            (EnforcementStrength::Mediated, "mediated"),
+            (EnforcementStrength::Structural, "structural"),
+        ] {
+            let json = serde_json::to_value(strength).unwrap();
+            assert_eq!(json, wire);
+            assert_eq!(
+                serde_json::from_value::<EnforcementStrength>(json).unwrap(),
+                strength
+            );
+        }
+    }
+
+    #[test]
+    fn test_capability_records_round_trip() {
+        let support = RuntimeCapabilitySupport {
+            capability: capability("filesystem.scoped"),
+            enforcement: EnforcementStrength::Advisory,
+        };
+        let requirement = RoleCapabilityRequirement {
+            capability: capability("filesystem.scoped"),
+            minimum_enforcement: EnforcementStrength::Structural,
+            mandatory: true,
+        };
+        let check = CapabilityCompatibility {
+            capability: capability("filesystem.scoped"),
+            required: EnforcementStrength::Structural,
+            available: EnforcementStrength::Advisory,
+            mandatory: false,
+        };
+        assert_eq!(
+            serde_json::from_str::<RuntimeCapabilitySupport>(
+                &serde_json::to_string(&support).unwrap()
+            )
+            .unwrap(),
+            support
+        );
+        assert_eq!(
+            serde_json::from_str::<RoleCapabilityRequirement>(
+                &serde_json::to_string(&requirement).unwrap()
+            )
+            .unwrap(),
+            requirement
+        );
+        let check_json = serde_json::to_value(&check).unwrap();
+        assert_eq!(check_json["required"], "structural");
+        assert_eq!(check_json["available"], "advisory");
+        assert_eq!(
+            serde_json::from_value::<CapabilityCompatibility>(check_json).unwrap(),
+            check
+        );
+    }
+
+    #[test]
+    fn test_assignment_and_compatibility_without_lists_parse_and_stay_omitted() {
+        let assignment: AgentRoleAssignment =
+            serde_json::from_value(serde_json::json!({"role": "reviewer"})).unwrap();
+        assert!(assignment.requirements.is_empty());
+        assert!(serde_json::to_value(&assignment)
+            .unwrap()
+            .get("requirements")
+            .is_none());
+
+        let compatibility: RoleCompatibility =
+            serde_json::from_value(serde_json::json!({"platform": "codex", "role": "reviewer"}))
+                .unwrap();
+        assert!(compatibility.checks.is_empty());
+        assert!(compatibility.launch_allowed());
+        assert!(serde_json::to_value(&compatibility)
+            .unwrap()
+            .get("checks")
+            .is_none());
+    }
 }

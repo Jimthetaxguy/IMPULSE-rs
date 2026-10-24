@@ -756,6 +756,7 @@ mod tests {
             expected_revision: 1,
             summary: spilled.summary.clone(),
             artifact_ids: spilled.artifact_ids.clone(),
+            generation: None,
         };
         request.validate().expect("the shortened claim validates");
     }

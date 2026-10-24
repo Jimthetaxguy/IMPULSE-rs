@@ -1283,6 +1283,7 @@ impl DesktopRuntime {
                 mutation: GovernedTaskMutation::MarkRunning {
                     actor: governed_system_actor("desktop-runtime"),
                 },
+                fencing_generation: None,
             });
             match running {
                 Ok(updated) => {
@@ -2925,6 +2926,13 @@ fn runtime_env(
     if let Some(task) = governed_task {
         env.push(("IMPULSE_GOVERNED_TASK_ID", task.id.to_string()));
         env.push(("IMPULSE_PROJECT_ID", task.project_id.clone()));
+        // The worker's lease token. Without it, every claim after the first
+        // takeover is refused as `Missing`, so a relaunched worker could
+        // never claim the task again.
+        env.push((
+            impulse_ops::governed_task::GOVERNED_LEASE_GENERATION_ENV,
+            task.lease_generation().to_string(),
+        ));
         if let Some(profile) = task.verification_profile {
             let profile = match profile {
                 GovernedVerificationProfile::RustWorkspaceV1 => "rust_workspace_v1",
@@ -3222,6 +3230,7 @@ mod tests {
                 task_id: task_id.clone(),
                 expected_revision: current.revision,
                 mutation,
+                fencing_generation: None,
             })
         }
     }
@@ -4988,6 +4997,52 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_env_carries_the_current_lease_generation() {
+        let gateway = TestGovernedTaskGateway::default();
+        let mut task = gateway
+            .register(
+                GovernedTaskRegistration::builder(
+                    "register-lease",
+                    "task-lease",
+                    "workspace",
+                    "/tmp/workspace",
+                    "relaunch after a takeover",
+                    "agent-1",
+                    "codex",
+                )
+                .build()
+                .expect("valid registration"),
+            )
+            .expect("test gateway registers");
+        let request = spawn_request(24, 80, Some("sh"));
+        let generation = |task: &GovernedTaskRun| {
+            runtime_env("agent-1", &request, "sh", None, Some(task), None)
+                .into_iter()
+                .find(|(key, _)| *key == "IMPULSE_GOVERNED_LEASE_GENERATION")
+                .map(|(_, value)| value)
+        };
+        assert_eq!(generation(&task).as_deref(), Some("0"));
+
+        task.events
+            .push(impulse_ops::governed_task::GovernedTaskEvent {
+                id: impulse_ops::governed_task::GovernedRecordId::try_new("event-takeover")
+                    .unwrap(),
+                revision: 1,
+                kind: impulse_ops::governed_task::GovernedTaskEventKind::WorkerTakenOver,
+                actor: impulse_ops::governed_task::GovernedActor {
+                    kind: impulse_ops::governed_task::GovernedActorKind::Operator,
+                    id: "operator".to_string(),
+                },
+                detail: "previous worker stalled".to_string(),
+                created_at: impulse_ops::now_rfc3339(),
+            });
+        assert_eq!(generation(&task).as_deref(), Some("1"));
+        assert!(runtime_env("agent-1", &request, "sh", None, None, None)
+            .iter()
+            .all(|(key, _)| *key != "IMPULSE_GOVERNED_LEASE_GENERATION"));
+    }
+
+    #[test]
     fn test_runtime_env_includes_optional_task_and_product_role_id() {
         let mut request = spawn_request(24, 80, Some("sh"));
         request.task = Some("inspect compatibility".to_string());
@@ -5176,5 +5231,50 @@ mod tests {
         let json = serde_json::to_string(&ws).unwrap();
         let recovered: WorkspaceTarget = serde_json::from_str(&json).unwrap();
         assert_eq!(ws, recovered);
+    }
+
+    #[test]
+    fn test_desktop_event_type_tag_differs_from_host_event_name() {
+        // Pinned, not aliased. The serde `type` tag is the variant name, while
+        // `name()` is the host event name JS listens on. `host_event_envelope`
+        // sends `name()` plus only the `data` content, so the tag never reaches
+        // JS, and nothing deserializes a DesktopEvent from the page.
+        let events = [
+            DesktopEvent::TerminalOutput {
+                agent_id: "a".to_string(),
+                data: vec![1],
+            },
+            DesktopEvent::TerminalExit {
+                agent_id: "a".to_string(),
+            },
+            DesktopEvent::OpsUpdate {
+                payload: serde_json::json!({}),
+            },
+            DesktopEvent::OpsConnectionUpdate {
+                connected: true,
+                error: None,
+            },
+        ];
+        for event in &events {
+            let value = serde_json::to_value(event).unwrap();
+            let tag = value["type"].as_str().unwrap();
+            assert_ne!(tag, event.name());
+            let mut swapped = value.clone();
+            swapped["type"] = serde_json::Value::String(event.name().to_string());
+            assert!(serde_json::from_value::<DesktopEvent>(swapped).is_err());
+        }
+        let tags: Vec<_> = events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap()["type"].clone())
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                "TerminalOutput",
+                "TerminalExit",
+                "OpsUpdate",
+                "OpsConnectionUpdate"
+            ]
+        );
     }
 }

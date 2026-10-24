@@ -303,4 +303,146 @@ mod tests {
         let registry = PluginRegistry::new();
         assert!(!registry.supports_format(OfficeFormat::Docx).unwrap());
     }
+
+    /// Returns `label` from both extraction calls and records what it was
+    /// asked for, so a test can see which provider ran and with what.
+    struct LabelProvider {
+        label: &'static str,
+        metadata: PluginMetadata,
+        seen: std::sync::Mutex<Vec<(std::path::PathBuf, Option<String>)>>,
+    }
+
+    impl LabelProvider {
+        fn new(label: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                label,
+                metadata: PluginMetadata::new(
+                    label,
+                    "0.0.0",
+                    super::super::PluginCategory::ContextProvider,
+                ),
+                seen: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl ContextProvider for LabelProvider {
+        fn metadata(&self) -> &PluginMetadata {
+            &self.metadata
+        }
+        fn formats(&self) -> &[OfficeFormat] {
+            &[]
+        }
+        fn extract(&self, path: &std::path::Path) -> PluginResult<PluginOutput> {
+            self.seen.lock().unwrap().push((path.to_path_buf(), None));
+            Ok(PluginOutput::new(self.label))
+        }
+        fn extract_smart(&self, path: &std::path::Path, query: &str) -> PluginResult<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), Some(query.to_string())));
+            Ok(format!("{}:{query}", self.label))
+        }
+        fn chunk(&self, _content: &str, _size: usize) -> Vec<super::super::ContentChunk> {
+            Vec::new()
+        }
+        fn metadata_info(&self, _path: &std::path::Path) -> PluginResult<serde_json::Value> {
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    #[test]
+    fn test_extract_without_an_extension_is_unsupported() {
+        let registry = PluginRegistry::new();
+        for result in [
+            registry
+                .extract(std::path::Path::new("document"))
+                .map(|_| ()),
+            registry
+                .extract_smart(std::path::Path::new("document"), "q")
+                .map(|_| ()),
+        ] {
+            assert!(matches!(result, Err(PluginError::UnsupportedFormat(_))));
+        }
+    }
+
+    #[test]
+    fn test_extract_with_no_provider_for_the_format_is_not_found() {
+        let registry = PluginRegistry::new();
+        match registry.extract(std::path::Path::new("notes.txt")) {
+            Err(PluginError::NotFound(message)) => assert!(message.contains("txt"), "{message}"),
+            other => panic!("expected NotFound, got {:?}", other.map(|o| o.content)),
+        }
+    }
+
+    #[test]
+    fn test_extract_routes_by_extension_case_insensitively() {
+        let registry = PluginRegistry::new();
+        let xlsx = LabelProvider::new("xlsx");
+        registry
+            .register_context_provider(OfficeFormat::Xlsx, xlsx.clone())
+            .unwrap();
+        let path = std::path::Path::new("REPORT.XLSX");
+        assert_eq!(registry.extract(path).unwrap().content, "xlsx");
+        assert_eq!(xlsx.seen.lock().unwrap()[0].0, path);
+        assert!(registry.supports_format(OfficeFormat::Xlsx).unwrap());
+        assert_eq!(
+            registry.list_context_formats().unwrap(),
+            vec![OfficeFormat::Xlsx]
+        );
+    }
+
+    #[test]
+    fn test_extract_smart_forwards_the_path_and_query() {
+        let registry = PluginRegistry::new();
+        let docx = LabelProvider::new("docx");
+        registry
+            .register_context_provider(OfficeFormat::Docx, docx.clone())
+            .unwrap();
+        let path = std::path::Path::new("brief.docx");
+        assert_eq!(
+            registry.extract_smart(path, "total revenue").unwrap(),
+            "docx:total revenue"
+        );
+        assert_eq!(
+            docx.seen.lock().unwrap()[0],
+            (path.to_path_buf(), Some("total revenue".to_string()))
+        );
+    }
+
+    /// Pins today's behavior: a second registration for a format replaces
+    /// the first (HashMap::insert), unlike ToolRegistry, which refuses
+    /// duplicates. Only the daemon's init registers providers, so nothing
+    /// relies on refusal yet; change this test if that changes.
+    #[test]
+    fn test_registering_a_format_twice_replaces_the_first_provider() {
+        let registry = PluginRegistry::new();
+        registry
+            .register_context_provider(OfficeFormat::Csv, LabelProvider::new("first"))
+            .unwrap();
+        registry
+            .register_context_provider(OfficeFormat::Csv, LabelProvider::new("second"))
+            .unwrap();
+        let output = registry.extract(std::path::Path::new("data.csv")).unwrap();
+        assert_eq!(output.content, "second");
+        assert_eq!(registry.list_context_providers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_a_clone_shares_registrations_with_the_original() {
+        let original = PluginRegistry::new();
+        let clone = original.clone();
+        clone
+            .register_context_provider(OfficeFormat::Docx, LabelProvider::new("shared"))
+            .unwrap();
+        assert!(original.supports_format(OfficeFormat::Docx).unwrap());
+        assert_eq!(
+            original
+                .extract(std::path::Path::new("a.docx"))
+                .unwrap()
+                .content,
+            "shared"
+        );
+    }
 }

@@ -35,7 +35,10 @@
 ## Remaining Clippy Warnings (11 total)
 
 ### Dead Code (Monty Module - Expected)
-These are placeholder implementations for optional Monty support:
+
+Update 2026-10-21: the symbols below are not in the tree. `monty-support` and `src/monty/python.rs` were removed. Python execution is `src/tools/python.rs`.
+
+These were placeholder names from this review for optional Monty support:
 - `check_monty_availability()` - not used
 - `try_import_monty()` - not used  
 - `execute_with_monty()` - not used
@@ -44,7 +47,7 @@ These are placeholder implementations for optional Monty support:
 - `execute_monty_code()` - not used
 - `get_external_functions()` - not used
 
-These are intentional - they're used when `monty-support` feature is enabled.
+They are not intentional live code. The feature they were waiting on is gone.
 
 ### Unused Variables (4 warnings)
 - `src/monty/python.rs:92`: `code` - could prefix with `_`
@@ -64,7 +67,7 @@ These are intentional - they're used when `monty-support` feature is enabled.
 2. **Proper error handling**: Uses thiserror for enums, anyhow for application errors
 3. **Atomic file I/O**: All file operations use temp+rename pattern
 4. **Good test coverage**: 333 tests passing
-5. **Feature flags**: Optional features (monty-support, datafusion-support, office-support)
+5. **Feature flags**: `office-support` default, `datafusion-support` optional. `monty-support` was removed on 2026-10-21.
 6. **Clean trait design**: CredentialProvider, LlmProvider traits well-designed
 
 ### Module Structure (Excellent)

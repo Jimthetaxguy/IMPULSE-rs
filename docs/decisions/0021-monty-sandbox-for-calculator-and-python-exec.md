@@ -127,10 +127,13 @@ Costs:
    an OS memory limit per worker (the in-process `max_memory` does not bound gradual growth).
 2. Remove the `impulse-rs/src/monty/` PyO3 stub and the `monty-support` feature, or build them for
    real. They are unbuilt and were wrongly marked Complete in `HANDBOOK.md` (corrected by this lane).
+   Done 2026-10-21: `src/monty/python.rs`, the optional `pyo3` dependency, and `monty-support` were
+   removed. Keyword routing in `src/monty/` stays. The sandbox remains `src/tools/python.rs`.
 3. Close `agent/grok-calculator-math-only-20260917`; Monty makes that fence unnecessary. PR #64's
    restriction stays for now.
 4. Revisit the `security-framework = "=3.6.0"` pin. Its stated reason (the Rust 1.82 MSRV) no longer
    applies.
 5. Report the loose `chrono = "0.4"` floor to pydantic/monty.
 6. `docs/CLI-COMMANDS.md` says `monty-support` gates `calc` and `exec`. It does not; both run without
-   any feature flag.
+   any feature flag. Done 2026-10-21: that row is gone. The command doc now says both run with no
+   feature flag.

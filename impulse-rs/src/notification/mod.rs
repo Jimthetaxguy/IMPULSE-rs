@@ -1044,4 +1044,18 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn test_notification_severity_wire_names_match_display() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                NotificationSeverity::Debug,
+                NotificationSeverity::Info,
+                NotificationSeverity::Warning,
+                NotificationSeverity::Error,
+            ],
+            None,
+            |v| v.to_string(),
+        );
+    }
 }

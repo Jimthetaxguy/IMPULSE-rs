@@ -1429,4 +1429,168 @@ mod tests {
         let history = state.get_conflict_history().unwrap();
         assert!(history.is_empty());
     }
+
+    // ---- Serde round-trips for the persisted formats ----
+    //
+    // None of these types derive PartialEq, so each round-trip compares the
+    // serialized JSON of the original and the recovered value. `read_jsonl`
+    // skips a line it cannot parse, so a wire-format break here would drop
+    // history silently rather than fail loudly; these tests are the alarm.
+
+    fn fixed_time(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn assert_json_round_trip<T>(original: &T) -> T
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let json = serde_json::to_string(original).unwrap();
+        let recovered: T = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            serde_json::to_value(original).unwrap(),
+            serde_json::to_value(&recovered).unwrap()
+        );
+        recovered
+    }
+
+    #[test]
+    fn round_trip_history_entry() {
+        let original = HistoryEntry {
+            session_id: "cockpit-rs-20260223-151018-997cb2a1".into(),
+            session_name: "serde lane".into(),
+            platform: Some(Platform::Codex),
+            started_at: fixed_time("2026-02-23T15:10:18.617084Z"),
+            ended_at: fixed_time("2026-02-23T15:10:38.443949Z"),
+            summary: "Round-trip the history format".into(),
+            files_touched: vec!["src/main.rs".into(), "src/lib.rs".into()],
+            tools_used: vec!["Write".into(), "Bash".into()],
+        };
+        let recovered = assert_json_round_trip(&original);
+        assert_eq!(recovered.platform, Some(Platform::Codex));
+        assert_eq!(recovered.started_at, original.started_at);
+
+        let without_platform = HistoryEntry {
+            platform: None,
+            ..original
+        };
+        let recovered = assert_json_round_trip(&without_platform);
+        assert_eq!(recovered.platform, None);
+    }
+
+    #[test]
+    fn test_history_entry_committed_line_still_deserializes() {
+        // Verbatim shape of a line in the committed `.impulse/HISTORY.jsonl`.
+        let line = r#"{"session_id":"cockpit-rs-20260223-064015-ba2eec46","session_name":"test-session","platform":"claudecode","started_at":"2026-02-23T06:40:15.873607Z","ended_at":"2026-02-23T06:40:55.004504Z","summary":"Test completed","files_touched":[],"tools_used":[]}"#;
+        let entry: HistoryEntry = serde_json::from_str(line).unwrap();
+        assert_eq!(entry.platform, Some(Platform::ClaudeCode));
+        assert_eq!(entry.session_name, "test-session");
+        assert!(entry.files_touched.is_empty());
+        // Writing it back reproduces the committed line byte for byte.
+        assert_eq!(serde_json::to_string(&entry).unwrap(), line);
+    }
+
+    #[test]
+    fn test_history_entry_without_platform_key_deserializes_as_none() {
+        let line = r#"{"session_id":"s","session_name":"n","started_at":"2026-02-23T06:40:15Z","ended_at":"2026-02-23T06:40:55Z","summary":"","files_touched":[],"tools_used":[]}"#;
+        let entry: HistoryEntry = serde_json::from_str(line).unwrap();
+        assert_eq!(entry.platform, None);
+    }
+
+    #[test]
+    fn test_platform_wire_names_are_pinned() {
+        // The serde form (`rename_all = "lowercase"`) differs from
+        // `Platform::as_str` ("claude-code"); HISTORY.jsonl uses the serde
+        // form, so renaming a variant would orphan existing lines.
+        let cases = [
+            (Platform::ClaudeCode, "\"claudecode\""),
+            (Platform::Codex, "\"codex\""),
+            (Platform::OpenCode, "\"opencode\""),
+        ];
+        for (platform, wire) in cases {
+            assert_eq!(serde_json::to_string(&platform).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<Platform>(wire).unwrap(), platform);
+        }
+        assert!(serde_json::from_str::<Platform>("\"claude-code\"").is_err());
+    }
+
+    #[test]
+    fn round_trip_conflict_event() {
+        let original = conflict_event("src/lib.rs", "s1", "2026-03-09T10:00:00Z");
+        let original = ConflictEvent {
+            conflicting_sessions: vec!["s2".into(), "s3".into()],
+            ..original
+        };
+        let recovered = assert_json_round_trip(&original);
+        assert_eq!(recovered.conflicting_sessions, vec!["s2", "s3"]);
+        assert_eq!(recovered.detected_at, original.detected_at);
+    }
+
+    fn sample_conflict_entry(resolved: bool) -> ConflictEntry {
+        ConflictEntry {
+            file_path: "src/state/mod.rs".into(),
+            detection_count: 4,
+            first_detected: fixed_time("2026-03-09T10:00:00Z"),
+            last_detected: fixed_time("2026-03-10T11:30:00Z"),
+            involved_sessions: vec!["s1".into(), "s2".into()],
+            resolution: resolved.then(|| "merged".to_string()),
+            resolved_at: resolved.then(|| fixed_time("2026-03-10T12:00:00Z")),
+        }
+    }
+
+    #[test]
+    fn round_trip_conflict_entry() {
+        let resolved = assert_json_round_trip(&sample_conflict_entry(true));
+        assert_eq!(resolved.resolution.as_deref(), Some("merged"));
+        assert!(resolved.resolved_at.is_some());
+
+        let unresolved = assert_json_round_trip(&sample_conflict_entry(false));
+        assert_eq!(unresolved.resolution, None);
+        assert_eq!(unresolved.resolved_at, None);
+    }
+
+    #[test]
+    fn test_conflict_entry_without_resolution_keys_deserializes_as_unresolved() {
+        let json = r#"{"file_path":"a.rs","detection_count":1,"first_detected":"2026-03-09T10:00:00Z","last_detected":"2026-03-09T10:00:00Z","involved_sessions":["s1"]}"#;
+        let entry: ConflictEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.resolution, None);
+        assert_eq!(entry.resolved_at, None);
+    }
+
+    #[test]
+    fn round_trip_conflict_history() {
+        let original = ConflictHistory {
+            conflict_history: vec![sample_conflict_entry(true), sample_conflict_entry(false)],
+        };
+        let recovered = assert_json_round_trip(&original);
+        assert_eq!(recovered.conflict_history.len(), 2);
+    }
+
+    #[test]
+    fn test_conflict_history_missing_list_deserializes_empty() {
+        let recovered: ConflictHistory = serde_json::from_str("{}").unwrap();
+        assert!(recovered.conflict_history.is_empty());
+    }
+
+    #[test]
+    fn round_trip_conflict_analytics() {
+        let original = ConflictAnalytics {
+            total_conflicts: 3,
+            resolved_count: 2,
+            unresolved_count: 1,
+            resolution_rate: 2.0 / 3.0,
+            conflicts_by_day: HashMap::from([("2026-03-09".to_string(), 2)]),
+            conflicts_by_week: HashMap::from([("2026-W11".to_string(), 3)]),
+            conflicts_by_month: HashMap::from([("2026-03".to_string(), 3)]),
+            most_common_files: vec![("src/lib.rs".into(), 2), ("src/main.rs".into(), 1)],
+            resolution_methods: HashMap::from([("merged".to_string(), 2)]),
+            avg_time_to_resolution_secs: Some(3665),
+        };
+        let recovered = assert_json_round_trip(&original);
+        assert_eq!(recovered.resolution_rate, original.resolution_rate);
+        assert_eq!(recovered.most_common_files, original.most_common_files);
+        assert_eq!(recovered.avg_time_to_resolution_secs, Some(3665));
+    }
 }
