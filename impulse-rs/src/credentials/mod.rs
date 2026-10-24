@@ -514,4 +514,33 @@ mod tests {
         assert_eq!(config.provider, CredentialProviderType::Env);
         assert!(config.cli_tool.is_none());
     }
+
+    #[test]
+    fn test_credential_provider_type_wire_names_differ_from_as_str() {
+        // Pinned, not aliased. No serde rename, so the wire name is the
+        // variant name. The provider is chosen through
+        // `CredentialProviderType::parse` (`impulse-rs credentials --provider`),
+        // and `CredentialConfig` is only built in code, never read from a file.
+        let rows = crate::test_support::wire_vs_str_api(
+            &[
+                CredentialProviderType::Keychain,
+                CredentialProviderType::Socket,
+                CredentialProviderType::CliProxy,
+                CredentialProviderType::Env,
+                CredentialProviderType::Memory,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+        assert_eq!(
+            rows,
+            crate::test_support::expected_rows(&[
+                ("Keychain", "keychain", false),
+                ("Socket", "socket", false),
+                ("CliProxy", "cliproxy", false),
+                ("Env", "env", false),
+                ("Memory", "memory", false),
+            ])
+        );
+    }
 }

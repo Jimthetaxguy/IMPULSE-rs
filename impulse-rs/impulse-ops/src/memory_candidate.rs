@@ -841,14 +841,14 @@ fn validate_record_id(id: &MemoryRecordId) -> Result<(), MemoryCandidateContract
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn digest(prefix: &str, character: char) -> String {
         format!("{prefix}{}", character.to_string().repeat(64))
     }
 
-    fn candidate() -> AcceptedRunMemoryCandidate {
+    pub(crate) fn candidate() -> AcceptedRunMemoryCandidate {
         AcceptedRunMemoryCandidate {
             id: MemoryCandidateId::try_new(format!(
                 "memory-candidate-{}",
@@ -991,7 +991,7 @@ mod tests {
     /// Build a shape-valid record whose id and digest share the same hex. The
     /// hex is not a real SHA-256 here; only the state layer, which owns the
     /// hash function, checks that.
-    fn record(character: char) -> MemoryRecord {
+    pub(crate) fn record(character: char) -> MemoryRecord {
         let hex = character.to_string().repeat(64);
         MemoryRecord {
             id: MemoryRecordId::try_new(format!("memory-record-{hex}")).unwrap(),
@@ -1221,5 +1221,186 @@ mod tests {
             MemoryLogEntry::digest_source_bytes(0, "sha256-memlog-v1:other", &record).unwrap(),
             base
         );
+    }
+
+    #[test]
+    fn test_source_assurance_wire_names() {
+        for (assurance, wire) in [
+            (
+                AcceptedRunSourceAssurance::DaemonProfiledEvidenceDeclaredOperator,
+                "daemon_profiled_evidence_declared_operator",
+            ),
+            (
+                AcceptedRunSourceAssurance::DaemonProfiledEvidenceAuthenticatedOperator,
+                "daemon_profiled_evidence_authenticated_operator",
+            ),
+            (
+                AcceptedRunSourceAssurance::CallerComposedEvidenceDeclaredOperator,
+                "caller_composed_evidence_declared_operator",
+            ),
+        ] {
+            let json = serde_json::to_value(assurance).unwrap();
+            assert_eq!(json, wire);
+            assert_eq!(
+                serde_json::from_value::<AcceptedRunSourceAssurance>(json).unwrap(),
+                assurance
+            );
+        }
+    }
+
+    #[test]
+    fn test_memory_scope_and_kind_wire_names_match_labels() {
+        for scope in [
+            MemoryScope::Project,
+            MemoryScope::Workspace,
+            MemoryScope::Global,
+        ] {
+            let json = serde_json::to_value(scope).unwrap();
+            assert_eq!(json, scope.label());
+            assert_eq!(serde_json::from_value::<MemoryScope>(json).unwrap(), scope);
+        }
+        for kind in [MemoryKind::AcceptedRunOutcome, MemoryKind::OperatorNote] {
+            let json = serde_json::to_value(kind).unwrap();
+            assert_eq!(json, kind.label());
+            assert_eq!(serde_json::from_value::<MemoryKind>(json).unwrap(), kind);
+        }
+    }
+
+    #[test]
+    fn test_candidate_status_wire_keys_match_labels() {
+        let decided = [
+            MemoryCandidateStatus::Promoted {
+                record_id: record_id('e'),
+                decided_at: "2026-09-12T10:00:00Z".to_string(),
+                decided_by: actor(),
+            },
+            MemoryCandidateStatus::Dismissed {
+                reason: "duplicate".to_string(),
+                decided_at: "2026-09-12T10:00:00Z".to_string(),
+                decided_by: actor(),
+            },
+        ];
+        for status in decided {
+            let json = serde_json::to_value(&status).unwrap();
+            let object = json.as_object().unwrap();
+            assert_eq!(object.len(), 1);
+            assert!(object.contains_key(status.label()), "{json}");
+        }
+        assert_eq!(
+            serde_json::to_value(MemoryCandidateStatus::PendingReview).unwrap(),
+            MemoryCandidateStatus::PendingReview.label()
+        );
+    }
+
+    #[test]
+    fn test_memory_source_tags_and_operator_manual_round_trip() {
+        let manual = MemorySource::OperatorManual {
+            note: "prefer atomic writes".to_string(),
+        };
+        let json = serde_json::to_value(&manual).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "operator_manual", "data": {"note": "prefer atomic writes"}})
+        );
+        assert_eq!(
+            serde_json::from_value::<MemorySource>(json).unwrap(),
+            manual
+        );
+
+        let candidate_ref = record('f').source;
+        let json = serde_json::to_value(&candidate_ref).unwrap();
+        assert_eq!(json["kind"], "candidate_ref");
+        assert_eq!(json["data"]["governed_task_id"], "task-a");
+        assert_eq!(
+            serde_json::from_value::<MemorySource>(json).unwrap(),
+            candidate_ref
+        );
+    }
+
+    #[test]
+    fn test_memory_ids_are_plain_strings_and_validate_on_deserialize() {
+        let candidate_id = candidate().id;
+        let json = serde_json::to_value(&candidate_id).unwrap();
+        assert_eq!(json, candidate_id.as_str());
+        assert_eq!(
+            serde_json::from_value::<MemoryCandidateId>(json).unwrap(),
+            candidate_id
+        );
+        let record_id = record_id('a');
+        let json = serde_json::to_value(&record_id).unwrap();
+        assert_eq!(json, record_id.as_str());
+        assert_eq!(
+            serde_json::from_value::<MemoryRecordId>(json).unwrap(),
+            record_id
+        );
+        for invalid in ["", "has space", "nul\u{0}"] {
+            assert!(
+                serde_json::from_value::<MemoryCandidateId>(serde_json::json!(invalid)).is_err()
+            );
+            assert!(serde_json::from_value::<MemoryRecordId>(serde_json::json!(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn test_command_evidence_without_truncation_flag_parses() {
+        let mut evidence = candidate().commands.remove(0);
+        evidence.output_truncated = true;
+        evidence.exit_code = None;
+        let json = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(
+            serde_json::from_value::<AcceptedRunCommandEvidence>(json.clone()).unwrap(),
+            evidence
+        );
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("output_truncated");
+        let decoded: AcceptedRunCommandEvidence = serde_json::from_value(legacy).unwrap();
+        assert!(!decoded.output_truncated);
+    }
+
+    #[test]
+    fn test_candidate_without_defaulted_lists_or_optionals_parses() {
+        let mut value = serde_json::to_value(candidate()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in [
+            "acceptance_criteria",
+            "session_id",
+            "verification_profile",
+            "claimed_artifact_ids",
+            "verification_artifact_ids",
+            "commands",
+        ] {
+            assert!(object.remove(key).is_some(), "{key} was on the wire");
+        }
+        let decoded: AcceptedRunMemoryCandidate = serde_json::from_value(value).unwrap();
+        assert!(decoded.acceptance_criteria.is_empty());
+        assert!(decoded.session_id.is_none());
+        assert!(decoded.verification_profile.is_none());
+        assert!(decoded.claimed_artifact_ids.is_empty());
+        assert!(decoded.verification_artifact_ids.is_empty());
+        assert!(decoded.commands.is_empty());
+
+        let mut bare = candidate();
+        bare.session_id = None;
+        bare.verification_profile = None;
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(json.get("session_id").is_none());
+        assert!(json.get("verification_profile").is_none());
+    }
+
+    #[test]
+    fn test_memory_record_superseded_by_round_trips_and_is_omitted_when_none() {
+        let mut superseded = record('a');
+        superseded.superseded_by = Some(record_id('b'));
+        let json = serde_json::to_value(&superseded).unwrap();
+        assert_eq!(json["superseded_by"], record_id('b').as_str());
+        assert_eq!(
+            serde_json::from_value::<MemoryRecord>(json).unwrap(),
+            superseded
+        );
+
+        let current = serde_json::to_value(record('a')).unwrap();
+        assert!(current.get("superseded_by").is_none());
+        assert_eq!(current["kind"], "accepted_run_outcome");
+        assert_eq!(current["scope"], "project");
     }
 }

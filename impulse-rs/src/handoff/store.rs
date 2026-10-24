@@ -701,4 +701,216 @@ mod tests {
             "dropping the holder removes only the lock whose token it wrote"
         );
     }
+
+    // ---- Serde round-trips for the persisted ledger (HANDOFF_GATE file) ----
+
+    fn fixed_time(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn assert_json_round_trip<T>(original: &T) -> T
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let json = serde_json::to_string(original).unwrap();
+        let recovered: T = serde_json::from_str(&json).unwrap();
+        assert_eq!(&recovered, original);
+        recovered
+    }
+
+    fn sample_recorded_via() -> RecordedVia {
+        RecordedVia {
+            execution_origin: "ion".into(),
+            session_id: Some("session-7".into()),
+        }
+    }
+
+    fn sample_fetch() -> FetchRecord {
+        FetchRecord {
+            url: "https://billing.example.com/docs/refunds".into(),
+            host: "billing.example.com".into(),
+            status: 200,
+            body_digest: "0123456789abcdef".repeat(4),
+            fetched_at: fixed_time("2026-06-01T12:00:00Z"),
+            sender: "researcher".into(),
+            recorded_via: sample_recorded_via(),
+        }
+    }
+
+    fn sample_claim() -> super::super::Claim {
+        super::super::Claim::try_new(
+            "refund-cap",
+            "Refunds over $50 need a second approver.",
+            "billing.example.com",
+            super::super::ClaimSource::Url {
+                url: "https://billing.example.com/docs/refunds".into(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn sample_pending_handoff() -> StoredHandoff {
+        StoredHandoff {
+            id: "h-pending".into(),
+            from_agent: "researcher".into(),
+            to_agent: "builder".into(),
+            workspace: "/work/impulse".into(),
+            claims: vec![sample_claim()],
+            phase: HandoffPhase::Pending {
+                failures: vec![GateFailure {
+                    target: "refund-cap".into(),
+                    check: CheckKind::SourceResolves,
+                    field: Some("source".into()),
+                    fix: "record the fetch first".into(),
+                }],
+            },
+            updated_at: fixed_time("2026-06-01T12:05:00Z"),
+            recorded_via: sample_recorded_via(),
+        }
+    }
+
+    fn sample_accepted_handoff() -> StoredHandoff {
+        StoredHandoff {
+            id: "h-accepted".into(),
+            phase: HandoffPhase::Accepted {
+                accepted_at: fixed_time("2026-06-01T12:10:00Z"),
+            },
+            recorded_via: RecordedVia::unrecorded(),
+            ..sample_pending_handoff()
+        }
+    }
+
+    fn sample_artifact() -> SharedArtifact {
+        SharedArtifact {
+            generation: 3,
+            content: "shared plan v3".into(),
+            last_writer: "builder".into(),
+            last_written_at: fixed_time("2026-06-01T12:20:00Z"),
+            reads: BTreeMap::from([(
+                "reviewer".to_string(),
+                ReadMark {
+                    generation: 2,
+                    read_at: fixed_time("2026-06-01T12:15:00Z"),
+                },
+            )]),
+        }
+    }
+
+    fn sample_store() -> GateStore {
+        let fetch = sample_fetch();
+        let pending = sample_pending_handoff();
+        let accepted = sample_accepted_handoff();
+        GateStore {
+            schema_version: SCHEMA_VERSION,
+            fetches: BTreeMap::from([(
+                fetch.sender.clone(),
+                BTreeMap::from([(fetch.url.clone(), fetch)]),
+            )]),
+            handoffs: BTreeMap::from([
+                (pending.id.clone(), pending),
+                (accepted.id.clone(), accepted),
+            ]),
+            artifacts: BTreeMap::from([("plan".to_string(), sample_artifact())]),
+        }
+    }
+
+    #[test]
+    fn round_trip_recorded_via() {
+        assert_json_round_trip(&sample_recorded_via());
+        let recovered = assert_json_round_trip(&RecordedVia::unrecorded());
+        assert_eq!(recovered.session_id, None);
+    }
+
+    #[test]
+    fn round_trip_fetch_record() {
+        let recovered = assert_json_round_trip(&sample_fetch());
+        assert_eq!(recovered.recorded_via.execution_origin, "ion");
+    }
+
+    #[test]
+    fn test_fetch_record_without_recorded_via_defaults_to_unrecorded() {
+        let json = r#"{"url":"https://a.example.com/x","host":"a.example.com","status":200,"body_digest":"d","fetched_at":"2026-06-01T12:00:00Z","sender":"researcher"}"#;
+        let fetch: FetchRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(fetch.recorded_via, RecordedVia::unrecorded());
+    }
+
+    #[test]
+    fn round_trip_stored_handoff_in_each_phase() {
+        let pending = assert_json_round_trip(&sample_pending_handoff());
+        assert!(
+            matches!(pending.phase, HandoffPhase::Pending { ref failures } if failures.len() == 1)
+        );
+        let accepted = assert_json_round_trip(&sample_accepted_handoff());
+        assert!(matches!(accepted.phase, HandoffPhase::Accepted { .. }));
+    }
+
+    #[test]
+    fn test_stored_handoff_without_recorded_via_defaults_to_unrecorded() {
+        let mut value = serde_json::to_value(sample_accepted_handoff()).unwrap();
+        value.as_object_mut().unwrap().remove("recorded_via");
+        let handoff: StoredHandoff = serde_json::from_value(value).unwrap();
+        assert_eq!(handoff.recorded_via, RecordedVia::unrecorded());
+    }
+
+    #[test]
+    fn test_handoff_phase_wire_tags_are_pinned() {
+        let pending = serde_json::to_value(HandoffPhase::Pending { failures: vec![] }).unwrap();
+        assert_eq!(pending, json!({"status": "pending", "failures": []}));
+        let accepted = serde_json::to_value(HandoffPhase::Accepted {
+            accepted_at: fixed_time("2026-06-01T12:10:00Z"),
+        })
+        .unwrap();
+        assert_eq!(
+            accepted,
+            json!({"status": "accepted", "accepted_at": "2026-06-01T12:10:00Z"})
+        );
+        assert!(serde_json::from_value::<HandoffPhase>(json!({"status": "Accepted"})).is_err());
+    }
+
+    #[test]
+    fn round_trip_shared_artifact_and_read_mark() {
+        let recovered = assert_json_round_trip(&sample_artifact());
+        assert_eq!(recovered.reads["reviewer"].generation, 2);
+        assert_json_round_trip(&ReadMark {
+            generation: 9,
+            read_at: fixed_time("2026-06-02T00:00:00Z"),
+        });
+    }
+
+    #[test]
+    fn test_shared_artifact_without_reads_deserializes_empty() {
+        let json = r#"{"generation":1,"content":"c","last_writer":"w","last_written_at":"2026-06-01T12:00:00Z"}"#;
+        let artifact: SharedArtifact = serde_json::from_str(json).unwrap();
+        assert!(artifact.reads.is_empty());
+    }
+
+    #[test]
+    fn round_trip_gate_store() {
+        let recovered = assert_json_round_trip(&sample_store());
+        assert_eq!(recovered.handoffs.len(), 2);
+        assert_json_round_trip(&GateStore::default());
+    }
+
+    #[test]
+    fn test_gate_store_save_then_load_returns_the_same_ledger() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = sample_store();
+        original.save(dir.path()).unwrap();
+        let loaded = GateStore::load(dir.path()).unwrap();
+        assert_eq!(loaded, original);
+    }
+
+    #[test]
+    fn test_gate_store_schema_3_with_only_version_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(HANDOFF_GATE_FILE),
+            format!("{{\"schema_version\":{SCHEMA_VERSION}}}"),
+        )
+        .unwrap();
+        let loaded = GateStore::load(dir.path()).unwrap();
+        assert_eq!(loaded, GateStore::default());
+    }
 }

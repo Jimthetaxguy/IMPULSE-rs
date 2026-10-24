@@ -993,4 +993,61 @@ I recommend we refactor this module."#;
             None
         );
     }
+
+    #[test]
+    fn test_context_tier_wire_names_match_as_str() {
+        for tier in [
+            ContextTier::None,
+            ContextTier::Full,
+            ContextTier::Essential,
+            ContextTier::Critical,
+            ContextTier::Minimal,
+            ContextTier::PostCompaction,
+        ] {
+            let wire = format!("\"{}\"", tier.as_str());
+            assert_eq!(serde_json::to_string(&tier).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<ContextTier>(&wire).unwrap(), tier);
+        }
+    }
+
+    #[test]
+    fn test_insight_type_wire_names_differ_from_as_str() {
+        // Pinned, not aliased. `as_str` returns the variant name, serde the
+        // snake_case form. Nothing in the workspace calls this `as_str` or
+        // parses its output back.
+        for (insight, wire, api) in [
+            (InsightType::FileModified, "file_modified", "FileModified"),
+            (
+                InsightType::ErrorEncountered,
+                "error_encountered",
+                "ErrorEncountered",
+            ),
+            (InsightType::DecisionMade, "decision_made", "DecisionMade"),
+            (
+                InsightType::TaskCompleted,
+                "task_completed",
+                "TaskCompleted",
+            ),
+        ] {
+            assert_eq!(insight.as_str(), api);
+            assert_eq!(serde_json::to_value(&insight).unwrap(), wire);
+            assert!(serde_json::from_value::<InsightType>(api.into()).is_err());
+        }
+    }
+
+    #[test]
+    fn test_agent_kind_wire_names_differ_from_label() {
+        // Pinned, not aliased. `label` is a display title ("Claude Code"),
+        // not an identifier; nothing parses it back as an AgentKind.
+        for (kind, wire, label) in [
+            (AgentKind::ClaudeCode, "claude_code", "Claude Code"),
+            (AgentKind::Codex, "codex", "Codex"),
+            (AgentKind::OpenCode, "open_code", "OpenCode"),
+            (AgentKind::GenericShell, "generic_shell", "Shell"),
+        ] {
+            assert_eq!(kind.label(), label);
+            assert_eq!(serde_json::to_value(kind).unwrap(), wire);
+            assert!(serde_json::from_value::<AgentKind>(label.into()).is_err());
+        }
+    }
 }

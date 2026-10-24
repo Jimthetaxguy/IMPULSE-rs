@@ -83,10 +83,19 @@ fn is_operator_capability_file(path: &Path) -> bool {
 /// Capability a tool may require — deny-by-default security model
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Capability {
+    // The wire name is the variant name (manifests and peers write it that
+    // way, so it stays), but `tools describe`, the tool manifest and the MCP
+    // tool list show `as_str`'s snake_case spelling. Accept that spelling
+    // too, so a manifest author can list a capability exactly as shown.
+    #[serde(alias = "filesystem_read")]
     FileSystemRead,
+    #[serde(alias = "filesystem_write")]
     FileSystemWrite,
+    #[serde(alias = "network")]
     Network,
+    #[serde(alias = "python_exec")]
     PythonExec,
+    #[serde(alias = "system_info")]
     SystemInfo,
     /// Run an arbitrary shell command as a child process. Separate from
     /// `FileSystemWrite` because a shell command's effects are not limited to
@@ -94,6 +103,7 @@ pub enum Capability {
     /// own deny-by-default capability so a tool that only needs file I/O
     /// never implicitly gets shell access (TUI_SPEC.md T7: `bash_exec`
     /// ReplTool bridge).
+    #[serde(alias = "shell_exec")]
     ShellExec,
 }
 
@@ -579,6 +589,93 @@ mod tests {
     fn test_tool_source_str() {
         assert_eq!(ToolSource::Builtin.as_str(), "builtin");
         assert_eq!(ToolSource::ExternalProcess.as_str(), "external_process");
+    }
+
+    #[test]
+    fn test_tool_source_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                ToolSource::Builtin,
+                ToolSource::Document,
+                ToolSource::ExternalProcess,
+                ToolSource::Plugin,
+                ToolSource::McpProxy,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+    }
+
+    #[test]
+    fn test_execution_origin_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                ExecutionOrigin::Cli,
+                ExecutionOrigin::Daemon,
+                ExecutionOrigin::Mcp,
+                ExecutionOrigin::Voice,
+                ExecutionOrigin::Test,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+    }
+
+    #[test]
+    fn test_tool_category_wire_names_differ_from_display() {
+        // Pinned, not aliased. No serde rename, so `ToolDescriptor` writes the
+        // variant name; Display feeds the exported manifest's plain-string
+        // `category`. Nothing deserializes a ToolCategory from user input.
+        let rows = crate::test_support::wire_vs_str_api(
+            &[
+                ToolCategory::Utility,
+                ToolCategory::Document,
+                ToolCategory::Analysis,
+                ToolCategory::System,
+            ],
+            None,
+            |v| v.to_string(),
+        );
+        assert_eq!(
+            rows,
+            crate::test_support::expected_rows(&[
+                ("Utility", "utility", false),
+                ("Document", "document", false),
+                ("Analysis", "analysis", false),
+                ("System", "system", false),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_param_type_wire_names_differ_from_as_str() {
+        // Pinned, not aliased. No serde rename; `as_str` is the `type` the
+        // daemon's tool listing shows. External tools derive their params
+        // from JSON Schema (`external::schema_to_params`), so no input path
+        // deserializes a ParamType.
+        let rows = crate::test_support::wire_vs_str_api(
+            &[
+                ParamType::String,
+                ParamType::Integer,
+                ParamType::Float,
+                ParamType::Bool,
+                ParamType::FilePath,
+                ParamType::Json,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+        assert_eq!(
+            rows,
+            crate::test_support::expected_rows(&[
+                ("String", "string", false),
+                ("Integer", "integer", false),
+                ("Float", "float", false),
+                ("Bool", "bool", false),
+                ("FilePath", "file_path", false),
+                ("Json", "json", false),
+            ])
+        );
     }
 }
 

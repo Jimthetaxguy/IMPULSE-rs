@@ -257,4 +257,18 @@ mod tests {
         assert_eq!(output.content, "extracted content");
         assert_eq!(output.chunks.len(), 2);
     }
+
+    #[test]
+    fn test_plugin_category_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                PluginCategory::ContextProvider,
+                PluginCategory::ActionHandler,
+                PluginCategory::RetrievalSource,
+                PluginCategory::AnalysisModule,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+    }
 }

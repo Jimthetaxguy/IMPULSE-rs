@@ -266,4 +266,24 @@ mod tests {
         assert_eq!(spec.max_depth, 1);
         assert_eq!(spec.restricted_tools.len(), 2);
     }
+
+    #[test]
+    fn test_delegation_state_status_tag_matches_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                DelegationState::Pending,
+                DelegationState::InProgress,
+                DelegationState::Completed {
+                    summary: "done".to_string(),
+                    tool_trace: Vec::new(),
+                    diff_summary: None,
+                },
+                DelegationState::Failed {
+                    error: "boom".to_string(),
+                },
+            ],
+            Some("status"),
+            |v| v.as_str().to_string(),
+        );
+    }
 }

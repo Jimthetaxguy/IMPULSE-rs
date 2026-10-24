@@ -445,4 +445,33 @@ mod tests {
         assert_eq!(recovered.enabled, rule.enabled);
         assert_eq!(recovered.builtin, rule.builtin);
     }
+
+    #[test]
+    fn test_guard_action_wire_names_match_as_str_and_display() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[GuardAction::Block, GuardAction::Warn, GuardAction::Log],
+            None,
+            |v| {
+                assert_eq!(v.to_string(), v.as_str());
+                v.as_str().to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn test_guard_target_wire_names_match_as_str_and_display() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                GuardTarget::Bash,
+                GuardTarget::ToolCall,
+                GuardTarget::FileWrite,
+                GuardTarget::Any,
+            ],
+            None,
+            |v| {
+                assert_eq!(v.to_string(), v.as_str());
+                v.as_str().to_string()
+            },
+        );
+    }
 }

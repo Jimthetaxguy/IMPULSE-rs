@@ -218,6 +218,138 @@ pub(crate) async fn wait_for_pids_to_exit(
     }
 }
 
+/// For each variant of a serde enum: its wire name, its string-API spelling
+/// (`as_str`, `label`, `Display`, ...), and whether that spelling
+/// deserializes back to the same variant.
+///
+/// Many enums here carry two spellings: the one serde writes and the one the
+/// string API shows people (CLI output, error text, config docs). When they
+/// disagree, a value copied from the output and fed back through serde fails,
+/// or (with `#[serde(other)]`) silently becomes another variant. `tag` names
+/// the tag field for an internally or adjacently tagged enum; `None` means the
+/// enum serializes as a bare string. The parse check swaps the API spelling
+/// into the serialized value and compares the re-serialized result, so it
+/// also works for enums without `PartialEq`.
+pub(crate) fn wire_vs_str_api<T>(
+    variants: &[T],
+    tag: Option<&str>,
+    api: impl Fn(&T) -> String,
+) -> Vec<(String, String, bool)>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    variants
+        .iter()
+        .map(|variant| {
+            let value = serde_json::to_value(variant).expect("variant serializes");
+            let wire_slot = |value: &serde_json::Value| match tag {
+                Some(tag) => value.get(tag).cloned(),
+                None => Some(value.clone()),
+            };
+            let wire = wire_slot(&value)
+                .and_then(|slot| slot.as_str().map(str::to_string))
+                .unwrap_or_else(|| panic!("no string wire name (tag {tag:?}) in {value}"));
+            let spelled = api(variant);
+            let mut swapped = value.clone();
+            match tag {
+                Some(tag) => swapped[tag] = serde_json::Value::String(spelled.clone()),
+                None => swapped = serde_json::Value::String(spelled.clone()),
+            }
+            let parses = serde_json::from_value::<T>(swapped)
+                .ok()
+                .and_then(|parsed| serde_json::to_value(parsed).ok())
+                .is_some_and(|reparsed| reparsed == value);
+            (wire, spelled, parses)
+        })
+        .collect()
+}
+
+/// Owned rows to compare against [`wire_vs_str_api`] output when pinning an
+/// enum whose two spellings are known to differ.
+pub(crate) fn expected_rows(rows: &[(&str, &str, bool)]) -> Vec<(String, String, bool)> {
+    rows.iter()
+        .map(|(wire, api, parses)| (wire.to_string(), api.to_string(), *parses))
+        .collect()
+}
+
+/// Assert that every variant's wire name equals its string-API spelling, so
+/// the two cannot drift apart unnoticed.
+pub(crate) fn assert_wire_names_match_str_api<T>(
+    variants: &[T],
+    tag: Option<&str>,
+    api: impl Fn(&T) -> String,
+) where
+    T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    assert!(!variants.is_empty(), "no variants listed");
+    for (variant, (wire, spelled, parses)) in
+        variants.iter().zip(wire_vs_str_api(variants, tag, api))
+    {
+        assert_eq!(wire, spelled, "{variant:?}: wire name vs string API");
+        assert!(
+            parses,
+            "{variant:?}: string-API spelling {spelled:?} does not parse back"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wire_vs_str_api_tests {
+    use super::{assert_wire_names_match_str_api, wire_vs_str_api};
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Plain {
+        OneWord,
+        #[serde(other)]
+        Other,
+    }
+
+    #[derive(Debug, serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "kind", rename_all = "snake_case")]
+    enum Tagged {
+        Unit,
+        WithData { n: u8 },
+    }
+
+    #[test]
+    fn test_wire_vs_str_api_reports_mismatch_and_other_fallback_as_not_parsing() {
+        let rows = wire_vs_str_api(&[Plain::OneWord, Plain::Other], None, |v| {
+            match v {
+                Plain::OneWord => "oneword",
+                Plain::Other => "other",
+            }
+            .to_string()
+        });
+        assert_eq!(
+            rows,
+            vec![
+                // `#[serde(other)]` swallows "oneword" as Other: not a parse.
+                ("one_word".to_string(), "oneword".to_string(), false),
+                ("other".to_string(), "other".to_string(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_assert_wire_names_match_str_api_reads_the_tag_field() {
+        assert_wire_names_match_str_api(
+            &[Tagged::Unit, Tagged::WithData { n: 1 }],
+            Some("kind"),
+            |v| match v {
+                Tagged::Unit => "unit".to_string(),
+                Tagged::WithData { .. } => "with_data".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "wire name vs string API")]
+    fn test_assert_wire_names_match_str_api_fails_on_a_mismatch() {
+        assert_wire_names_match_str_api(&[Plain::OneWord], None, |_| "oneword".to_string());
+    }
+}
+
 #[cfg(test)]
 mod init_git_repo_tests {
     use super::init_git_repo;
