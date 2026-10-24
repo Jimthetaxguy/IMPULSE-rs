@@ -54,7 +54,7 @@ use super::handlers::{
     persist_governed_mutation, require_current_governed_task, require_producer_request_state,
 };
 use super::protocol::{respond_err, respond_ok, DaemonRequest, DaemonResponse};
-use crate::state::{ProducerKind, SharedState};
+use crate::state::{ProducerKind, ProducerSideEffectError, SharedState};
 
 /// The actor every daemon-owned staged-worktree and promotion side effect is
 /// recorded under. Mirrors `governed_producers::staged_system_actor`, which is
@@ -313,16 +313,31 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<GovernedTaskMutationRequest>>,
 {
-    crate::state::with_reservation(
+    crate::state::with_reservation_effect(
         state,
         task_id,
         expected_revision,
         request_id,
         producer,
         || async move {
-            let mutation_request = build_mutation().await?;
+            // A producer error is a definite failure unless the producer
+            // marked it as raised after its side effect was dispatched (a
+            // promotion that moved the branch and then failed to sync or
+            // observe it): that one is unknown, never failed.
+            let mutation_request = build_mutation()
+                .await
+                .map_err(crate::state::classify_producer_error)?;
             let receipt = mutation_request.request_id.as_str().to_string();
-            let updated = persist_governed_mutation(state, mutation_request).await?;
+            // From here the side effect has run. If its receipt cannot be made
+            // durable the outcome is unknown, not failed (blueprint 2.1 "lost
+            // response"): the journal closes the reservation as needs-rerun.
+            // That includes a ledger that refuses the receipt (a revision
+            // conflict, an invalid transition): the refusal is definite, but
+            // it is a refusal of the receipt, and the effect it would have
+            // recorded already ran, so `FailedKnown` would be false.
+            let updated = persist_governed_mutation(state, mutation_request)
+                .await
+                .map_err(ProducerSideEffectError::ReceiptLost)?;
             Ok((updated, receipt))
         },
     )
@@ -2434,6 +2449,100 @@ mod tests {
         assert!(
             state.open_reservations().unwrap().is_empty(),
             "the rerun released its own reservation"
+        );
+    }
+
+    /// Blueprint 2.1 failure test "lost response": the daemon is killed after
+    /// the verification commands finished but before their receipt was
+    /// durable. On restart the reservation is `NeedsRerun` (as before) and the
+    /// effect is recorded as `unknown` -- never `failed`: the task shows no
+    /// failed verification, and the rerun proceeds and confirms.
+    #[tokio::test]
+    async fn a_lost_verification_response_is_recorded_as_unknown_not_failed() {
+        let (repo, state, project_id, oid) = repo_state();
+        let claimed = awaiting_verification(&state, repo.path(), &project_id, &oid);
+        let lost_request = request_id("verify-lost-response");
+
+        state
+            .reserve(
+                &claimed.id,
+                claimed.revision,
+                &lost_request,
+                ProducerKind::Verification,
+            )
+            .unwrap();
+        // The side effect runs to completion...
+        let evidence = crate::governed_producers::run_verification(&claimed)
+            .await
+            .expect("the verification commands ran");
+        assert!(!evidence.commands.is_empty());
+        // ...and the daemon is killed before the receipt is persisted.
+        drop(evidence);
+        drop(state);
+
+        let state: SharedState = Arc::new(
+            crate::state::State::new(repo.path().join(".impulse")).expect("the daemon reloads"),
+        );
+        state
+            .reconcile_producer_reservations()
+            .expect("the restarted daemon reconciles");
+
+        let reservation = state
+            .latest_reservation(&claimed.id, ProducerKind::Verification, &lost_request)
+            .unwrap()
+            .expect("the journal keeps the interrupted attempt");
+        assert_eq!(
+            reservation.effect_outcome(),
+            Some(crate::state::ProducerEffectOutcome::Unknown)
+        );
+        assert!(matches!(
+            reservation.outcome,
+            Some(crate::state::ReservationOutcome::NeedsRerun { .. })
+        ));
+
+        let reloaded = state
+            .get_governed_task(&project_id, &claimed.id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            reloaded.verifications.is_empty(),
+            "an unrecorded verification must not appear as evidence of any outcome"
+        );
+        assert_eq!(
+            reloaded.review_state,
+            GovernedReviewState::AwaitingVerification,
+            "a lost response must not read as a failed verification"
+        );
+        assert!(reloaded.events.iter().any(|event| {
+            event.kind == GovernedTaskEventKind::ProducerReservationInterrupted
+                && event.detail.contains("effect outcome unknown")
+        }));
+
+        // The rerun is not blocked, says why it reruns, and confirms.
+        let ack = run_governed_verification(
+            &state,
+            GovernedVerificationRequest {
+                request_id: lost_request.clone(),
+                project_id: project_id.clone(),
+                task_id: reloaded.id.clone(),
+                expected_revision: reloaded.revision,
+            },
+        )
+        .await
+        .expect("the rerun proceeds");
+        assert!(!ack.replayed);
+        assert_eq!(
+            ack.pending_rerun_reason.as_deref(),
+            Some("interrupted before receipt")
+        );
+        assert!(ack.task.latest_verification().is_some());
+        let rerun = state
+            .latest_reservation(&reloaded.id, ProducerKind::Verification, &lost_request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rerun.effect_outcome(),
+            Some(crate::state::ProducerEffectOutcome::Confirmed)
         );
     }
 
