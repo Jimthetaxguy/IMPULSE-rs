@@ -10,7 +10,8 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 
 use super::actor_provenance::{
-    authorize_governed_mutation, mutation_authorization_needs_profile, ConnectionClass,
+    authorize_governed_mutation, mutation_authorization_needs_profile, ActorProvenanceError,
+    ConnectionClass,
 };
 use super::protocol::{
     request_type_name, respond_err, respond_ok, DaemonRequest, DaemonResponse, PROTOCOL_VERSION,
@@ -53,7 +54,9 @@ pub(crate) async fn build_supervisor_permission_state(
     state: &SharedState,
     supervisor_session_override: &Arc<RwLock<Option<impulse_ops::SupervisorPermissionPolicy>>>,
 ) -> Result<impulse_ops::SupervisorPermissionState> {
-    let config = state.config_snapshot()?;
+    // Read from disk, not this process's copy: a permission revoked with
+    // `impulse-rs config` while the daemon runs must take effect at once.
+    let config = state.current_config()?;
     let session_override = supervisor_session_override.read().await.clone();
     Ok(impulse_ops::SupervisorPermissionState::resolve(
         config.impulse_agent_permissions,
@@ -596,29 +599,26 @@ async fn run_supervisor_action(
             grant_tool_capabilities,
             ..
         } => {
-            let mut updated_policy = match scope {
-                impulse_ops::PermissionChangeScope::SessionOverride => {
-                    permission_state.effective.clone()
+            let grant = |policy: &mut impulse_ops::SupervisorPermissionPolicy| {
+                for permission in &grant_actions {
+                    policy.grant_action(*permission);
                 }
-                impulse_ops::PermissionChangeScope::PersistentDefault => {
-                    permission_state.baseline.clone()
+                for capability in &grant_tool_capabilities {
+                    policy.grant_tool_capability(*capability);
                 }
+                policy.normalize();
             };
-            for permission in grant_actions {
-                updated_policy.grant_action(permission);
-            }
-            for capability in grant_tool_capabilities {
-                updated_policy.grant_tool_capability(capability);
-            }
-            updated_policy.normalize();
-
             let next_state = match scope {
                 impulse_ops::PermissionChangeScope::SessionOverride => {
-                    *supervisor_session_override.write().await = Some(updated_policy.clone());
+                    let mut updated_policy = permission_state.effective.clone();
+                    grant(&mut updated_policy);
+                    *supervisor_session_override.write().await = Some(updated_policy);
                     build_supervisor_permission_state(state, supervisor_session_override).await?
                 }
                 impulse_ops::PermissionChangeScope::PersistentDefault => {
-                    state.update_impulse_agent_permissions(updated_policy.clone())?;
+                    // Granted onto the policy as it is on disk, not onto this
+                    // process's copy, so a revocation made meanwhile stands.
+                    state.update_impulse_agent_permissions(grant)?;
                     *supervisor_session_override.write().await = None;
                     build_supervisor_permission_state(state, supervisor_session_override).await?
                 }
@@ -679,9 +679,9 @@ async fn run_supervisor_action(
             })
         }
         impulse_ops::SupervisorAction::ResetBaselinePermissions { .. } => {
-            state.update_impulse_agent_permissions(
-                impulse_ops::SupervisorPermissionPolicy::default(),
-            )?;
+            state.update_impulse_agent_permissions(|policy| {
+                *policy = impulse_ops::SupervisorPermissionPolicy::default();
+            })?;
             *supervisor_session_override.write().await = None;
             let next_state =
                 build_supervisor_permission_state(state, supervisor_session_override).await?;
@@ -786,6 +786,15 @@ pub(crate) fn validate_request_fields(
     Ok(())
 }
 
+/// Whether `connection_class` may run `action`. A permission change is
+/// operator-only; every other supervisor action keeps its policy-based gate.
+pub(crate) fn supervisor_action_allowed(
+    action: &impulse_ops::SupervisorAction,
+    connection_class: ConnectionClass,
+) -> bool {
+    !action.changes_permissions() || connection_class.is_operator()
+}
+
 #[tracing::instrument(skip_all, fields(request_type = request_type_name(&request)))]
 pub(crate) async fn process_request(
     request: DaemonRequest,
@@ -884,7 +893,18 @@ pub(crate) async fn process_request(
             .await
         }
 
-        // Supervisor group
+        // Supervisor group. A permission change is operator-only, checked
+        // here because `handle_supervisor_request` never sees the class.
+        DaemonRequest::RunSupervisorAction { ref action }
+            if !supervisor_action_allowed(action, connection_class) =>
+        {
+            respond_err(format!(
+                "Supervisor action failed: {}",
+                ActorProvenanceError::OperatorClassRequired {
+                    request: "RunSupervisorAction",
+                }
+            ))
+        }
         DaemonRequest::GetSupervisorPermissions
         | DaemonRequest::SupervisorChat { .. }
         | DaemonRequest::RunSupervisorAction { .. }
@@ -1344,6 +1364,9 @@ pub(crate) async fn handle_governed_producer_request(
                     mutation: impulse_ops::governed_task::GovernedTaskMutation::SubmitClaim {
                         claim,
                     },
+                    // The worker's own lease token, never derived here: the
+                    // ledger fences a claim whose generation is stale.
+                    fencing_generation: request.generation,
                 };
                 (_producer_guard, mutation_request)
             }
@@ -2979,6 +3002,7 @@ mod governed_producer_handler_tests {
                                 id: "desktop-runtime".to_string(),
                             },
                         },
+                        fencing_generation: None,
                     },
                 },
                 &state,
@@ -3005,6 +3029,7 @@ mod governed_producer_handler_tests {
                             reason: Some("fixture exited".to_string()),
                             exit_kind: Default::default(),
                         },
+                        fencing_generation: None,
                     },
                 },
                 &mutation_state,
@@ -3082,6 +3107,7 @@ mod governed_producer_handler_tests {
                                 id: "desktop-runtime".to_string(),
                             },
                         },
+                        fencing_generation: None,
                     },
                 },
                 &state,
@@ -3110,6 +3136,7 @@ mod governed_producer_handler_tests {
                             diff_ref: None,
                         },
                     },
+                    fencing_generation: None,
                 },
             },
             &state,
@@ -3125,6 +3152,7 @@ mod governed_producer_handler_tests {
             expected_revision: running.revision,
             summary: "fixture implementation is complete".to_string(),
             artifact_ids: vec!["artifact-1".to_string()],
+            generation: None,
         };
         std::fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
         let dirty = handle_governed_producer_request(
@@ -3196,6 +3224,7 @@ mod governed_producer_handler_tests {
                             notes: None,
                         },
                     },
+                    fencing_generation: None,
                 },
             },
             &state,
@@ -3315,6 +3344,7 @@ mod governed_producer_handler_tests {
                             rationale: "forged".to_string(),
                         },
                     },
+                    fencing_generation: None,
                 },
             },
             &state,
@@ -3413,6 +3443,7 @@ mod governed_producer_handler_tests {
                                 rationale: "verified evidence accepted".to_string(),
                             },
                         },
+                        fencing_generation: None,
                     },
                 },
                 &state,
@@ -3465,6 +3496,7 @@ mod governed_producer_handler_tests {
             expected_revision: task.revision,
             summary: "implementation complete".into(),
             artifact_ids: Vec::new(),
+            generation: None,
         };
         let error = super::preflight_claim(&task, &request)
             .expect_err("a discarded staged checkout is not claimable");
@@ -3577,5 +3609,102 @@ mod request_validation_tests {
             session_id: "../escape".to_string(),
         };
         assert!(validate_request_fields(&request).is_err());
+    }
+}
+
+#[cfg(test)]
+mod supervisor_permission_gate_tests {
+    use std::sync::Arc;
+
+    use tokio::sync::RwLock;
+
+    use super::{process_request, supervisor_action_allowed, ProcessRequestContext};
+    use crate::daemon::actor_provenance::ConnectionClass;
+    use crate::daemon::protocol::{DaemonRequest, DaemonResponse};
+    use crate::state::State;
+
+    fn reset_baseline() -> impulse_ops::SupervisorAction {
+        impulse_ops::SupervisorAction::ResetBaselinePermissions { confirmed: true }
+    }
+
+    async fn run(
+        state: Arc<State>,
+        action: impulse_ops::SupervisorAction,
+        connection_class: ConnectionClass,
+    ) -> DaemonResponse {
+        let registry = crate::tooling::ToolRegistry::new();
+        let tool_context = crate::tooling::ToolContext::default();
+        let terminal_telemetry = Arc::new(RwLock::new(
+            crate::ops_workbench::TerminalOpsTelemetryStore::default(),
+        ));
+        let supervisor_session_override = Arc::new(RwLock::new(None));
+        let conflict_resolver = Arc::new(RwLock::new(
+            crate::agent::coordinator::ConflictResolver::new(),
+        ));
+        let delegation_tracker = Arc::new(RwLock::new(crate::delegation::DelegationTracker::new()));
+        let cached_agent = Arc::new(tokio::sync::Mutex::new(None));
+        process_request(
+            DaemonRequest::RunSupervisorAction { action },
+            ProcessRequestContext {
+                state,
+                registry: &registry,
+                tool_context: &tool_context,
+                terminal_telemetry: &terminal_telemetry,
+                supervisor_session_override: &supervisor_session_override,
+                conflict_resolver: &conflict_resolver,
+                delegation_tracker: &delegation_tracker,
+                cached_agent: &cached_agent,
+                connection_class,
+            },
+        )
+        .await
+    }
+
+    #[test]
+    fn test_supervisor_action_allowed_gates_only_permission_changes() {
+        assert!(!supervisor_action_allowed(
+            &reset_baseline(),
+            ConnectionClass::NonOperator
+        ));
+        assert!(supervisor_action_allowed(
+            &reset_baseline(),
+            ConnectionClass::Operator
+        ));
+        let search = impulse_ops::SupervisorAction::SearchMemory {
+            query: "q".to_string(),
+        };
+        assert!(supervisor_action_allowed(
+            &search,
+            ConnectionClass::NonOperator
+        ));
+    }
+
+    /// A same-UID client without the operator capability used to rewrite the
+    /// persisted supervisor policy by setting `confirmed: true` itself.
+    #[tokio::test]
+    async fn test_non_operator_cannot_change_supervisor_permissions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = Arc::new(State::new(dir.path().to_path_buf()).unwrap());
+        let escalate = impulse_ops::SupervisorAction::ModifyPermissions {
+            scope: impulse_ops::PermissionChangeScope::PersistentDefault,
+            grant_actions: vec![impulse_ops::SupervisorActionPermission::SendInput],
+            grant_tool_capabilities: Vec::new(),
+            confirmed: true,
+        };
+        let before = state.config_snapshot().unwrap().impulse_agent_permissions;
+
+        let response = run(Arc::clone(&state), escalate, ConnectionClass::NonOperator).await;
+
+        match response {
+            DaemonResponse::Error { message } => {
+                assert!(message.contains("operator-class connection"), "{message}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(
+            serde_json::to_value(state.config_snapshot().unwrap().impulse_agent_permissions)
+                .unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
     }
 }

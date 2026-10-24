@@ -34,6 +34,8 @@ pub enum OpsError {
     Json(#[from] serde_json::Error),
     #[error("missing artifact parent directory for {0}")]
     MissingParent(PathBuf),
+    #[error("artifact {field} `{value}` is not a single path segment")]
+    InvalidPathSegment { field: &'static str, value: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -250,7 +252,13 @@ pub struct ContextHealthSummary {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCapabilityId {
+    // `as_str` (and so the daemon's "Missing tool capabilities" error)
+    // spells these without the inner underscore; accept that spelling back
+    // too, so a client can grant the capability the error named. The wire
+    // name written stays `file_system_*`.
+    #[serde(alias = "filesystem_read")]
     FileSystemRead,
+    #[serde(alias = "filesystem_write")]
     FileSystemWrite,
     Network,
     PythonExec,
@@ -504,6 +512,20 @@ impl SupervisorAction {
                 SupervisorActionPermission::ModifyPermissions
             }
         }
+    }
+
+    /// Whether this action changes the supervisor's permission policy.
+    ///
+    /// These take effect for every later supervisor action, so the daemon
+    /// accepts them only from an operator-class connection (ADR-0018); the
+    /// `confirmed` field is the client's own claim and authorizes nothing.
+    pub fn changes_permissions(&self) -> bool {
+        matches!(
+            self,
+            Self::ModifyPermissions { .. }
+                | Self::ClearSessionOverride { .. }
+                | Self::ResetBaselinePermissions { .. }
+        )
     }
 
     pub fn confirmed(&self) -> bool {
@@ -952,7 +974,31 @@ pub fn artifact_file_path(
         .join(format!("{}.json", artifact_id))
 }
 
+/// Checks that an artifact's ids can each be used as one path segment.
+///
+/// `artifact_file_path` joins `project_id`, `agent_id` and `id` into a path,
+/// and acknowledge/apply re-save an artifact using the ids stored in its own
+/// JSON. A forged artifact with `"project_id": "../../.."` would otherwise
+/// make an operator's click write outside `.impulse`. Only what can leave a
+/// directory is refused, so existing ids (which may contain dots) still work.
+pub fn validate_artifact_path_ids(artifact: &ArtifactEnvelope) -> Result<(), OpsError> {
+    for (field, value) in [
+        ("project_id", artifact.project_id.as_str()),
+        ("agent_id", artifact.agent_id.as_str()),
+        ("id", artifact.id.as_str()),
+    ] {
+        if value.is_empty() || value == "." || value == ".." || value.contains(['/', '\\', '\0']) {
+            return Err(OpsError::InvalidPathSegment {
+                field,
+                value: value.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn save_artifact(impulse_dir: &Path, artifact: &ArtifactEnvelope) -> Result<PathBuf, OpsError> {
+    validate_artifact_path_ids(artifact)?;
     let path = artifact_file_path(
         impulse_dir,
         &artifact.project_id,
@@ -1048,6 +1094,58 @@ mod tests {
         assert_eq!(saved.id, "artifact-1");
     }
 
+    /// Path audit: acknowledge/apply re-save an artifact using the ids in
+    /// its own JSON, so a forged id must not steer the write outside.
+    #[test]
+    fn test_save_artifact_refuses_ids_that_leave_the_directory() {
+        let temp = TempDir::new().unwrap();
+        let impulse = temp.path().join(".impulse");
+        for (field, value) in [
+            ("project_id", "../../.."),
+            ("agent_id", "a/b"),
+            ("id", ".."),
+            ("id", ""),
+            ("project_id", "nul\0byte"),
+        ] {
+            let mut artifact = ArtifactEnvelope {
+                id: "artifact-1".into(),
+                project_id: "project-a".into(),
+                agent_id: "agent-a".into(),
+                ..Default::default()
+            };
+            match field {
+                "project_id" => artifact.project_id = value.into(),
+                "agent_id" => artifact.agent_id = value.into(),
+                _ => artifact.id = value.into(),
+            }
+            match save_artifact(&impulse, &artifact) {
+                Err(OpsError::InvalidPathSegment { field: refused, .. }) => {
+                    assert_eq!(refused, field)
+                }
+                other => panic!("{field}={value:?} must be refused, got {other:?}"),
+            }
+        }
+        // Nothing was written anywhere under the temp root.
+        assert!(!impulse.exists());
+        let err = OpsError::InvalidPathSegment {
+            field: "id",
+            value: "..".into(),
+        };
+        assert!(err.to_string().contains("not a single path segment"));
+    }
+
+    #[test]
+    fn test_save_artifact_accepts_ids_with_dots() {
+        let temp = TempDir::new().unwrap();
+        let artifact = ArtifactEnvelope {
+            id: "report.v2".into(),
+            project_id: "impulse.rs".into(),
+            agent_id: "agent-a".into(),
+            ..Default::default()
+        };
+        assert!(save_artifact(temp.path(), &artifact).unwrap().exists());
+    }
+
     #[test]
     fn test_supervisor_permission_state_resolve_layers_session_override() {
         let baseline = SupervisorPermissionPolicy::default();
@@ -1099,5 +1197,1012 @@ mod tests {
             serde_json::from_str::<WorkbenchDaemonResponse>(&json).unwrap(),
             response
         );
+    }
+
+    // ---- Wire contract shared with impulse-desktop -------------------------
+    //
+    // These models cross the daemon socket into the Dioxus host, so the JSON
+    // shape is a cross-process contract: tags and field names are pinned, and
+    // JSON from an older peer that omits defaulted fields must still parse.
+
+    /// Serialize, deserialize, compare, and hand back the JSON for pinning.
+    fn round_trip<T>(value: &T) -> serde_json::Value
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let json = serde_json::to_string(value).unwrap();
+        let decoded: T = serde_json::from_str(&json).unwrap();
+        assert_eq!(&decoded, value, "round trip changed the value: {json}");
+        serde_json::from_str(&json).unwrap()
+    }
+
+    fn context_health() -> ContextHealthSummary {
+        ContextHealthSummary {
+            tier: "warning".into(),
+            usage_fraction: 0.5,
+            estimated_tokens: 64_000,
+            window_tokens: 128_000,
+            compaction_count: 2,
+            injection_count: 3,
+            pending_review_count: 1,
+            recent_insights: vec![InsightRecord {
+                timestamp: Some("2026-10-23T10:00:00Z".into()),
+                agent_label: "Codex".into(),
+                kind: "decision".into(),
+                content: "use atomic writes".into(),
+            }],
+        }
+    }
+
+    fn tool_invocation() -> ToolInvocationRecord {
+        ToolInvocationRecord {
+            kind: "edit".into(),
+            target: "src/lib.rs".into(),
+            timestamp: Some("2026-10-23T10:01:00Z".into()),
+        }
+    }
+
+    fn diff_summary() -> DiffSummary {
+        DiffSummary {
+            files_changed: 2,
+            lines_added: 30,
+            lines_removed: 4,
+        }
+    }
+
+    fn agent_runtime() -> AgentRuntime {
+        let assignment = role_assignment::canonical_governed_builder_assignment();
+        let compatibility = role_assignment::evaluate_role_compatibility(
+            &agent_registry::AgentPlatformId::try_new("codex").unwrap(),
+            &[],
+            &assignment,
+        )
+        .unwrap();
+        AgentRuntime {
+            id: "agent-1".into(),
+            label: "Codex".into(),
+            backend_kind: "codex".into(),
+            session_id: Some("session-1".into()),
+            governed_task_id: Some(governed_task::GovernedTaskId::try_new("task-7").unwrap()),
+            governed_task_revision: Some(4),
+            ephemeral: true,
+            working_directory: "/workspace".into(),
+            status: "working: wire tests".into(),
+            current_task: Some("wire tests".into()),
+            active: true,
+            context: context_health(),
+            recent_files: vec!["src/lib.rs".into()],
+            recent_tools: vec!["Edit".into()],
+            warnings: vec!["context at 50%".into()],
+            agent_status: AgentStatus::Working {
+                task: "wire tests".into(),
+            },
+            role: Some(AgentRole::Worker { parent_pane_id: 3 }),
+            role_assignment: Some(assignment),
+            role_compatibility: Some(compatibility),
+            group: Some("builders".into()),
+            tool_invocations: vec![tool_invocation()],
+            diff_summary: Some(diff_summary()),
+            target: Some(MachineTarget::Remote {
+                user: "james".into(),
+                host: "build-box".into(),
+                workdir: "/srv/work".into(),
+                session_name: Some("impulse".into()),
+            }),
+        }
+    }
+
+    fn intervention() -> InterventionRecommendation {
+        InterventionRecommendation {
+            id: "intervention-1".into(),
+            title: "Pause pane 2".into(),
+            description: "Two agents edit src/lib.rs".into(),
+            severity: "high".into(),
+            action_kind: "focus_agent".into(),
+            action_label: "Focus".into(),
+            target_agent_id: Some("agent-2".into()),
+        }
+    }
+
+    fn terminal_ops_report() -> TerminalOpsReport {
+        TerminalOpsReport {
+            source_id: "desktop".into(),
+            published_at: "2026-10-23T10:02:00Z".into(),
+            agents: vec![agent_runtime()],
+            context: context_health(),
+            interventions: vec![intervention()],
+        }
+    }
+
+    fn artifact_envelope() -> ArtifactEnvelope {
+        ArtifactEnvelope {
+            id: "artifact-1".into(),
+            project_id: "project-a".into(),
+            agent_id: "agent-1".into(),
+            session_id: Some("session-1".into()),
+            kind: "review".into(),
+            schema: "impulse.review.v1".into(),
+            title: "Review".into(),
+            summary: "Two findings".into(),
+            payload: serde_json::json!({"findings": 2}),
+            view_hints: vec![ArtifactViewHint::SummaryCard, ArtifactViewHint::Diff],
+            actions: vec![ArtifactAction {
+                id: "apply".into(),
+                label: "Apply".into(),
+                kind: "apply_patch".into(),
+                requires_confirmation: true,
+                params_schema: serde_json::json!({"type": "object"}),
+            }],
+            status: ArtifactStatus::Staged,
+            created_at: "2026-10-23T10:03:00Z".into(),
+            related_files: vec![ArtifactFileRef {
+                path: "src/lib.rs".into(),
+                label: Some("library".into()),
+            }],
+            metadata: serde_json::json!({"source": "test"}),
+        }
+    }
+
+    fn delegation_summary() -> DelegationSummary {
+        DelegationSummary {
+            id: "delegation-1".into(),
+            task: "write wire tests".into(),
+            state: "completed".into(),
+            coordinator_pane_id: 1,
+            worker_pane_id: Some(2),
+            created_at: "2026-10-23T09:00:00Z".into(),
+            completed_at: Some("2026-10-23T09:30:00Z".into()),
+            tool_invocations: vec![tool_invocation()],
+            diff_summary: Some(diff_summary()),
+        }
+    }
+
+    fn ops_snapshot() -> ProjectOpsSnapshot {
+        ProjectOpsSnapshot {
+            generated_at: "2026-10-23T10:04:00Z".into(),
+            project: ProjectSummary {
+                id: "project-a".into(),
+                name: "Project A".into(),
+                root_path: "/workspace".into(),
+                impulse_path: "/workspace/.impulse".into(),
+            },
+            agents: vec![agent_runtime()],
+            interventions: vec![intervention()],
+            context: context_health(),
+            memory: MemorySummary {
+                active_sessions: 2,
+                history_entries: 40,
+                genome_decisions: 7,
+                last_genome_update: Some("2026-10-22T08:00:00Z".into()),
+            },
+            retrieval: RetrievalSummary {
+                mode: "hybrid".into(),
+                backend: "sqlite".into(),
+                vector_enabled: true,
+                semantic_strategy: "rrf".into(),
+            },
+            artifacts: vec![artifact_envelope()],
+            delegations: vec![delegation_summary()],
+            governed_tasks: Vec::new(),
+            memory_candidates: Vec::new(),
+        }
+    }
+
+    fn every_supervisor_action() -> Vec<(&'static str, SupervisorAction)> {
+        vec![
+            (
+                "focus_agent",
+                SupervisorAction::FocusAgent {
+                    agent_id: "agent-1".into(),
+                    session_id: Some("session-1".into()),
+                },
+            ),
+            (
+                "send_input",
+                SupervisorAction::SendInput {
+                    agent_id: "agent-1".into(),
+                    session_id: Some("session-1".into()),
+                    content: "continue".into(),
+                    confirmed: true,
+                },
+            ),
+            (
+                "inject_context",
+                SupervisorAction::InjectContext {
+                    agent_id: Some("agent-1".into()),
+                    session_id: Some("session-1".into()),
+                    query: "atomic writes".into(),
+                    confirmed: true,
+                },
+            ),
+            (
+                "cleanup_context",
+                SupervisorAction::CleanupContext {
+                    agent_id: Some("agent-1".into()),
+                    session_id: Some("session-1".into()),
+                    goal: Some("drop stale logs".into()),
+                    confirmed: true,
+                },
+            ),
+            (
+                "handoff_context",
+                SupervisorAction::HandoffContext {
+                    session_id: Some("session-1".into()),
+                    target_tool: "codex".into(),
+                    task: "finish review".into(),
+                    notes: Some("see PR".into()),
+                    confirmed: true,
+                },
+            ),
+            (
+                "open_artifact_review",
+                SupervisorAction::OpenArtifactReview {
+                    artifact_id: "artifact-1".into(),
+                },
+            ),
+            (
+                "search_memory",
+                SupervisorAction::SearchMemory {
+                    query: "serde".into(),
+                },
+            ),
+            (
+                "modify_permissions",
+                SupervisorAction::ModifyPermissions {
+                    scope: PermissionChangeScope::PersistentDefault,
+                    grant_actions: vec![SupervisorActionPermission::SendInput],
+                    grant_tool_capabilities: vec![ToolCapabilityId::Network],
+                    confirmed: true,
+                },
+            ),
+            (
+                "clear_session_override",
+                SupervisorAction::ClearSessionOverride { confirmed: true },
+            ),
+            (
+                "reset_baseline_permissions",
+                SupervisorAction::ResetBaselinePermissions { confirmed: true },
+            ),
+        ]
+    }
+
+    fn permission_state() -> SupervisorPermissionState {
+        SupervisorPermissionState::resolve(
+            SupervisorPermissionPolicy::default(),
+            Some(SupervisorPermissionPolicy {
+                allowed_actions: vec![SupervisorActionPermission::InjectContext],
+                allowed_tool_capabilities: vec![ToolCapabilityId::PythonExec],
+                require_confirmation_actions: vec![SupervisorActionPermission::FocusAgent],
+            }),
+        )
+    }
+
+    #[test]
+    fn test_workbench_request_every_variant_round_trips_with_its_type_tag() {
+        use governed_task as gt;
+        let request_id = |id: &str| gt::GovernedRequestId::try_new(id).unwrap();
+        let task_id = || gt::GovernedTaskId::try_new("task-7").unwrap();
+        let registration = gt::GovernedTaskRegistration::builder(
+            "request-register",
+            "task-7",
+            "demo",
+            "/tmp/demo",
+            "pin the wire contract",
+            "agent-1",
+            "codex",
+        )
+        .build()
+        .unwrap();
+        let requests = vec![
+            WorkbenchDaemonRequest::Ping,
+            WorkbenchDaemonRequest::Status,
+            WorkbenchDaemonRequest::PresentOperatorCapability(
+                operator_capability::OperatorCapabilityPresentation {
+                    token: "f".repeat(64),
+                },
+            ),
+            WorkbenchDaemonRequest::ListSessions,
+            WorkbenchDaemonRequest::CreateSession {
+                name: "wire".into(),
+                platform: Some("codex".into()),
+            },
+            WorkbenchDaemonRequest::EndSession {
+                session_id: "s-1".into(),
+                summary: "done".into(),
+            },
+            WorkbenchDaemonRequest::TrackFile {
+                session_id: "s-1".into(),
+                file_path: "src/lib.rs".into(),
+            },
+            WorkbenchDaemonRequest::InvokeTool {
+                name: "system_info".into(),
+                params: serde_json::json!({"verbose": true}),
+            },
+            WorkbenchDaemonRequest::ToolSchema,
+            WorkbenchDaemonRequest::GetOpsSnapshot,
+            WorkbenchDaemonRequest::SubscribeOps { since_seq: Some(9) },
+            WorkbenchDaemonRequest::PublishTerminalOps {
+                report: terminal_ops_report(),
+            },
+            WorkbenchDaemonRequest::GetSupervisorPermissions,
+            WorkbenchDaemonRequest::SupervisorChat {
+                prompt: "status?".into(),
+                context: Some("two panes".into()),
+            },
+            WorkbenchDaemonRequest::RunSupervisorAction {
+                action: SupervisorAction::SearchMemory {
+                    query: "serde".into(),
+                },
+            },
+            WorkbenchDaemonRequest::RunArtifactAction {
+                artifact_id: "artifact-1".into(),
+                action_id: "apply".into(),
+                params: serde_json::json!({"note": "ok"}),
+            },
+            WorkbenchDaemonRequest::RegisterGovernedTask { registration },
+            WorkbenchDaemonRequest::GetGovernedTask {
+                project_id: "demo".into(),
+                task_id: task_id(),
+            },
+            WorkbenchDaemonRequest::ListGovernedTasks {
+                project_id: "demo".into(),
+            },
+            WorkbenchDaemonRequest::MutateGovernedTask {
+                request: gt::GovernedTaskMutationRequest {
+                    request_id: request_id("request-mutate"),
+                    project_id: "demo".into(),
+                    task_id: task_id(),
+                    expected_revision: 1,
+                    mutation: gt::GovernedTaskMutation::MarkRunning {
+                        actor: gt::GovernedActor {
+                            kind: gt::GovernedActorKind::System,
+                            id: "desktop".into(),
+                        },
+                    },
+                    fencing_generation: Some(1),
+                },
+            },
+            WorkbenchDaemonRequest::SubmitGovernedClaim {
+                request: gt::GovernedClaimRequest {
+                    request_id: request_id("request-claim"),
+                    project_id: "demo".into(),
+                    task_id: task_id(),
+                    expected_revision: 2,
+                    summary: "implemented".into(),
+                    artifact_ids: vec!["artifact-1".into()],
+                    generation: Some(1),
+                },
+            },
+            WorkbenchDaemonRequest::RunGovernedVerification {
+                request: gt::GovernedVerificationRequest {
+                    request_id: request_id("request-verify"),
+                    project_id: "demo".into(),
+                    task_id: task_id(),
+                    expected_revision: 3,
+                },
+            },
+            WorkbenchDaemonRequest::RunGovernedSupervisorReview {
+                request: gt::GovernedSupervisorReviewRequest {
+                    request_id: request_id("request-review"),
+                    project_id: "demo".into(),
+                    task_id: task_id(),
+                    expected_revision: 4,
+                },
+            },
+            WorkbenchDaemonRequest::PromoteGovernedOutcome {
+                request: governed_wiring::GovernedPromotionRequest {
+                    request_id: request_id("request-promote"),
+                    project_id: "demo".into(),
+                    task_id: task_id(),
+                    expected_revision: 5,
+                },
+            },
+            WorkbenchDaemonRequest::DiscardGovernedStagedWorktree {
+                request: governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                    request_id: request_id("request-discard"),
+                    project_id: "demo".into(),
+                    task_id: task_id(),
+                    expected_revision: 6,
+                    reason: "rejected".into(),
+                },
+            },
+            WorkbenchDaemonRequest::GuardList,
+            WorkbenchDaemonRequest::GetConflictHistory,
+            WorkbenchDaemonRequest::ClearResolvedConflicts,
+        ];
+
+        let mut seen = std::collections::BTreeSet::new();
+        for request in &requests {
+            // Exhaustive on purpose: a new variant fails to compile here until
+            // its wire tag is pinned and a value is added above.
+            let (tag, unit) = match request {
+                WorkbenchDaemonRequest::Ping => ("Ping", true),
+                WorkbenchDaemonRequest::Status => ("Status", true),
+                WorkbenchDaemonRequest::PresentOperatorCapability(_) => {
+                    ("PresentOperatorCapability", false)
+                }
+                WorkbenchDaemonRequest::ListSessions => ("ListSessions", true),
+                WorkbenchDaemonRequest::CreateSession { .. } => ("CreateSession", false),
+                WorkbenchDaemonRequest::EndSession { .. } => ("EndSession", false),
+                WorkbenchDaemonRequest::TrackFile { .. } => ("TrackFile", false),
+                WorkbenchDaemonRequest::InvokeTool { .. } => ("InvokeTool", false),
+                WorkbenchDaemonRequest::ToolSchema => ("ToolSchema", true),
+                WorkbenchDaemonRequest::GetOpsSnapshot => ("GetOpsSnapshot", true),
+                WorkbenchDaemonRequest::SubscribeOps { .. } => ("SubscribeOps", false),
+                WorkbenchDaemonRequest::PublishTerminalOps { .. } => ("PublishTerminalOps", false),
+                WorkbenchDaemonRequest::GetSupervisorPermissions => {
+                    ("GetSupervisorPermissions", true)
+                }
+                WorkbenchDaemonRequest::SupervisorChat { .. } => ("SupervisorChat", false),
+                WorkbenchDaemonRequest::RunSupervisorAction { .. } => {
+                    ("RunSupervisorAction", false)
+                }
+                WorkbenchDaemonRequest::RunArtifactAction { .. } => ("RunArtifactAction", false),
+                WorkbenchDaemonRequest::RegisterGovernedTask { .. } => {
+                    ("RegisterGovernedTask", false)
+                }
+                WorkbenchDaemonRequest::GetGovernedTask { .. } => ("GetGovernedTask", false),
+                WorkbenchDaemonRequest::ListGovernedTasks { .. } => ("ListGovernedTasks", false),
+                WorkbenchDaemonRequest::MutateGovernedTask { .. } => ("MutateGovernedTask", false),
+                WorkbenchDaemonRequest::SubmitGovernedClaim { .. } => {
+                    ("SubmitGovernedClaim", false)
+                }
+                WorkbenchDaemonRequest::RunGovernedVerification { .. } => {
+                    ("RunGovernedVerification", false)
+                }
+                WorkbenchDaemonRequest::RunGovernedSupervisorReview { .. } => {
+                    ("RunGovernedSupervisorReview", false)
+                }
+                WorkbenchDaemonRequest::PromoteGovernedOutcome { .. } => {
+                    ("PromoteGovernedOutcome", false)
+                }
+                WorkbenchDaemonRequest::DiscardGovernedStagedWorktree { .. } => {
+                    ("DiscardGovernedStagedWorktree", false)
+                }
+                WorkbenchDaemonRequest::GuardList => ("GuardList", true),
+                WorkbenchDaemonRequest::GetConflictHistory => ("GetConflictHistory", true),
+                WorkbenchDaemonRequest::ClearResolvedConflicts => ("ClearResolvedConflicts", true),
+            };
+            let json = round_trip(request);
+            assert_eq!(json["type"], tag);
+            assert_eq!(json.get("data").is_none(), unit, "data presence for {tag}");
+            assert!(seen.insert(tag), "duplicate {tag}");
+        }
+        assert_eq!(
+            seen.len(),
+            28,
+            "every WorkbenchDaemonRequest variant is listed"
+        );
+    }
+
+    #[test]
+    fn test_workbench_request_omitting_defaulted_fields_parses() {
+        let parse = |value: serde_json::Value| {
+            serde_json::from_value::<WorkbenchDaemonRequest>(value).unwrap()
+        };
+        assert_eq!(
+            parse(serde_json::json!({"type": "InvokeTool", "data": {"name": "system_info"}})),
+            WorkbenchDaemonRequest::InvokeTool {
+                name: "system_info".into(),
+                params: serde_json::Value::Null,
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type": "SubscribeOps", "data": {}})),
+            WorkbenchDaemonRequest::SubscribeOps { since_seq: None }
+        );
+        assert_eq!(
+            parse(serde_json::json!({
+                "type": "RunArtifactAction",
+                "data": {"artifact_id": "a", "action_id": "b"}
+            })),
+            WorkbenchDaemonRequest::RunArtifactAction {
+                artifact_id: "a".into(),
+                action_id: "b".into(),
+                params: serde_json::Value::Null,
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type": "CreateSession", "data": {"name": "n"}})),
+            WorkbenchDaemonRequest::CreateSession {
+                name: "n".into(),
+                platform: None,
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"type": "SupervisorChat", "data": {"prompt": "p"}})),
+            WorkbenchDaemonRequest::SupervisorChat {
+                prompt: "p".into(),
+                context: None,
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({
+                "type": "PublishTerminalOps",
+                "data": {"report": {"source_id": "desktop", "published_at": "t"}}
+            })),
+            WorkbenchDaemonRequest::PublishTerminalOps {
+                report: TerminalOpsReport {
+                    source_id: "desktop".into(),
+                    published_at: "t".into(),
+                    ..Default::default()
+                },
+            }
+        );
+        assert!(serde_json::from_value::<WorkbenchDaemonRequest>(
+            serde_json::json!({"type": "Nope"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_workbench_response_every_variant_round_trips_with_its_type_tag() {
+        let responses = [
+            (
+                "Ok",
+                WorkbenchDaemonResponse::Ok {
+                    result: serde_json::json!({"sessions": 2}),
+                },
+            ),
+            (
+                "Error",
+                WorkbenchDaemonResponse::Error {
+                    message: "no such task".into(),
+                },
+            ),
+            (
+                "Busy",
+                WorkbenchDaemonResponse::Busy {
+                    resource: DaemonBusyResource::AgentTurn,
+                    retry_after_ms: 250,
+                },
+            ),
+            (
+                "ConflictCheck",
+                WorkbenchDaemonResponse::ConflictCheck {
+                    has_conflict: true,
+                    conflicting_sessions: vec!["s-1".into(), "s-2".into()],
+                },
+            ),
+        ];
+        for (tag, response) in &responses {
+            let json = round_trip(response);
+            assert_eq!(json["type"], *tag);
+            assert!(json["data"].is_object());
+        }
+    }
+
+    #[test]
+    fn test_tool_capability_id_wire_names_and_as_str_spelling_both_parse() {
+        let cases = [
+            (ToolCapabilityId::FileSystemRead, "file_system_read"),
+            (ToolCapabilityId::FileSystemWrite, "file_system_write"),
+            (ToolCapabilityId::Network, "network"),
+            (ToolCapabilityId::PythonExec, "python_exec"),
+            (ToolCapabilityId::SystemInfo, "system_info"),
+        ];
+        for (capability, wire) in cases {
+            assert_eq!(round_trip(&capability), wire);
+        }
+        // `as_str` (used in the daemon's error text) spells the filesystem
+        // pair without the inner underscore; that spelling is accepted back
+        // so a client can grant exactly what the error named.
+        assert_eq!(ToolCapabilityId::FileSystemRead.as_str(), "filesystem_read");
+        for capability in [
+            ToolCapabilityId::FileSystemRead,
+            ToolCapabilityId::FileSystemWrite,
+        ] {
+            let named_in_error = format!("\"{}\"", capability.as_str());
+            assert_eq!(
+                serde_json::from_str::<ToolCapabilityId>(&named_in_error).unwrap(),
+                capability
+            );
+        }
+        for capability in [
+            ToolCapabilityId::Network,
+            ToolCapabilityId::PythonExec,
+            ToolCapabilityId::SystemInfo,
+        ] {
+            assert_eq!(round_trip(&capability), capability.as_str());
+        }
+    }
+
+    #[test]
+    fn test_supervisor_permission_wire_names_match_as_str() {
+        let permissions = [
+            SupervisorActionPermission::MonitorAgents,
+            SupervisorActionPermission::FocusAgent,
+            SupervisorActionPermission::OpenReview,
+            SupervisorActionPermission::SearchMemory,
+            SupervisorActionPermission::ModifyPermissions,
+            SupervisorActionPermission::SendInput,
+            SupervisorActionPermission::InjectContext,
+            SupervisorActionPermission::CleanupContext,
+            SupervisorActionPermission::HandoffContext,
+        ];
+        for permission in permissions {
+            assert_eq!(round_trip(&permission), permission.as_str());
+        }
+        assert_eq!(
+            round_trip(&PermissionChangeScope::SessionOverride),
+            "session_override"
+        );
+        assert_eq!(
+            round_trip(&PermissionChangeScope::PersistentDefault),
+            "persistent_default"
+        );
+    }
+
+    #[test]
+    fn test_supervisor_permission_policy_round_trips_and_fills_missing_lists() {
+        let policy = SupervisorPermissionPolicy {
+            allowed_actions: vec![SupervisorActionPermission::SendInput],
+            allowed_tool_capabilities: vec![ToolCapabilityId::Network],
+            require_confirmation_actions: vec![],
+        };
+        round_trip(&policy);
+
+        // Container-level `serde(default)`: each missing list keeps the default.
+        assert_eq!(
+            serde_json::from_str::<SupervisorPermissionPolicy>("{}").unwrap(),
+            SupervisorPermissionPolicy::default()
+        );
+        let partial: SupervisorPermissionPolicy =
+            serde_json::from_str(r#"{"allowed_actions":["send_input"]}"#).unwrap();
+        assert_eq!(
+            partial.allowed_actions,
+            vec![SupervisorActionPermission::SendInput]
+        );
+        assert_eq!(
+            partial.require_confirmation_actions,
+            SupervisorPermissionPolicy::default().require_confirmation_actions
+        );
+    }
+
+    #[test]
+    fn test_supervisor_permission_state_round_trips_and_omitted_override_is_none() {
+        let state = permission_state();
+        assert!(state.session_override_active());
+        round_trip(&state);
+
+        let mut json = serde_json::to_value(&state).unwrap();
+        json.as_object_mut().unwrap().remove("session_override");
+        let decoded: SupervisorPermissionState = serde_json::from_value(json).unwrap();
+        assert!(decoded.session_override.is_none());
+        assert_eq!(decoded.effective, state.effective);
+    }
+
+    #[test]
+    fn test_supervisor_action_every_kind_round_trips_and_matches_permission() {
+        let actions = every_supervisor_action();
+        assert_eq!(actions.len(), 10);
+        for (kind, action) in &actions {
+            let json = round_trip(action);
+            assert_eq!(json["kind"], *kind);
+            assert!(action.confirmed());
+        }
+    }
+
+    #[test]
+    fn test_supervisor_action_minimal_json_fills_defaults() {
+        let parse =
+            |value: serde_json::Value| serde_json::from_value::<SupervisorAction>(value).unwrap();
+        assert_eq!(
+            parse(serde_json::json!({"kind": "focus_agent", "agent_id": "a"})),
+            SupervisorAction::FocusAgent {
+                agent_id: "a".into(),
+                session_id: None,
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"kind": "send_input", "agent_id": "a", "content": "c"})),
+            SupervisorAction::SendInput {
+                agent_id: "a".into(),
+                session_id: None,
+                content: "c".into(),
+                confirmed: false,
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"kind": "inject_context", "query": "q"})),
+            SupervisorAction::InjectContext {
+                agent_id: None,
+                session_id: None,
+                query: "q".into(),
+                confirmed: false,
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"kind": "cleanup_context"})),
+            SupervisorAction::CleanupContext {
+                agent_id: None,
+                session_id: None,
+                goal: None,
+                confirmed: false,
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"kind": "handoff_context", "target_tool": "t", "task": "k"})),
+            SupervisorAction::HandoffContext {
+                session_id: None,
+                target_tool: "t".into(),
+                task: "k".into(),
+                notes: None,
+                confirmed: false,
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"kind": "modify_permissions", "scope": "session_override"})),
+            SupervisorAction::ModifyPermissions {
+                scope: PermissionChangeScope::SessionOverride,
+                grant_actions: vec![],
+                grant_tool_capabilities: vec![],
+                confirmed: false,
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"kind": "clear_session_override"})),
+            SupervisorAction::ClearSessionOverride { confirmed: false }
+        );
+        assert_eq!(
+            parse(serde_json::json!({"kind": "reset_baseline_permissions"})),
+            SupervisorAction::ResetBaselinePermissions { confirmed: false }
+        );
+    }
+
+    #[test]
+    fn test_supervisor_results_round_trip_and_minimal_json_parses() {
+        let proposal = SupervisorProposal {
+            id: "proposal-1".into(),
+            title: "Inject context".into(),
+            description: "Give agent-1 the ADR".into(),
+            action_label: "Inject".into(),
+            action: every_supervisor_action().remove(2).1,
+            missing_actions: vec![SupervisorActionPermission::InjectContext],
+            missing_tool_capabilities: vec![ToolCapabilityId::FileSystemWrite],
+            requires_confirmation: true,
+        };
+        round_trip(&proposal);
+        round_trip(&SupervisorChatResult {
+            response: "Two agents are active".into(),
+            proposals: vec![proposal],
+            permission_state: permission_state(),
+        });
+        round_trip(&SupervisorActionResult {
+            status: "ok".into(),
+            message: "focused".into(),
+            local_action: Some(every_supervisor_action().remove(0).1),
+            permission_state: Some(permission_state()),
+            artifact_id: Some("artifact-1".into()),
+            payload: Some(serde_json::json!({"focused": "agent-1"})),
+        });
+
+        let minimal_proposal: SupervisorProposal = serde_json::from_value(serde_json::json!({
+            "id": "p", "title": "t", "description": "d", "action_label": "l",
+            "action": {"kind": "search_memory", "query": "q"}
+        }))
+        .unwrap();
+        assert!(minimal_proposal.missing_actions.is_empty());
+        assert!(minimal_proposal.missing_tool_capabilities.is_empty());
+        assert!(!minimal_proposal.requires_confirmation);
+
+        let state = serde_json::to_value(permission_state()).unwrap();
+        let minimal_chat: SupervisorChatResult =
+            serde_json::from_value(serde_json::json!({"response": "r", "permission_state": state}))
+                .unwrap();
+        assert!(minimal_chat.proposals.is_empty());
+
+        let minimal_result: SupervisorActionResult =
+            serde_json::from_value(serde_json::json!({"status": "ok", "message": "m"})).unwrap();
+        assert!(minimal_result.local_action.is_none());
+        assert!(minimal_result.permission_state.is_none());
+        assert!(minimal_result.artifact_id.is_none());
+        assert!(minimal_result.payload.is_none());
+    }
+
+    #[test]
+    fn test_agent_status_state_tag_matches_as_str_for_every_variant() {
+        let statuses = [
+            AgentStatus::Starting,
+            AgentStatus::Idle,
+            AgentStatus::Working { task: "t".into() },
+            AgentStatus::Blocked { reason: "r".into() },
+            AgentStatus::Interrupted,
+            AgentStatus::Completed,
+        ];
+        for status in &statuses {
+            let json = round_trip(status);
+            assert_eq!(json["state"], status.as_str());
+        }
+        assert_eq!(
+            round_trip(&AgentStatus::Working { task: "t".into() }),
+            serde_json::json!({"state": "working", "task": "t"})
+        );
+        assert_eq!(
+            round_trip(&AgentStatus::Blocked { reason: "r".into() }),
+            serde_json::json!({"state": "blocked", "reason": "r"})
+        );
+    }
+
+    #[test]
+    fn test_agent_role_wire_shapes() {
+        assert_eq!(round_trip(&AgentRole::Coordinator), "coordinator");
+        assert_eq!(
+            round_trip(&AgentRole::Worker { parent_pane_id: 3 }),
+            serde_json::json!({"worker": {"parent_pane_id": 3}})
+        );
+    }
+
+    #[test]
+    fn test_machine_target_kinds_round_trip_and_session_name_is_optional() {
+        assert_eq!(
+            round_trip(&MachineTarget::Local {
+                workdir: "/w".into()
+            }),
+            serde_json::json!({"kind": "local", "workdir": "/w"})
+        );
+        let remote = round_trip(&MachineTarget::Remote {
+            user: "u".into(),
+            host: "h".into(),
+            workdir: "/w".into(),
+            session_name: Some("s".into()),
+        });
+        assert_eq!(remote["kind"], "remote");
+        let minimal: MachineTarget = serde_json::from_value(
+            serde_json::json!({"kind": "remote", "user": "u", "host": "h", "workdir": "/w"}),
+        )
+        .unwrap();
+        assert_eq!(
+            minimal,
+            MachineTarget::Remote {
+                user: "u".into(),
+                host: "h".into(),
+                workdir: "/w".into(),
+                session_name: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_delegation_and_tool_records_round_trip_and_minimal_json_parses() {
+        round_trip(&tool_invocation());
+        round_trip(&diff_summary());
+        round_trip(&delegation_summary());
+
+        let minimal: DelegationSummary = serde_json::from_value(serde_json::json!({
+            "id": "d", "task": "t", "state": "pending", "coordinator_pane_id": 1,
+            "created_at": "c"
+        }))
+        .unwrap();
+        assert!(minimal.worker_pane_id.is_none());
+        assert!(minimal.completed_at.is_none());
+        assert!(minimal.tool_invocations.is_empty());
+        assert!(minimal.diff_summary.is_none());
+
+        let record: ToolInvocationRecord =
+            serde_json::from_value(serde_json::json!({"kind": "k", "target": "t"})).unwrap();
+        assert!(record.timestamp.is_none());
+    }
+
+    #[test]
+    fn test_agent_runtime_full_value_round_trips_and_omits_unset_governed_fields() {
+        let runtime = agent_runtime();
+        let json = round_trip(&runtime);
+        assert_eq!(json["governed_task_id"], "task-7");
+        assert_eq!(json["governed_task_revision"], 4);
+        assert_eq!(json["agent_status"]["state"], "working");
+        assert_eq!(json["target"]["kind"], "remote");
+
+        let bare = serde_json::to_value(AgentRuntime::default()).unwrap();
+        for key in [
+            "governed_task_id",
+            "governed_task_revision",
+            "role_assignment",
+            "role_compatibility",
+        ] {
+            assert!(bare.get(key).is_none(), "{key} should be skipped when None");
+        }
+    }
+
+    #[test]
+    fn test_summary_records_round_trip() {
+        round_trip(&context_health());
+        round_trip(&intervention());
+        round_trip(&terminal_ops_report());
+        let snapshot = ops_snapshot();
+        round_trip(&snapshot.project);
+        round_trip(&snapshot.memory);
+        round_trip(&snapshot.retrieval);
+        round_trip(&snapshot.context.recent_insights[0]);
+    }
+
+    #[test]
+    fn test_artifact_enum_wire_names() {
+        let hints = [
+            (ArtifactViewHint::SummaryCard, "summary_card"),
+            (ArtifactViewHint::Table, "table"),
+            (ArtifactViewHint::Timeline, "timeline"),
+            (ArtifactViewHint::Diff, "diff"),
+            (ArtifactViewHint::Log, "log"),
+            (ArtifactViewHint::Markdown, "markdown"),
+            (ArtifactViewHint::RawJson, "raw_json"),
+        ];
+        for (hint, wire) in &hints {
+            assert_eq!(round_trip(hint), *wire);
+        }
+        let statuses = [
+            (ArtifactStatus::Ready, "ready"),
+            (ArtifactStatus::Staged, "staged"),
+            (ArtifactStatus::Pending, "pending"),
+            (ArtifactStatus::Applied, "applied"),
+            (ArtifactStatus::Acknowledged, "acknowledged"),
+        ];
+        for (status, wire) in &statuses {
+            assert_eq!(round_trip(status), *wire);
+        }
+    }
+
+    #[test]
+    fn test_artifact_envelope_round_trips_and_minimal_json_parses() {
+        let artifact = artifact_envelope();
+        round_trip(&artifact);
+        round_trip(&artifact.actions[0]);
+        round_trip(&artifact.related_files[0]);
+        round_trip(&ArtifactActionResult {
+            status: "applied".into(),
+            message: "patch applied".into(),
+            artifact: Some(artifact),
+            payload: Some(serde_json::json!({"files": 2})),
+        });
+
+        let minimal: ArtifactEnvelope = serde_json::from_value(serde_json::json!({
+            "id": "a", "project_id": "p", "agent_id": "g", "kind": "k", "schema": "s"
+        }))
+        .unwrap();
+        assert_eq!(minimal.status, ArtifactStatus::Ready);
+        assert!(minimal.session_id.is_none());
+        assert!(minimal.title.is_empty());
+        assert!(minimal.payload.is_null());
+        assert!(minimal.view_hints.is_empty());
+        assert!(minimal.actions.is_empty());
+        assert!(minimal.related_files.is_empty());
+        assert!(minimal.metadata.is_null());
+
+        let action: ArtifactAction =
+            serde_json::from_value(serde_json::json!({"id": "i", "label": "l", "kind": "k"}))
+                .unwrap();
+        assert!(!action.requires_confirmation);
+        assert!(action.params_schema.is_null());
+    }
+
+    #[test]
+    fn test_ops_snapshot_and_subscription_round_trip() {
+        let snapshot = ops_snapshot();
+        let json = round_trip(&snapshot);
+        assert_eq!(json["delegations"][0]["id"], "delegation-1");
+        round_trip(&OpsSubscription {
+            snapshot,
+            events: vec![OpsEvent {
+                seq: 12,
+                kind: "agent_status".into(),
+                severity: "info".into(),
+                title: "agent-1 working".into(),
+                detail: "wire tests".into(),
+                agent_id: Some("agent-1".into()),
+                created_at: "2026-10-23T10:05:00Z".into(),
+            }],
+            next_seq: 13,
+        });
+
+        // Snapshots from a peer that predates delegations still load.
+        let mut legacy = serde_json::to_value(ops_snapshot()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        for key in ["delegations", "governed_tasks", "memory_candidates"] {
+            object.remove(key);
+        }
+        let decoded: ProjectOpsSnapshot = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.delegations.is_empty());
+        assert!(decoded.governed_tasks.is_empty());
+        assert!(decoded.memory_candidates.is_empty());
     }
 }

@@ -154,3 +154,122 @@ pub fn register_all(registry: &mut ToolRegistry) -> Result<(), ToolError> {
     registry.register(Box::new(WipeTool))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod path_param_guard {
+    use crate::tooling::{ParamType, ToolRegistry};
+
+    /// The executor's path sandbox (`validate_paths`) only checks params
+    /// declared `ParamType::FilePath`. A path-like param declared `String`
+    /// skips it, which is how `scan_paths` reached outside its roots. Each
+    /// exception below validates the value inside the tool itself.
+    const VALIDATED_IN_TOOL: &[(&str, &str)] = &[
+        // parse_hygiene_config checks every entry with is_path_allowed.
+        ("build_health", "scan_paths"),
+        ("sweep", "scan_paths"),
+        ("wipe", "scan_paths"),
+        ("clean_all", "scan_paths"),
+        // resolve_and_validate_memory_dir allows a closed set of dirs.
+        ("genome_read", "impulse_dir"),
+        ("memory_search", "impulse_dir"),
+    ];
+
+    #[test]
+    fn test_path_like_params_are_declared_as_file_paths() {
+        let registry = ToolRegistry::with_defaults();
+        for descriptor in registry.list() {
+            for param in &descriptor.params {
+                let name = param.name.to_lowercase();
+                let path_like = ["path", "dir", "root"]
+                    .iter()
+                    .any(|word| name.contains(word))
+                    && !name.starts_with("create_");
+                if !path_like || param.param_type == ParamType::FilePath {
+                    continue;
+                }
+                assert!(
+                    VALIDATED_IN_TOOL.contains(&(descriptor.id.as_str(), param.name.as_str())),
+                    "{}.{} looks like a path but is {:?}: declare it FilePath so the \
+                     executor sandboxes it, or validate it in the tool and add it to \
+                     VALIDATED_IN_TOOL",
+                    descriptor.id,
+                    param.name,
+                    param.param_type
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tooling::Capability::{
+        FileSystemRead, FileSystemWrite, PythonExec, ShellExec, SystemInfo,
+    };
+
+    /// Every built-in and the capabilities it declares (deny-by-default,
+    /// CLAUDE.md principle 5). Changing what a tool may do should mean
+    /// changing this table on purpose, not drifting in a refactor.
+    const EXPECTED: &[(&str, &[crate::tooling::Capability])] = &[
+        ("bash_exec", &[ShellExec]),
+        ("benchmark", &[PythonExec]),
+        ("build_health", &[FileSystemRead]),
+        ("calculator", &[PythonExec]),
+        ("clean_all", &[FileSystemRead, FileSystemWrite]),
+        ("config_get", &[FileSystemRead]),
+        ("file_read", &[FileSystemRead]),
+        ("file_write", &[FileSystemWrite]),
+        ("genome_read", &[FileSystemRead]),
+        ("handoff", &[FileSystemRead, FileSystemWrite]),
+        ("health_check", &[FileSystemRead]),
+        ("memory_search", &[FileSystemRead]),
+        ("python_exec", &[PythonExec]),
+        ("sccache_setup", &[FileSystemWrite]),
+        ("sccache_status", &[SystemInfo]),
+        ("session_query", &[FileSystemRead]),
+        ("steward_status", &[FileSystemRead]),
+        ("sweep", &[FileSystemRead, FileSystemWrite]),
+        ("system_info", &[SystemInfo]),
+        ("tool_availability", &[SystemInfo]),
+        ("wipe", &[FileSystemRead, FileSystemWrite]),
+    ];
+
+    fn registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        register_all(&mut registry).expect("built-ins register");
+        registry
+    }
+
+    #[test]
+    fn test_register_all_registers_exactly_the_expected_tools() {
+        let registry = registry();
+        let mut registered: Vec<String> = registry.list().into_iter().map(|d| d.id).collect();
+        registered.sort();
+        let mut expected: Vec<&str> = EXPECTED.iter().map(|(id, _)| *id).collect();
+        expected.sort_unstable();
+        assert_eq!(registered, expected);
+    }
+
+    #[test]
+    fn test_each_builtin_declares_its_expected_capabilities() {
+        let registry = registry();
+        for (id, capabilities) in EXPECTED {
+            let tool = registry
+                .get(id)
+                .unwrap_or_else(|| panic!("{id} not registered"));
+            assert_eq!(tool.id(), *id);
+            assert_eq!(tool.descriptor().id, *id, "descriptor id for {id}");
+            assert_eq!(&tool.required_capabilities(), capabilities, "{id}");
+        }
+    }
+
+    #[test]
+    fn test_register_all_twice_is_refused() {
+        let mut registry = registry();
+        assert!(
+            register_all(&mut registry).is_err(),
+            "a second registration must not silently replace a built-in"
+        );
+    }
+}

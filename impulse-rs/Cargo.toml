@@ -43,8 +43,8 @@ long_description = "Feed the impulse to build with a local harness manager for g
 tokio = { version = "1", features = ["full"] }
 
 # Terminal UI
-ratatui = "0.28"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 # HTTP/API calls
 reqwest = { version = "0.12", features = ["json", "blocking", "stream"] }
@@ -104,11 +104,6 @@ portable-pty = "0.9"
 vt100 = "0.15"
 which = "7"
 
-# Monty Python interpreter integration (optional)
-# Uses pyo3 to call pydantic-monty for computed routing
-# Enable with --features monty-support
-pyo3 = { version = "0.29.0", optional = true, features = ["extension-module"] }
-
 # DataFusion for advanced analytics (optional)
 # Enable with --features datafusion-support
 # Nothing imports this crate yet; the requirement only shapes the lockfile. 43's
@@ -167,9 +162,6 @@ security-framework-sys = "=2.17.0"
 
 [features]
 default = ["office-support", "photon-subagent"]
-# Monty support enables computed routing and dynamic context injection
-# Requires: pip install pydantic-monty
-monty-support = ["dep:pyo3"]
 # DataFusion support enables advanced analytics and aggregation
 datafusion-support = ["dep:datafusion"]
 # Photon enables Ion's disposable read-only subagent tool (min-agent)

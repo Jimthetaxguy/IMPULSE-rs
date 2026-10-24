@@ -79,8 +79,9 @@ Safety invariants in the current code:
 
 - **Confirmation gate.** `CONFIRMATION_REQUIRED_TOOLS` is `bash_exec`, `file_write`, `governed_submit_claim`, and `handoff`. Those run only after approval; a decline returns before `ReplTool::run`. `bash_exec` commands and `file_write` content are scanned by `src/guardrail` first. `decide_approval` requires the literal `CONFIRM` for a Block-tier verdict and accepts `y` / `yes` otherwise. Gated tools execute only while holding an `ApprovalGrant`. The scan covers the tool call's arguments.
 - **Sandbox.** Bridged tools write under the repo root and read under the repo root plus `/allow` grants (`ReplContext::sandbox_tool_context`). `memory_search` and `genome_read` may also read an explicitly set `IMPULSE_HOME`, which they validate themselves.
+- **Read-before-write.** `file_write` over an existing file is refused, before any confirmation prompt, unless this session read the whole file (from line 1, not truncated) or wrote it, and its version (mtime, length, and on Unix inode and ctime) is unchanged since (`FileVersions` in `ion_repl/chat.rs`, cleared by `/clear`). New files need no prior read.
 - **Environment scrub.** `bash_exec`, manifest `ProcessTool`s, governed verification, and the PDF text-extraction child call `scrub_and_allowlist_env` (`src/tooling/env_scrub.rs`): clear the environment, then re-add `ENV_ALLOWLIST` plus any per-tool allowlist. `PiAdapter::verify` (`impulse-ion/src/pi_adapter.rs`) does not scrub; that child inherits the parent environment.
-- **Bounded tool loop.** One exchange is capped at `ION_DEFAULT_MAX_ROUNDS` (10) and `ION_DEFAULT_WALL_CLOCK` (180 s) in `src/loop_contract.rs`. On either error the conversation history is left unchanged.
+- **Bounded tool loop.** One exchange is capped at `ION_DEFAULT_MAX_ROUNDS` (10), `ION_DEFAULT_WALL_CLOCK` (180 s) and `ION_DEFAULT_MAX_TOOL_CALLS` (50 calls across all rounds, checked before each call runs) in `src/loop_contract.rs`. On any trip the conversation history is left unchanged.
 - **Credentials.** The macOS Keychain provider calls the Security framework in-process (`src/credentials/keychain.rs`).
 
 ---
@@ -119,7 +120,7 @@ Shared files that need explicit ownership include `Cargo.toml`, `Cargo.lock`, `A
 1. **Return `Result`.** Every function returns `Result<T>`. `unwrap()` on a production path is rejected. `unwrap()` is acceptable in tests, in `Default` impls where failure is impossible, and in `main()` after argument parsing. `expect("msg")` is acceptable in `main()` and test setup. `thiserror` enums need a `#[error("...")]` on every variant and a `Display` test. `anyhow` errors chain `.context("what we were doing")` on I/O and parse. Every `Result`-returning function has at least one test that hits `Err`.
 2. **Atomic writes.** Temp file plus rename. Temp names include PID and timestamp. Do not write the target path in place.
 3. **Validate at boundaries.** Sanitize user-supplied IDs before they become filesystem paths or SQL. Validate protocol data on the socket. Allowlist table names for PRAGMA queries.
-4. **Dirty flag.** In-memory state records whether it changed. Sync to disk when dirty, and persist on Drop or exit.
+4. **Locked read-modify-write for shared state.** Every process that opens a project (the daemon and each direct-mode hook) keeps its own in-memory copy of `.impulse/` state, so never save that copy whole. A change to a shared file runs as one read-modify-write under `Storage::lock_exclusive`: re-read the file, apply only this change, write atomically, then refresh the in-memory copy from what was written (`State::update_live_state`, `State::update_config`, and the memory-candidate writers). The lock is not re-entrant, so a change must never start another locked update; take it through `State::lock_project_state`, which fails after a bounded wait instead of hanging. Pass a change, not a finished value built from the copy (`update_impulse_agent_permissions(|policy| ...)`). Daemon-only files (`GOVERNED_TASKS.json`, `PRODUCER_RESERVATIONS.json`) are still whole-file writes, safe only while the daemon is their single writer; the startup projection rewrite of `GENOME_PROJECTION.md` is not yet locked.
 5. **Capability-based tools.** Deny by default. The registry order is: exists, capability check, parameter validation, execute.
 6. **Review before apply.** Context injection defaults to review mode. Show what would be injected and let the operator decide.
 7. **Simplest design that works.** Prefer editing an existing file over a new abstraction for a one-time operation.
@@ -182,7 +183,7 @@ ADR-0020's state and request types cover candidate decisions, `MEMORY.jsonl`, an
 |------|-----------|
 | Errors | `thiserror` enums, `anyhow` application errors, `Result<T>` everywhere |
 | File I/O | Atomic temp file plus rename, unique temp names |
-| State | `RwLock`, dirty flag, sync on Drop |
+| State | In-memory copy + locked re-read-modify-write per change |
 | Naming | `PascalCase` types, `snake_case` functions, `SCREAMING_SNAKE` constants |
 | Tests | `mod tests` in the owning file; integration tests use a `DaemonGuard` |
 | CLI | New commands are `clap::Subcommand` variants of `Commands` in `impulse-rs/src/cli.rs`. `direct_dispatch.rs` and `daemon_dispatch.rs` match the same variant. Daemon-only commands refuse in direct mode. A command also exposed from `ion` needs an `IonCommand` variant in `src/bin/ion.rs` whose handler calls the one shared function in `handlers::`. |
@@ -228,13 +229,12 @@ Name tests `test_<function>_<scenario>_<expected_result>`.
 
 ### Feature flags
 
-From `impulse-rs/Cargo.toml` `[features]` (read 2026-10-23):
+From `impulse-rs/Cargo.toml` `[features]` (read 2026-10-24). `calc`/`exec` use the `monty` crate and are not feature-gated.
 
 | Flag | Crate | Default | Enables |
 |------|-------|---------|---------|
 | `office-support` | `impulse-rs` | Yes | Excel, Word, CSV, and PDF document read/write (`document_read` included) |
 | `photon-subagent` | `impulse-rs` | Yes | Ion's read-only `photon` tool (`min-agent`) |
-| `monty-support` | `impulse-rs` | No | Embedded Python via `pyo3`. The manifest comment also says `pip install pydantic-monty`. |
 | `datafusion-support` | `impulse-rs` | No | DataFusion analytics |
 | `desktop-app` | `impulse-desktop` | No | Dioxus desktop binary and host adapter |
 | `native-macos` | `impulse-desktop` | No | macOS island bindings |

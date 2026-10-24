@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # Every pull request, not only those into main: a PR stacked on another
+  # PR's branch got no CI at all until it was retargeted.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,7 +27,7 @@ jobs:
         with:
           workspaces: impulse-rs
       - name: Test (default features, includes office-support)
-        run: cargo test
+        run: cargo test --workspace
       - name: Test lib (minimal, no default features)
         run: cargo test --no-default-features --lib
 
@@ -44,8 +45,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: impulse-rs
-      - run: cargo clippy -- -D warnings
-      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo fmt --all -- --check
 
   build:
     name: Build (release)

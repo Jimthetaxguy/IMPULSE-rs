@@ -213,6 +213,7 @@ pub struct ChatState {
     agent: Agent,
     confirm: ConfirmFn,
     untrusted_seen: std::sync::atomic::AtomicBool,
+    file_versions: FileVersions,
 }
 
 impl ChatState {
@@ -291,6 +292,7 @@ impl ChatState {
             ),
             confirm: Box::new(confirm_via_stdin),
             untrusted_seen: std::sync::atomic::AtomicBool::new(false),
+            file_versions: FileVersions::default(),
         }
     }
 
@@ -356,6 +358,7 @@ impl ChatState {
             ctx,
             confirm: self.confirm.as_ref(),
             untrusted_seen: &self.untrusted_seen,
+            file_versions: &self.file_versions,
         };
         self.agent
             .chat_with_tools(text, &tool_defs, &executor)
@@ -375,6 +378,7 @@ impl ChatState {
         self.agent.clear_history();
         self.untrusted_seen
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.file_versions.clear();
     }
 
     /// Typed termination evidence from the most recent [`ChatState::turn`]
@@ -748,13 +752,24 @@ fn bash_command_escape_candidates(command: &str, tool_ctx: &ToolContext) -> Vec<
 
     let tokens = split_shell_tokens(command);
     let mut flagged: Vec<String> = Vec::new();
+    if bare_cd_reaches_home(command) {
+        flagged.push("cd (to $HOME)".to_string());
+    }
     for (index, token) in tokens.iter().enumerate() {
-        let bare = unquoted(token).trim_start_matches(SHELL_METACHARS);
+        // Also step over an escape or brace before the path (`\/etc`,
+        // `{/etc/passwd,}`), which the shell drops.
+        let bare = unquoted(token).trim_start_matches(|c: char| {
+            SHELL_METACHARS.contains(&c) || matches!(c, '\\' | '{' | '"' | '\'')
+        });
         if bare.starts_with('/')
             || bare.contains("..")
             || bare.contains('~')
             || bare.contains("$HOME")
-            || bare.contains("${HOME}")
+            // Every `${HOME...}` form: `${HOME}`, `${HOME:-}`, `${HOME%/}`.
+            || bare.contains("${HOME")
+            // The repo's parent (`${PWD%/*}`) and the previous directory.
+            || bare.contains("${PWD%")
+            || bare.contains("OLDPWD")
         {
             flagged.push(token.clone());
         }
@@ -771,6 +786,41 @@ fn bash_command_escape_candidates(command: &str, tool_ctx: &ToolContext) -> Vec<
     flagged.sort();
     flagged.dedup();
     flagged
+}
+
+/// Whether `command` runs a `cd` whose destination this scan cannot see: no
+/// target (`$HOME`), `-` (`$OLDPWD`), or a variable (`cd $X`, `cd ${X:-}`).
+/// [`split_shell_tokens`] drops the `;`/`&&` after a bare `cd`, so the token
+/// scan would read the *next command's* name as its target.
+///
+/// `cd` counts anywhere in a command segment, not only as its first word, so
+/// `builtin cd`, `command cd`, `{ cd; }` and `then cd` are caught; the cost is
+/// an occasional extra `CONFIRM` for text such as a heredoc line reading `cd`.
+fn bare_cd_reaches_home(command: &str) -> bool {
+    let mut segments = command.split(|c: char| SHELL_METACHARS.contains(&c) || c == '\n');
+    segments.any(|segment| {
+        let mut parts = segment.split_whitespace();
+        while let Some(word) = parts.next() {
+            if word != "cd" {
+                continue;
+            }
+            // `-P`/`-L`/`-e`/`-@` and `--` are options, not the destination.
+            let target = parts
+                .by_ref()
+                .find(|part| !(part.len() > 1 && part.starts_with('-')));
+            let unseen = match target {
+                None => true,
+                Some(target) => {
+                    let target = target.trim_matches(|c| c == '"' || c == '\'');
+                    target == "-" || target.starts_with('$')
+                }
+            };
+            if unseen {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 /// Shell metacharacters that can sit directly against a path with no
@@ -892,6 +942,105 @@ struct ReplToolExecutor<'a> {
     /// history the poisoned content lives in. `AtomicBool` (not `Cell`)
     /// because `execute` takes `&self` and `ToolExecutor` requires `Sync`.
     untrusted_seen: &'a std::sync::atomic::AtomicBool,
+    /// Files this session has read or written, borrowed from
+    /// `ChatState::file_versions` so it spans turns like `untrusted_seen`.
+    file_versions: &'a FileVersions,
+}
+
+/// The files a session has read in full or written, with the version it
+/// last saw for each, so `file_write` can refuse to replace a file the model
+/// has never seen or that changed since it looked (another agent, an editor,
+/// a `bash_exec`). Keyed by `tooling::resolve_for_write` of the resolved
+/// path, the exact physical path `file_write` replaces, so `x/../a` and `a`
+/// (or a symlinked prefix) share one entry.
+#[derive(Debug, Default)]
+pub(crate) struct FileVersions(
+    std::sync::Mutex<std::collections::HashMap<PathBuf, Option<FileVersion>>>,
+);
+
+/// What identifies one version of a file. The mtime alone is not enough:
+/// `touch -r`, `cp -p` or `rsync -t` restore an old mtime over new content.
+/// On Unix the inode (a rename-replace gets a new one) and the ctime, which
+/// user space cannot set, catch those; the length catches the rest cheaply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileVersion {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+    #[cfg(unix)]
+    inode: (u64, u64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl FileVersions {
+    fn modified(path: &std::path::Path) -> Option<FileVersion> {
+        let meta = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(FileVersion {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+            #[cfg(unix)]
+            inode: (meta.dev(), meta.ino()),
+            #[cfg(unix)]
+            changed: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+
+    /// Remember `path` as seen at its current modification time.
+    fn record(&self, path: &std::path::Path) {
+        let key = Self::key(path);
+        let seen = Self::modified(&key);
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, seen);
+    }
+
+    fn key(path: &std::path::Path) -> PathBuf {
+        crate::tooling::resolve_for_write(path)
+    }
+
+    /// Why a write to `path` must not run, or `None` when it may: the path
+    /// does not exist yet, or this session saw it at its current version.
+    fn write_refusal(&self, path: &std::path::Path) -> Option<String> {
+        let key = Self::key(path);
+        if std::fs::symlink_metadata(&key).is_err() {
+            return None;
+        }
+        let current = Self::modified(&key);
+        let versions = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match versions.get(&key) {
+            None => Some(format!(
+                "'{}' already exists and has not been read in this session. Read it with \
+                 file_read first, then write the full new content.",
+                path.display()
+            )),
+            Some(seen) if *seen != current => Some(format!(
+                "'{}' changed since this session last read or wrote it. Read it again with \
+                 file_read before writing, so the change is not overwritten.",
+                path.display()
+            )),
+            Some(_) => None,
+        }
+    }
+
+    fn clear(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+}
+
+/// Whether a `file_read` payload holds the file's entire content.
+fn read_whole_file(payload: &Value) -> bool {
+    payload.get("content").is_some()
+        && payload.get("start_line").and_then(Value::as_u64) == Some(1)
+        && payload.get("truncated").and_then(Value::as_bool) == Some(false)
 }
 
 impl ReplToolExecutor<'_> {
@@ -988,6 +1137,24 @@ impl ToolExecutor for ReplToolExecutor<'_> {
     }
 
     async fn execute(&self, name: &str, input: Value) -> ToolExecutionResult {
+        // Resolved before `input` moves into `run`; only file_read and
+        // file_write are tracked.
+        let tracked_path = matches!(name, "file_read" | "file_write")
+            .then(|| resolved_paths_for(name, &input, &self.ctx.sandbox_tool_context()))
+            .and_then(|paths| paths.into_iter().next());
+        // Refused before the confirmation prompt: a human should not be asked
+        // to approve a write over content the model never saw.
+        if name == "file_write" {
+            if let Some(reason) = tracked_path
+                .as_deref()
+                .and_then(|path| self.file_versions.write_refusal(path))
+            {
+                return ToolExecutionResult {
+                    content: format!("Refused: {reason}"),
+                    is_error: true,
+                };
+            }
+        }
         let _grant: Option<ApprovalGrant> = if CONFIRMATION_REQUIRED_TOOLS.contains(&name) {
             let tool_ctx = self.ctx.sandbox_tool_context();
             let write = matches!(name, "file_write" | "bash_exec");
@@ -1023,6 +1190,19 @@ impl ToolExecutor for ReplToolExecutor<'_> {
                     is_error: true,
                 };
             }
+            // Checked again after the prompt: the file may have been edited,
+            // or created, while the human was deciding.
+            if name == "file_write" {
+                if let Some(reason) = tracked_path
+                    .as_deref()
+                    .and_then(|path| self.file_versions.write_refusal(path))
+                {
+                    return ToolExecutionResult {
+                        content: format!("Refused: {reason}"),
+                        is_error: true,
+                    };
+                }
+            }
             Some(ApprovalGrant::new(name, verdict.as_ref().map(|r| r.action)))
         } else {
             None
@@ -1043,6 +1223,17 @@ impl ToolExecutor for ReplToolExecutor<'_> {
                     .flatten();
                 let result = match tool.run(input, self.ctx).await {
                     Ok(outcome) => {
+                        // A read counts only when it returned the whole file:
+                        // from line 1 and not truncated. A window (200 lines
+                        // by default) would let the model replace lines it
+                        // never saw, and an oversized file comes back Ok with
+                        // an `error` and no content at all.
+                        let saw_content = name != "file_read" || read_whole_file(&outcome.payload);
+                        if outcome.ok && saw_content {
+                            if let Some(path) = &tracked_path {
+                                self.file_versions.record(path);
+                            }
+                        }
                         let raw = raw_tool_result_content(&outcome);
                         let content_type = if outcome.rendered.is_empty() {
                             "application/json"
@@ -1679,11 +1870,13 @@ mod tests {
             false // always decline
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let marker = std::env::temp_dir().join(format!(
@@ -1720,11 +1913,13 @@ mod tests {
         let ctx = ReplContext::default();
         let confirm = |_n: &str, _i: &Value, _v: &GuardVerdict, _p: &[PathBuf]| false;
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let wrapped = executor.wrap_compaction_stub("[compacted 4000 chars]");
@@ -1754,11 +1949,13 @@ mod tests {
             false
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         // file_read: not in CONFIRMATION_REQUIRED_TOOLS, so confirm must
@@ -1850,11 +2047,13 @@ mod tests {
             false
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let result = executor
@@ -1895,11 +2094,13 @@ mod tests {
             false
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let result = executor
@@ -2041,11 +2242,13 @@ mod tests {
             decide_approval(verdict, "y")
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let result = executor
@@ -2154,11 +2357,13 @@ mod tests {
         let confirm =
             |_name: &str, _input: &Value, _verdict: &GuardVerdict, _paths: &[PathBuf]| false;
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
         let result = executor
             .execute(
@@ -2423,6 +2628,70 @@ mod tests {
         );
     }
 
+    /// Roots set to the working directory, as Ion's sandbox does. The default
+    /// context's relative write root makes the older `cd <target>` check flag
+    /// every `cd X`, which would hide whether the bare-`cd` check works.
+    fn repo_rooted_ctx() -> ToolContext {
+        let root = std::env::current_dir().unwrap();
+        ToolContext {
+            allowed_write_roots: vec![root.clone()],
+            allowed_read_roots: vec![root],
+            ..ToolContext::with_all_capabilities()
+        }
+    }
+
+    #[test]
+    fn test_bash_command_escape_candidates_flags_bare_cd_to_home() {
+        let ctx = repo_rooted_ctx();
+        for command in [
+            "cd && rm -rf ./*",
+            "cd; cat .ssh/id_rsa .aws/credentials",
+            "cd",
+            "cd -- ; ls",
+            "X=1 cd\nls",
+            "cd -P; cat .ssh/id_rsa",
+            "cd -L && cat .aws/credentials",
+            "builtin cd; ls",
+            "command cd; ls",
+            "{ cd; }; ls",
+            "if true; then cd; fi; ls",
+            "cd $UNSET_VAR; ls",
+            "cd ${X:-}; ls",
+            "cd -; ls",
+        ] {
+            assert!(
+                !bash_command_escape_candidates(command, &ctx).is_empty(),
+                "`{command}` changes to a directory the scan cannot see"
+            );
+        }
+        for command in ["cd src && ls", "cd -- src", "cd -P src", "abcd; ls"] {
+            assert!(
+                bash_command_escape_candidates(command, &ctx).is_empty(),
+                "`{command}` stays in the repo"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bash_command_escape_candidates_flags_hidden_home_and_root_forms() {
+        let ctx = repo_rooted_ctx();
+        for command in [
+            "rm -rf ${HOME:-}",
+            "rm -rf ${HOME%/}/x",
+            "cat ${HOME:?}/.ssh/id_rsa",
+            "cat \\/etc/passwd",
+            "cat {/etc/passwd,}",
+            "cat ${PWD%/*}/secret",
+            "cd ${PWD%/*}; ls",
+        ] {
+            assert!(
+                !bash_command_escape_candidates(command, &ctx).is_empty(),
+                "`{command}` reaches outside the repo and must be flagged"
+            );
+        }
+        assert!(bash_command_escape_candidates("cargo test --lib", &ctx).is_empty());
+    }
+
     #[test]
     fn test_bash_command_escape_candidates_flags_dotdot_and_tilde_and_home() {
         let ctx = ToolContext::default();
@@ -2493,11 +2762,13 @@ mod tests {
             decide_approval(verdict, "y")
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let result = executor
@@ -2530,11 +2801,13 @@ mod tests {
             decide_approval(verdict, "y")
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let command = format!("cd {} && echo out > escaped.txt", outside.path().display());
@@ -2562,11 +2835,13 @@ mod tests {
             decide_approval(verdict, "y")
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
         let result = executor
             .execute(
@@ -2594,11 +2869,13 @@ mod tests {
             decide_approval(verdict, "y")
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let result = executor
@@ -2633,11 +2910,13 @@ mod tests {
             decide_approval(verdict, "CONFIRM")
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let result = executor
@@ -2671,11 +2950,13 @@ mod tests {
             decide_approval(verdict, "y")
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let target = outside.path().join("escape.txt");
@@ -2695,6 +2976,310 @@ mod tests {
         assert!(!target.exists(), "the write must never have run");
     }
 
+    /// Read-before-write: `file_write` over an existing file needs this
+    /// session to have seen its current version, so the model cannot replace
+    /// content it never read, or a change another agent made after it read.
+    #[tokio::test]
+    async fn test_file_write_requires_reading_the_current_version_of_an_existing_file() {
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+        let asked = std::sync::Mutex::new(0_usize);
+        let confirm = |_name: &str, _input: &Value, verdict: &GuardVerdict, _paths: &[PathBuf]| {
+            *asked.lock().unwrap() += 1;
+            decide_approval(verdict, "y")
+        };
+        let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
+        let executor = ReplToolExecutor {
+            tools: &tools,
+            ctx: &ctx,
+            confirm: &confirm,
+            untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
+        };
+        let target = repo_root.path().join("notes.txt");
+        let path = target.display().to_string();
+        std::fs::write(&target, "original\n").unwrap();
+        let write = |content: &str| {
+            executor.execute(
+                "file_write",
+                serde_json::json!({"path": path, "content": content}),
+            )
+        };
+
+        // Never read: refused before the human is asked, file untouched.
+        let refused = write("replaced\n").await;
+        assert!(refused.is_error);
+        assert!(
+            refused.content.contains("has not been read"),
+            "{}",
+            refused.content
+        );
+        assert_eq!(*asked.lock().unwrap(), 0, "no prompt for a refused write");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original\n");
+
+        // Read it, and the write goes through the normal confirmation.
+        let read = executor
+            .execute("file_read", serde_json::json!({"path": path}))
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        let written = write("replaced\n").await;
+        assert!(!written.is_error, "{}", written.content);
+        assert_eq!(*asked.lock().unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "replaced\n");
+
+        // Its own write counts as seen: a second write needs no re-read.
+        let again = write("replaced twice\n").await;
+        assert!(!again.is_error, "{}", again.content);
+
+        // Someone else changes the file: the next write is refused.
+        std::fs::write(&target, "edited elsewhere\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&target)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60))
+            .unwrap();
+        let stale = write("clobber\n").await;
+        assert!(stale.is_error);
+        assert!(stale.content.contains("changed since"), "{}", stale.content);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "edited elsewhere\n"
+        );
+    }
+
+    /// Codex review on #148: the three ways the first version let an unread
+    /// or changed file be overwritten.
+    #[tokio::test]
+    async fn test_file_write_refusal_holds_for_aliases_oversized_reads_and_edits_during_the_prompt()
+    {
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+        let edit_during_prompt: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+        let confirm = |_name: &str, _input: &Value, verdict: &GuardVerdict, _paths: &[PathBuf]| {
+            if let Some(path) = edit_during_prompt.lock().unwrap().take() {
+                std::fs::write(&path, "edited during the prompt\n").unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(
+                        std::time::SystemTime::now() + std::time::Duration::from_secs(120),
+                    )
+                    .unwrap();
+            }
+            decide_approval(verdict, "y")
+        };
+        let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
+        let executor = ReplToolExecutor {
+            tools: &tools,
+            ctx: &ctx,
+            confirm: &confirm,
+            untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
+        };
+        let root = repo_root.path();
+        std::fs::write(root.join("existing.txt"), "original\n").unwrap();
+
+        // `missing/../existing.txt` names the existing file: refused unread.
+        let aliased = root.join("missing").join("..").join("existing.txt");
+        let result = executor
+            .execute(
+                "file_write",
+                serde_json::json!({"path": aliased.display().to_string(), "content": "x"}),
+            )
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("has not been read"),
+            "{}",
+            result.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("existing.txt")).unwrap(),
+            "original\n"
+        );
+
+        // Reading through one spelling counts for the other.
+        let read = executor
+            .execute(
+                "file_read",
+                serde_json::json!({"path": root.join("existing.txt").display().to_string()}),
+            )
+            .await;
+        assert!(!read.is_error, "{}", read.content);
+        let result = executor
+            .execute(
+                "file_write",
+                serde_json::json!({"path": aliased.display().to_string(), "content": "ok\n"}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+
+        // A file too large to read returns no content, so it is not "read".
+        let big = root.join("big.txt");
+        std::fs::write(&big, vec![b'x'; 1_000_001]).unwrap();
+        let read = executor
+            .execute(
+                "file_read",
+                serde_json::json!({"path": big.display().to_string()}),
+            )
+            .await;
+        assert!(read.content.contains("File too large"), "{}", read.content);
+        let result = executor
+            .execute(
+                "file_write",
+                serde_json::json!({"path": big.display().to_string(), "content": "small"}),
+            )
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert_eq!(std::fs::metadata(&big).unwrap().len(), 1_000_001);
+
+        // An edit made while the human is deciding is not overwritten.
+        let target = root.join("existing.txt");
+        *edit_during_prompt.lock().unwrap() = Some(target.clone());
+        let result = executor
+            .execute(
+                "file_write",
+                serde_json::json!({"path": target.display().to_string(), "content": "clobber\n"}),
+            )
+            .await;
+        assert!(result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("changed since"),
+            "{}",
+            result.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "edited during the prompt\n"
+        );
+    }
+
+    /// Adversarial review on #148: a windowed read, an empty read past the
+    /// end, and a change that keeps the old mtime all counted as "seen".
+    #[tokio::test]
+    async fn test_file_write_needs_a_whole_file_read_and_sees_mtime_preserving_edits() {
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+        let confirm = |_name: &str, _input: &Value, verdict: &GuardVerdict, _paths: &[PathBuf]| {
+            decide_approval(verdict, "y")
+        };
+        let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
+        let executor = ReplToolExecutor {
+            tools: &tools,
+            ctx: &ctx,
+            confirm: &confirm,
+            untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
+        };
+        let long = repo_root.path().join("long.txt");
+        let lines: String = (1..=500).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&long, &lines).unwrap();
+        let path = long.display().to_string();
+        let read = |args: Value| executor.execute("file_read", args);
+        let write = || {
+            executor.execute(
+                "file_write",
+                serde_json::json!({"path": path, "content": "new\n"}),
+            )
+        };
+
+        // The default 200-line window is not the whole file.
+        let partial = read(serde_json::json!({"path": path})).await;
+        assert!(partial.content.contains("truncated"), "{}", partial.content);
+        assert!(
+            write().await.is_error,
+            "a windowed read must not allow a rewrite"
+        );
+        // Nor is a read that starts past the end and returns nothing.
+        read(serde_json::json!({"path": path, "start_line": 9_999})).await;
+        assert!(
+            write().await.is_error,
+            "an empty read must not allow a rewrite"
+        );
+        assert_eq!(std::fs::read_to_string(&long).unwrap(), lines);
+
+        // A whole-file read does.
+        let whole = read(serde_json::json!({"path": path, "max_lines": 1_000})).await;
+        assert!(!whole.is_error, "{}", whole.content);
+        assert!(!write().await.is_error);
+        assert_eq!(std::fs::read_to_string(&long).unwrap(), "new\n");
+
+        // Another process rewrites it in place with content of the same
+        // length and restores the old mtime: only the ctime gives it away.
+        let seen_mtime = std::fs::metadata(&long).unwrap().modified().unwrap();
+        std::fs::write(&long, "NEW\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&long)
+            .unwrap()
+            .set_modified(seen_mtime)
+            .unwrap();
+        let stale = write().await;
+        assert!(stale.is_error, "{}", stale.content);
+        assert!(stale.content.contains("changed since"), "{}", stale.content);
+        assert_eq!(std::fs::read_to_string(&long).unwrap(), "NEW\n");
+    }
+
+    #[tokio::test]
+    async fn test_file_write_creates_a_new_file_without_a_prior_read() {
+        let repo_root = tempfile::tempdir().expect("tempdir");
+        let tools = ReplToolRegistry::with_defaults();
+        let ctx = ReplContext {
+            repo_root: repo_root.path().to_path_buf(),
+            ..ReplContext::default()
+        };
+        let confirm = |_name: &str, _input: &Value, verdict: &GuardVerdict, _paths: &[PathBuf]| {
+            decide_approval(verdict, "y")
+        };
+        let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
+        let executor = ReplToolExecutor {
+            tools: &tools,
+            ctx: &ctx,
+            confirm: &confirm,
+            untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
+        };
+        let target = repo_root.path().join("new.txt");
+        let result = executor
+            .execute(
+                "file_write",
+                serde_json::json!({"path": target.display().to_string(), "content": "fresh\n"}),
+            )
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fresh\n");
+    }
+
+    #[test]
+    fn test_file_versions_clear_forgets_what_was_seen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("seen.txt");
+        std::fs::write(&path, "x").unwrap();
+        let versions = FileVersions::default();
+        versions.record(&path);
+        assert_eq!(versions.write_refusal(&path), None);
+        versions.clear();
+        assert!(versions.write_refusal(&path).is_some());
+    }
+
     #[tokio::test]
     async fn test_file_write_outside_repo_root_proceeds_with_a_literal_confirm_but_the_sandbox_still_refuses(
     ) {
@@ -2712,11 +3297,13 @@ mod tests {
             decide_approval(verdict, "CONFIRM")
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let target = outside.path().join("escape.txt");
@@ -2743,11 +3330,13 @@ mod tests {
             decide_approval(verdict, "y")
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let target = repo_root.path().join("inside.txt");
@@ -2784,11 +3373,13 @@ mod tests {
             decide_approval(verdict, "y")
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         // Read the instruction-shaped file first (ungated, but scanned).
@@ -2828,11 +3419,13 @@ mod tests {
             decide_approval(verdict, "y")
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let result = executor
@@ -2848,11 +3441,13 @@ mod tests {
         let confirm =
             |_name: &str, _input: &Value, _verdict: &GuardVerdict, _paths: &[PathBuf]| true;
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let result = executor
@@ -2897,11 +3492,13 @@ mod tests {
         let confirm =
             |_name: &str, _input: &Value, _verdict: &GuardVerdict, _paths: &[PathBuf]| true;
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         // file_read on a nonexistent path: an ordinary Err from a real
@@ -2931,11 +3528,13 @@ mod tests {
             decide_approval(verdict, "y")
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let first = executor
@@ -3089,11 +3688,13 @@ mod tests {
         let confirm =
             |_name: &str, _input: &Value, _verdict: &GuardVerdict, _paths: &[PathBuf]| true;
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let result = executor
@@ -3154,11 +3755,13 @@ mod tests {
         let confirm =
             |_name: &str, _input: &Value, _verdict: &GuardVerdict, _paths: &[PathBuf]| true;
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
         let result = executor
             .execute(
@@ -3190,11 +3793,13 @@ mod tests {
         let confirm =
             |_name: &str, _input: &Value, _verdict: &GuardVerdict, _paths: &[PathBuf]| true;
         let untrusted_seen = std::sync::atomic::AtomicBool::new(false);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
         let result = executor
             .execute("large_output_tool", serde_json::json!({}))
@@ -3276,11 +3881,13 @@ mod tests {
             approved
         };
         let untrusted_seen = std::sync::atomic::AtomicBool::new(true);
+        let file_versions = FileVersions::default();
         let executor = ReplToolExecutor {
             tools: &tools,
             ctx: &ctx,
             confirm: &confirm,
             untrusted_seen: &untrusted_seen,
+            file_versions: &file_versions,
         };
 
         let result = executor

@@ -921,6 +921,8 @@ fn sync_legacy_injection_artifacts(base_path: &Path, project: &ProjectSummary) -
 /// every mirrored file on every poll. Changed content is new material to
 /// review, so it is written fresh.
 fn save_unless_unchanged(base_path: &Path, artifact: &ArtifactEnvelope) -> Result<()> {
+    impulse_ops::validate_artifact_path_ids(artifact)
+        .context("Refusing to save an artifact whose ids are not path segments")?;
     let path = impulse_ops::artifact_file_path(
         base_path,
         &artifact.project_id,

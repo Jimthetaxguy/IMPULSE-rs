@@ -29,7 +29,18 @@ use crate::loop_contract::{
 use crate::storage::Storage;
 
 const GOVERNED_TASKS_FILE: &str = "GOVERNED_TASKS.json";
-const GOVERNED_TASKS_SCHEMA_VERSION: u32 = 1;
+/// The newest ledger schema this build writes.
+///
+/// Version 2 adds worker-lease fencing (`WorkerTakenOver` events, blueprint 2.1
+/// change #2). It is written only when a ledger actually holds such an event:
+/// every other ledger keeps writing version 1, byte-compatible with builds that
+/// predate fencing, so upgrading does not strand a downgrade. A build that does
+/// not know version 2 refuses it with "Unsupported governed task ledger schema
+/// version 2" instead of failing on an unknown event kind deep in history.
+const GOVERNED_TASKS_SCHEMA_VERSION: u32 = 2;
+/// The pre-fencing schema. Loaded as-is: the migration is purely additive,
+/// because every task in it is at lease generation zero.
+const GOVERNED_TASKS_LEGACY_SCHEMA_VERSION: u32 = 1;
 const MAX_REASON_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -55,6 +66,35 @@ pub enum GovernedTaskStateError {
     IdempotencyPayloadConflict { request_id: GovernedRequestId },
     #[error("invalid governed task transition: {0}")]
     InvalidTransition(String),
+    /// The caller presented a worker-lease generation that is not the task's
+    /// current one: its lease was taken over (or it never held one after the
+    /// first takeover). Fenced writes are refused outright; retrying with a
+    /// fresh `expected_revision` cannot succeed, which is the point.
+    #[error(
+        "governed task `{task_id}` write fenced: presented lease generation {presented}, current generation {current}"
+    )]
+    Fenced {
+        task_id: GovernedTaskId,
+        presented: PresentedGeneration,
+        current: u64,
+    },
+}
+
+/// What a fenced caller presented, kept typed so the operator surface can tell
+/// a stale worker (`Stale(n)`) from a pre-fencing client (`Missing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentedGeneration {
+    Missing,
+    Stale(u64),
+}
+
+impl std::fmt::Display for PresentedGeneration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => formatter.write_str("none"),
+            Self::Stale(generation) => write!(formatter, "{generation}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,11 +117,22 @@ pub(super) struct GovernedTaskLedger {
 impl Default for GovernedTaskLedger {
     fn default() -> Self {
         Self {
-            schema_version: GOVERNED_TASKS_SCHEMA_VERSION,
+            schema_version: GOVERNED_TASKS_LEGACY_SCHEMA_VERSION,
             tasks: BTreeMap::new(),
             processed_requests: BTreeMap::new(),
         }
     }
+}
+
+/// Every governed task as `GOVERNED_TASKS.json` holds it now, bypassing this
+/// process's copy. Memory-candidate reconciliation compares against this under
+/// the storage lock, since a direct-mode process's copy can predate a task the
+/// daemon accepted since.
+pub(super) fn governed_tasks_on_disk(storage: &Storage) -> Result<Vec<GovernedTaskRun>> {
+    Ok(GovernedTaskLedger::load(storage)?
+        .tasks
+        .into_values()
+        .collect())
 }
 
 impl GovernedTaskLedger {
@@ -89,14 +140,40 @@ impl GovernedTaskLedger {
         let ledger: Self = storage
             .read_json(GOVERNED_TASKS_FILE)
             .context("Failed to read governed task ledger")?;
-        if ledger.schema_version != GOVERNED_TASKS_SCHEMA_VERSION {
+        if !matches!(
+            ledger.schema_version,
+            GOVERNED_TASKS_LEGACY_SCHEMA_VERSION | GOVERNED_TASKS_SCHEMA_VERSION
+        ) {
             anyhow::bail!(
                 "Unsupported governed task ledger schema version {}",
                 ledger.schema_version
             );
         }
+        if ledger.schema_version < ledger.required_schema_version() {
+            anyhow::bail!(
+                "governed task ledger declares schema version {} but records worker-lease takeovers, which require version {}",
+                ledger.schema_version,
+                GOVERNED_TASKS_SCHEMA_VERSION
+            );
+        }
         ledger.validate(storage)?;
         Ok(ledger)
+    }
+
+    /// The oldest schema version able to represent this ledger: version 2 once
+    /// any task records a worker-lease takeover, version 1 otherwise.
+    fn required_schema_version(&self) -> u32 {
+        if self.tasks.values().any(|task| task.lease_generation() > 0) {
+            GOVERNED_TASKS_SCHEMA_VERSION
+        } else {
+            GOVERNED_TASKS_LEGACY_SCHEMA_VERSION
+        }
+    }
+
+    /// Stamp the schema version this ledger needs just before it is written.
+    /// Never lowers a version already on disk.
+    fn stamp_schema_version(&mut self) {
+        self.schema_version = self.schema_version.max(self.required_schema_version());
     }
 
     fn validate(&self, storage: &Storage) -> Result<()> {
@@ -352,6 +429,7 @@ impl State {
                 request_fingerprint,
             },
         );
+        candidate.stamp_schema_version();
         self.storage()
             .write_private_json(GOVERNED_TASKS_FILE, &candidate)
             .context("Failed to persist governed task registration")?;
@@ -423,6 +501,13 @@ impl State {
             .cloned()
             .ok_or_else(|| GovernedTaskStateError::NotFound(request.task_id.clone()))?;
         require_project(&expected_project, &current.project_id)?;
+        // Fencing runs before the revision check on purpose: a stale worker
+        // that re-reads the task gets a fresh revision, and it must hear
+        // `Fenced`, not a `RevisionConflict` that invites another retry. The
+        // generation is not a secret (it is the count of takeover events any
+        // client can read), so this stops an honest but delayed worker; it is
+        // not authorization.
+        require_current_lease_generation(&current, &request.mutation, request.fencing_generation)?;
         if current.revision != request.expected_revision {
             return Err(GovernedTaskStateError::RevisionConflict {
                 expected: request.expected_revision,
@@ -483,6 +568,7 @@ impl State {
                 request_fingerprint,
             },
         );
+        candidate.stamp_schema_version();
         self.storage()
             .write_private_json(GOVERNED_TASKS_FILE, &candidate)
             .context("Failed to persist governed task mutation")?;
@@ -955,6 +1041,13 @@ fn validate_task_history(task: &GovernedTaskRun) -> Result<BTreeMap<u64, String>
                 };
                 (mutation.clone(), mutation)
             }
+            GovernedTaskEventKind::WorkerTakenOver => {
+                let mutation = GovernedTaskMutation::TakeOverWorker {
+                    actor: event.actor.clone(),
+                    reason: event.detail.clone(),
+                };
+                (mutation.clone(), mutation)
+            }
         };
         let fingerprint =
             fingerprint_mutation(&task.project_id, &task.id, &fingerprint_input_mutation)
@@ -1138,6 +1231,41 @@ fn require_request_fingerprint(value: &str) -> Result<()> {
         anyhow::bail!("request fingerprint must contain 64 lowercase hexadecimal characters");
     }
     Ok(())
+}
+
+/// Refuse a claim, verification or promotion that does not carry the task's
+/// current worker-lease generation (blueprint 2.1 change #2).
+///
+/// `None` is admitted only while the generation is still zero, i.e. before the
+/// lease was ever taken over, so clients written before fencing keep working on
+/// tasks that never needed it. Every other mutation kind is daemon- or
+/// operator-authored and is already serialized by `expected_revision`.
+pub(crate) fn require_current_lease_generation(
+    task: &GovernedTaskRun,
+    mutation: &GovernedTaskMutation,
+    presented: Option<u64>,
+) -> Result<()> {
+    if !matches!(
+        mutation,
+        GovernedTaskMutation::SubmitClaim { .. }
+            | GovernedTaskMutation::RecordVerification { .. }
+            | GovernedTaskMutation::RecordPromotion { .. }
+    ) {
+        return Ok(());
+    }
+    let current = task.lease_generation();
+    let presented = match presented {
+        Some(generation) if generation == current => return Ok(()),
+        None if current == 0 => return Ok(()),
+        Some(generation) => PresentedGeneration::Stale(generation),
+        None => PresentedGeneration::Missing,
+    };
+    Err(GovernedTaskStateError::Fenced {
+        task_id: task.id.clone(),
+        presented,
+        current,
+    }
+    .into())
 }
 
 fn require_project(expected: &str, received: &str) -> Result<()> {
@@ -1407,6 +1535,67 @@ fn apply_mutation(
                 GovernedTaskEventKind::PromotionRecorded,
                 promotion.actor,
                 format!("promotion {id} recorded as {summary}"),
+                now,
+            ));
+        }
+        GovernedTaskMutation::TakeOverWorker { actor, reason } => {
+            // The lease is the daemon's or the operator's to hand over; a
+            // worker cannot raise its own generation (blueprint rule 5).
+            if !matches!(
+                actor.kind,
+                GovernedActorKind::System | GovernedActorKind::Operator
+            ) {
+                return invalid_transition(
+                    "only the daemon or an operator can take over a worker lease",
+                );
+            }
+            require_text("worker takeover reason", &reason)?;
+            // Takeover answers a worker that stopped renewing while its run is
+            // still live. An exited or never-launched run has no lease to take,
+            // and a settled review has nothing left for a new worker to do.
+            if task.execution_state != GovernedExecutionState::Running {
+                return invalid_transition(
+                    "a worker lease is taken over only while the run is running",
+                );
+            }
+            if matches!(
+                task.review_state,
+                GovernedReviewState::Accepted | GovernedReviewState::Rejected
+            ) {
+                return invalid_transition("a settled review has no worker lease to take over");
+            }
+            // Once the worker has handed in a claim, its part is done until
+            // the review sends work back (ChangesRequested, VerificationFailed),
+            // which reopens the lease. A takeover in between would fence no
+            // one and leave the old generation's claim under review. Replay
+            // does not re-judge this: a ledger written before the rule may
+            // hold such a takeover, and refusing it would fail the whole
+            // ledger closed (see `MutationContext::is_replay`).
+            if !context.is_replay
+                && matches!(
+                    task.review_state,
+                    GovernedReviewState::AwaitingVerification
+                        | GovernedReviewState::AwaitingSupervisor
+                        | GovernedReviewState::AwaitingOperator
+                        | GovernedReviewState::Escalated
+                )
+            {
+                return invalid_transition(
+                    "a claim is under review; take over only after it is sent back",
+                );
+            }
+            if task.world_scope.requires_staged_worktree()
+                && task.active_staged_worktree().is_none()
+            {
+                return invalid_transition(
+                    "a staged_authoritative takeover requires an active staged worktree",
+                );
+            }
+            task.events.push(new_event(
+                event_revision,
+                GovernedTaskEventKind::WorkerTakenOver,
+                actor,
+                reason,
                 now,
             ));
         }
@@ -1831,6 +2020,8 @@ fn governed_builder_loop_state(
         // report can never carry a compaction; the field is skipped when zero
         // so existing `loop_report_digest` values stay reproducible.
         compactions: 0,
+        // Likewise empty: the daemon never sees the Builder's tool calls.
+        calls_by_tool: std::collections::BTreeMap::new(),
         elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
     };
     let version = current_governed_loop_version();
@@ -2373,7 +2564,8 @@ pub(in crate::state) mod tests {
     use impulse_ops::governed_task::{
         ApprovalPolicy, GovernedCommandEvidence, GovernedTaskMutation, GovernedTaskMutationRequest,
         GovernedTaskRegistration, GovernedVerificationInput, OperatorDecisionInput,
-        SupervisorVerdictInput, WorkerCompletionClaimInput,
+        PromiseClaimedStatus, PromiseEvidencedStatus, SupervisorVerdictInput,
+        WorkerCompletionClaimInput,
     };
     use tempfile::TempDir;
 
@@ -2478,6 +2670,7 @@ pub(in crate::state) mod tests {
             task_id: task.id.clone(),
             expected_revision: task.revision,
             mutation,
+            fencing_generation: None,
         }
     }
 
@@ -5889,5 +6082,510 @@ pub(in crate::state) mod tests {
             staged.shared_config_digest = SharedRepositoryConfigPin::Recorded(digest);
         }
         assert!(staged_worktree_is_discardable(&task));
+    }
+
+    // ── Worker-lease fencing (blueprint 2.1 change #2) ──────────────────────
+
+    fn running_task(state: &State, suffix: &str) -> GovernedTaskRun {
+        let registered = state
+            .register_governed_task(registration(state, &format!("register-{suffix}")))
+            .unwrap();
+        state
+            .mutate_governed_task(mutation(
+                &registered,
+                &format!("running-{suffix}"),
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "desktop"),
+                },
+            ))
+            .unwrap()
+    }
+
+    fn take_over(state: &State, task: &GovernedTaskRun, request_id: &str) -> GovernedTaskRun {
+        state
+            .mutate_governed_task(mutation(
+                task,
+                request_id,
+                GovernedTaskMutation::TakeOverWorker {
+                    actor: actor(GovernedActorKind::System, "impulse-daemon"),
+                    reason: "worker lease expired without renewal".into(),
+                },
+            ))
+            .unwrap()
+    }
+
+    fn fenced_claim(
+        task: &GovernedTaskRun,
+        request_id: &str,
+        generation: Option<u64>,
+    ) -> GovernedTaskMutationRequest {
+        let mut request = mutation(
+            task,
+            request_id,
+            GovernedTaskMutation::SubmitClaim {
+                claim: WorkerCompletionClaimInput {
+                    actor: actor(GovernedActorKind::Worker, "worker-1"),
+                    summary: "implementation complete".into(),
+                    subject_revision: "abc123".into(),
+                    artifact_ids: vec![],
+                    diff_ref: None,
+                },
+            },
+        );
+        request.fencing_generation = generation;
+        request
+    }
+
+    fn expect_fenced(error: anyhow::Error) -> (PresentedGeneration, u64) {
+        match error.downcast_ref::<GovernedTaskStateError>() {
+            Some(GovernedTaskStateError::Fenced {
+                presented, current, ..
+            }) => (*presented, *current),
+            _ => panic!("expected a typed Fenced error, got: {error:#}"),
+        }
+    }
+
+    fn persisted_schema_version(state: &State) -> u64 {
+        let path = state.storage().path(GOVERNED_TASKS_FILE);
+        let ledger: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        ledger["schema_version"].as_u64().unwrap()
+    }
+
+    /// Blueprint 2.1 failure test "stale worker": worker A pauses past its
+    /// lease, B takes over, A resumes. A's claim is rejected with `Fenced`
+    /// even after A re-reads the task for a fresh revision, and so is
+    /// verification evidence produced under A's generation. B's writes land.
+    #[test]
+    fn stale_worker_resumes_after_takeover_is_fenced() {
+        let (_root, state) = state();
+        let running = running_task(&state, "fence");
+        let worker_a_generation = running.lease_generation();
+        assert_eq!(worker_a_generation, 0);
+
+        // Worker A stops renewing; the daemon hands the lease to worker B.
+        let taken_over = take_over(&state, &running, "takeover-fence");
+        assert_eq!(taken_over.lease_generation(), 1);
+        assert_eq!(
+            taken_over.events.last().unwrap().kind,
+            GovernedTaskEventKind::WorkerTakenOver
+        );
+        assert_eq!(taken_over.execution_state, GovernedExecutionState::Running);
+        assert_eq!(taken_over.review_state, GovernedReviewState::AwaitingClaim);
+
+        // A resumes with a stale revision: fencing wins over the revision
+        // conflict so A is told to stop, not to retry.
+        let stale = state
+            .mutate_governed_task(fenced_claim(
+                &running,
+                "claim-a-stale-revision",
+                Some(worker_a_generation),
+            ))
+            .unwrap_err();
+        assert_eq!(expect_fenced(stale), (PresentedGeneration::Stale(0), 1));
+
+        // A re-reads the task (fresh revision) but still holds generation 0.
+        let reread = state
+            .get_governed_task("impulse-test", &running.id)
+            .unwrap()
+            .unwrap();
+        let fenced = state
+            .mutate_governed_task(fenced_claim(
+                &reread,
+                "claim-a-fresh-revision",
+                Some(worker_a_generation),
+            ))
+            .unwrap_err();
+        assert_eq!(expect_fenced(fenced), (PresentedGeneration::Stale(0), 1));
+
+        // A client that predates fencing is refused once a takeover happened.
+        let missing = state
+            .mutate_governed_task(fenced_claim(&reread, "claim-a-no-token", None))
+            .unwrap_err();
+        assert_eq!(expect_fenced(missing), (PresentedGeneration::Missing, 1));
+
+        // A cannot guess a future generation either.
+        let future = state
+            .mutate_governed_task(fenced_claim(&reread, "claim-a-future", Some(2)))
+            .unwrap_err();
+        assert_eq!(expect_fenced(future), (PresentedGeneration::Stale(2), 1));
+
+        // Nothing A sent was recorded.
+        let unchanged = state
+            .get_governed_task("impulse-test", &running.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged, taken_over);
+        assert!(unchanged.claims.is_empty());
+
+        // B, holding the current generation, claims successfully.
+        let claimed = state
+            .mutate_governed_task(fenced_claim(&unchanged, "claim-b", Some(1)))
+            .unwrap();
+        assert_eq!(
+            claimed.review_state,
+            GovernedReviewState::AwaitingVerification
+        );
+
+        // Verification evidence produced under A's generation is fenced too.
+        let evidence = GovernedCommandEvidence {
+            name: "tests".into(),
+            executable: "cargo".into(),
+            redacted_args: vec!["test".into()],
+            command_digest: digest('a'),
+            exit_code: Some(0),
+            success: true,
+            output_digest: digest('b'),
+            output_ref: Some("evidence/tests.log".into()),
+            output_bytes: 42,
+            output_truncated: false,
+        };
+        let mut stale_verification = mutation(
+            &claimed,
+            "verify-a",
+            GovernedTaskMutation::RecordVerification {
+                verification: GovernedVerificationInput {
+                    actor: actor(GovernedActorKind::Verifier, "cargo-gate"),
+                    claim_id: claimed.latest_claim().unwrap().id.clone(),
+                    subject_revision: "abc123".into(),
+                    policy: "workspace-default".into(),
+                    outcome: GovernedVerificationOutcome::Passed,
+                    commands: vec![evidence],
+                    artifact_ids: vec![],
+                    notes: None,
+                },
+            },
+        );
+        stale_verification.fencing_generation = Some(0);
+        let verification_error = state
+            .mutate_governed_task(stale_verification.clone())
+            .unwrap_err();
+        assert_eq!(
+            expect_fenced(verification_error),
+            (PresentedGeneration::Stale(0), 1)
+        );
+        let mut current_verification = stale_verification;
+        current_verification.request_id = GovernedRequestId::try_new("verify-b").unwrap();
+        current_verification.fencing_generation = Some(1);
+        let verified = state.mutate_governed_task(current_verification).unwrap();
+        assert_eq!(
+            verified.review_state,
+            GovernedReviewState::AwaitingSupervisor
+        );
+
+        // The takeover survives reload: replay rebuilds it from the event and
+        // the ledger is written at schema version 2.
+        assert_eq!(persisted_schema_version(&state), 2);
+        let base = state.storage().base_path().to_path_buf();
+        drop(state);
+        let reloaded = State::new(base).unwrap();
+        let recovered = reloaded
+            .get_governed_task("impulse-test", &verified.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered, verified);
+        assert_eq!(recovered.lease_generation(), 1);
+    }
+
+    #[test]
+    fn a_worker_cannot_take_over_or_raise_its_own_lease() {
+        let (_root, state) = state();
+        let running = running_task(&state, "self-takeover");
+        let error = state
+            .mutate_governed_task(mutation(
+                &running,
+                "takeover-by-worker",
+                GovernedTaskMutation::TakeOverWorker {
+                    actor: actor(GovernedActorKind::Worker, "worker-1"),
+                    reason: "I would like a fresh lease".into(),
+                },
+            ))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("only the daemon or an operator"),
+            "unexpected error: {error:#}"
+        );
+        let unchanged = state
+            .get_governed_task("impulse-test", &running.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.lease_generation(), 0);
+    }
+
+    #[test]
+    fn takeover_requires_a_running_unsettled_run() {
+        let (_root, state) = state();
+        let registered = state
+            .register_governed_task(registration(&state, "register-not-running"))
+            .unwrap();
+        let error = state
+            .mutate_governed_task(mutation(
+                &registered,
+                "takeover-not-running",
+                GovernedTaskMutation::TakeOverWorker {
+                    actor: actor(GovernedActorKind::Operator, "james"),
+                    reason: "no worker yet".into(),
+                },
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("only while the run is running"));
+
+        let accepted = accept_run(&state, "settled-takeover");
+        let error = state
+            .mutate_governed_task(mutation(
+                &accepted,
+                "takeover-settled",
+                GovernedTaskMutation::TakeOverWorker {
+                    actor: actor(GovernedActorKind::Operator, "james"),
+                    reason: "too late".into(),
+                },
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("settled review"));
+    }
+
+    /// Review on #140: the under-review rule ran during replay too, so a
+    /// ledger written before it that holds such a takeover failed
+    /// `State::new` for the whole project.
+    #[test]
+    fn a_takeover_recorded_under_review_still_replays() {
+        let (_root, state) = state();
+        let running = running_task(&state, "replay-under-review");
+        let mut claimed = state
+            .mutate_governed_task(fenced_claim(&running, "claim-replay", None))
+            .unwrap();
+        assert_eq!(
+            claimed.review_state,
+            GovernedReviewState::AwaitingVerification
+        );
+        let takeover = || GovernedTaskMutation::TakeOverWorker {
+            actor: actor(GovernedActorKind::Operator, "james"),
+            reason: "recorded before the rule".into(),
+        };
+        let now = "2026-10-23T00:00:00Z";
+        let next_revision = claimed.revision + 1;
+        let live = apply_mutation(
+            &mut claimed.clone(),
+            takeover(),
+            next_revision,
+            MutationContext::live(now, OperatorAuthentication::Declared),
+        );
+        assert!(live.is_err(), "a live takeover under review is refused");
+        let replayed = apply_mutation(
+            &mut claimed,
+            takeover(),
+            next_revision,
+            MutationContext {
+                now,
+                operator_authentication: OperatorAuthentication::Declared,
+                replay_claim: None,
+                is_replay: true,
+            },
+        );
+        assert!(replayed.is_ok(), "replay must reproduce it: {replayed:?}");
+        assert_eq!(claimed.lease_generation(), 1);
+    }
+
+    #[test]
+    fn fenced_error_display_names_what_was_presented() {
+        let task_id = GovernedTaskId::try_new("task-fenced").unwrap();
+        let stale = GovernedTaskStateError::Fenced {
+            task_id: task_id.clone(),
+            presented: PresentedGeneration::Stale(0),
+            current: 1,
+        };
+        assert_eq!(
+            stale.to_string(),
+            "governed task `task-fenced` write fenced: presented lease generation 0, current generation 1"
+        );
+        let missing = GovernedTaskStateError::Fenced {
+            task_id,
+            presented: PresentedGeneration::Missing,
+            current: 2,
+        };
+        assert!(missing
+            .to_string()
+            .contains("presented lease generation none, current generation 2"));
+    }
+
+    /// Review on #140: a takeover while a claim was under review left the old
+    /// generation's claim in the pipeline with no worker left to fence.
+    #[test]
+    fn takeover_is_refused_while_a_claim_is_under_review() {
+        let (_root, state) = state();
+        let running = running_task(&state, "takeover-under-review");
+        let claimed = state
+            .mutate_governed_task(fenced_claim(&running, "claim-under-review", None))
+            .unwrap();
+        assert_eq!(
+            claimed.review_state,
+            GovernedReviewState::AwaitingVerification
+        );
+        let error = state
+            .mutate_governed_task(mutation(
+                &claimed,
+                "takeover-under-review",
+                GovernedTaskMutation::TakeOverWorker {
+                    actor: actor(GovernedActorKind::Operator, "james"),
+                    reason: "worker went quiet".into(),
+                },
+            ))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("a claim is under review"),
+            "unexpected error: {error:#}"
+        );
+        let unchanged = state
+            .get_governed_task("impulse-test", &claimed.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.lease_generation(), 0);
+        assert_eq!(unchanged.revision, claimed.revision);
+    }
+
+    /// Compatibility: a ledger that never saw a takeover is still written at
+    /// schema version 1, and unfenced (pre-fencing) clients keep working.
+    #[test]
+    fn a_ledger_without_takeovers_stays_at_schema_v1_and_admits_legacy_clients() {
+        let (_root, state) = state();
+        let accepted = accept_run(&state, "legacy");
+        assert!(accepted.is_accepted());
+        assert_eq!(accepted.lease_generation(), 0);
+        assert_eq!(persisted_schema_version(&state), 1);
+    }
+
+    #[test]
+    fn a_v1_ledger_that_records_a_takeover_is_refused_at_load() {
+        let (_root, state) = state();
+        let running = running_task(&state, "forged-v1");
+        take_over(&state, &running, "takeover-forged-v1");
+        rewrite_persisted_ledger(&state, |ledger| {
+            ledger["schema_version"] = serde_json::json!(1);
+        });
+        let base = state.storage().base_path().to_path_buf();
+        drop(state);
+        let error = reload_error(base, "a v1 ledger cannot hold a takeover");
+        assert!(
+            format!("{error:#}").contains("require version 2"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    // ── Promises: claimed vs evidenced (blueprint 2.1 change #4) ────────────
+
+    /// Blueprint 2.1 failure test "false completion": a failed tool run is
+    /// injected while the worker claims "done". The promise's evidenced status
+    /// stays `open` and the run reports claimed-vs-evidenced divergence; only
+    /// a passing verifier record keeps the promise.
+    #[test]
+    fn a_failed_run_under_a_done_claim_leaves_the_promise_open_and_divergent() {
+        let (_root, state) = state();
+        let registered = state
+            .register_governed_task(registration(&state, "register-promise"))
+            .unwrap();
+        let running = state
+            .mutate_governed_task(mutation(
+                &registered,
+                "running-promise",
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "desktop"),
+                },
+            ))
+            .unwrap();
+        assert!(running.promises().is_empty());
+        assert!(running.claim_evidence_divergence().is_none());
+
+        // The worker says it is done...
+        let claimed = claim(&state, &running, "claim-promise");
+        let promise = claimed
+            .claim_evidence_divergence()
+            .expect("unverified claim diverges");
+        assert_eq!(promise.claimed_status, PromiseClaimedStatus::Done);
+        assert_eq!(promise.evidenced_status, PromiseEvidencedStatus::Open);
+        assert!(promise.evidence.is_empty());
+
+        // ...but the verification run fails.
+        let failed = verify(
+            &state,
+            &claimed,
+            "verify-promise-failed",
+            GovernedVerificationOutcome::Failed,
+        );
+        let promise = failed
+            .claim_evidence_divergence()
+            .expect("a failed run must not close a done claim");
+        assert_eq!(promise.evidenced_status, PromiseEvidencedStatus::Open);
+        assert_eq!(
+            promise.latest_evidence_outcome,
+            Some(GovernedVerificationOutcome::Failed)
+        );
+        assert_eq!(promise.evidence.len(), 1);
+        // The worker's own record still says done; the evidence disagrees.
+        assert_eq!(
+            failed.latest_claim().unwrap().summary,
+            "implementation complete"
+        );
+
+        // A new claim supersedes the old promise; a passing verification by
+        // the verifier is the only thing that keeps it.
+        let reclaimed = claim(&state, &failed, "claim-promise-2");
+        let verified = verify(
+            &state,
+            &reclaimed,
+            "verify-promise-passed",
+            GovernedVerificationOutcome::Passed,
+        );
+        let promises = verified.promises();
+        assert_eq!(promises.len(), 2);
+        assert!(promises[0].superseded);
+        assert_eq!(promises[0].evidenced_status, PromiseEvidencedStatus::Open);
+        assert!(!promises[1].superseded);
+        assert_eq!(promises[1].evidenced_status, PromiseEvidencedStatus::Kept);
+        assert!(verified.claim_evidence_divergence().is_none());
+    }
+
+    /// Only verifier evidence about the promised subject counts. A record that
+    /// names the claim but comes from anyone else, or verifies a different
+    /// revision, cannot set `evidenced_status` (defense in depth: the ledger
+    /// already refuses a non-verifier verification).
+    #[test]
+    fn evidence_from_a_non_verifier_or_another_revision_cannot_keep_a_promise() {
+        let (_root, state) = state();
+        let registered = state
+            .register_governed_task(registration(&state, "register-forged-evidence"))
+            .unwrap();
+        let running = state
+            .mutate_governed_task(mutation(
+                &registered,
+                "running-forged-evidence",
+                GovernedTaskMutation::MarkRunning {
+                    actor: actor(GovernedActorKind::System, "desktop"),
+                },
+            ))
+            .unwrap();
+        let claimed = claim(&state, &running, "claim-forged-evidence");
+        let passed = verify(
+            &state,
+            &claimed,
+            "verify-forged-evidence",
+            GovernedVerificationOutcome::Passed,
+        );
+        assert!(passed.claim_evidence_divergence().is_none());
+
+        // The worker cannot record its own evidence through the ledger.
+        let mut by_worker = passed.clone();
+        by_worker.verifications[0].actor = actor(GovernedActorKind::Worker, "worker-1");
+        assert_eq!(
+            by_worker.promises()[0].evidenced_status,
+            PromiseEvidencedStatus::Open
+        );
+        assert!(by_worker.claim_evidence_divergence().is_some());
+
+        let mut other_revision = passed;
+        other_revision.verifications[0].subject_revision = "def456".into();
+        assert_eq!(
+            other_revision.promises()[0].evidenced_status,
+            PromiseEvidencedStatus::Open
+        );
     }
 }

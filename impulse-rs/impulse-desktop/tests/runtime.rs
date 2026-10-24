@@ -2,6 +2,13 @@ use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// How long a test waits for a spawned PTY child to produce output, exit, or
+/// be cleaned up. Every wait returns as soon as its condition holds, so this
+/// only bounds a failure. 2 s was tight for a real `sh` on a loaded macOS CI
+/// runner, where the first exec of a new binary can stall for seconds; these
+/// tests first ran in CI when it moved to `--workspace`.
+const READY_DEADLINE: Duration = Duration::from_secs(10);
+
 use impulse_desktop::{
     AgentPlatformId, AgentSpawnRequest, AgentWriteRequest, DesktopEvent, DesktopEventSink,
     DesktopRuntime, GovernedRoutingMetadata, GovernedTaskGateway, LocalSupervisorAction,
@@ -103,7 +110,7 @@ impl DesktopEventSink for BlockingOutputSink {
             self.output_release
                 .lock()
                 .expect("release mutex poisoned")
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(READY_DEADLINE)
                 .expect("release blocked output");
         }
         self.events
@@ -243,6 +250,7 @@ impl GovernedTaskGateway for TestGovernedGateway {
             task_id: task_id.clone(),
             expected_revision: current.revision,
             mutation,
+            fencing_generation: None,
         })
     }
 
@@ -305,7 +313,7 @@ fn test_immediate_exit_never_emits_a_live_snapshot_after_terminal_exit() {
             .spawn_agent(shell_spawn(&agent_id, "exit 0"))
             .expect("spawn immediate-exit agent");
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + READY_DEADLINE;
         while Instant::now() < deadline
             && !sink.events().iter().any(|event| {
                 matches!(
@@ -339,7 +347,7 @@ fn test_immediate_exit_never_emits_a_live_snapshot_after_terminal_exit() {
         );
     }
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + READY_DEADLINE;
     while Instant::now() < deadline && !runtime.snapshot_agents().is_empty() {
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -430,7 +438,7 @@ fn test_manual_close_never_delivers_buffered_output_after_exit() {
         ))
     });
     output_started_rx
-        .recv_timeout(Duration::from_secs(2))
+        .recv_timeout(READY_DEADLINE)
         .expect("reader reached output sink");
 
     let closer = runtime.clone();
@@ -449,7 +457,7 @@ fn test_manual_close_never_delivers_buffered_output_after_exit() {
         .expect("spawn thread")
         .expect("spawn buffered-output agent");
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + READY_DEADLINE;
     while Instant::now() < deadline
         && !sink
             .events
@@ -506,7 +514,7 @@ fn test_desktop_runtime_spawns_shell_and_emits_terminal_output() {
     assert_eq!(snapshot.rows, 24);
     assert_eq!(snapshot.cols, 80);
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + READY_DEADLINE;
     while Instant::now() < deadline {
         if sink.events().iter().any(|event| {
             matches!(
@@ -603,7 +611,7 @@ fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_direc
         .build();
     let mut request = shell_spawn(
         "canonical-workspace-agent",
-        "printf '%s|%s|%s|%s|%s|%s|%s' \"$PWD\" \"$IMPULSE_WORKSPACE_ROOT\" \"$IMPULSE_GOVERNED_TASK_ID\" \"$IMPULSE_PROJECT_ID\" \"$IMPULSE_SOCKET_PATH\" \"$IMPULSE_CONTROL_CLI\" \"$IMPULSE_GOVERNED_VERIFICATION_PROFILE\"",
+        "printf '%s|%s|%s|%s|%s|%s|%s|%s' \"$PWD\" \"$IMPULSE_WORKSPACE_ROOT\" \"$IMPULSE_GOVERNED_TASK_ID\" \"$IMPULSE_PROJECT_ID\" \"$IMPULSE_SOCKET_PATH\" \"$IMPULSE_CONTROL_CLI\" \"$IMPULSE_GOVERNED_VERIFICATION_PROFILE\" \"$IMPULSE_GOVERNED_LEASE_GENERATION\"",
     );
     request.cwd = Some(alias.display().to_string());
     request.workspace = Some(WorkspaceTarget {
@@ -634,13 +642,13 @@ fn test_governed_spawn_binds_symlink_equivalent_workspace_to_canonical_pty_direc
     assert_eq!(telemetry.governed_task_id, snapshot.governed_task_id);
 
     let expected_output = format!(
-        "{canonical_text}|{canonical_text}|{}|workspace|/tmp/impulse-test.sock|/tmp/impulse-test-cli|rust_workspace_v1",
+        "{canonical_text}|{canonical_text}|{}|workspace|/tmp/impulse-test.sock|/tmp/impulse-test-cli|rust_workspace_v1|0",
         snapshot
             .governed_task_id
             .as_ref()
             .expect("governed task id")
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + READY_DEADLINE;
     while Instant::now() < deadline {
         let output = String::from_utf8_lossy(&terminal_output(&sink, "canonical-workspace-agent"))
             .to_string();
@@ -706,7 +714,7 @@ fn test_ungoverned_cross_workspace_spawn_does_not_receive_daemon_control_routing
     runtime
         .spawn_agent(request)
         .expect("ordinary cross-workspace agent should launch");
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + READY_DEADLINE;
     loop {
         let output = String::from_utf8_lossy(&terminal_output(&sink, "ungoverned-cross-workspace"))
             .to_string();
@@ -914,7 +922,7 @@ fn test_runtime_env_exposes_project_metadata_but_not_raw_notes() {
         .spawn_agent(request)
         .expect("spawn project metadata env probe");
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + READY_DEADLINE;
     while Instant::now() < deadline {
         let output = String::from_utf8_lossy(&terminal_output(&sink, "project-env")).to_string();
         if output.contains("unset|fnv1a64:")

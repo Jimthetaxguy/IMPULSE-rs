@@ -250,7 +250,7 @@ impulse-rs/          # Rust implementation (canonical)
   src/
     main.rs          # CLI entry + command routing
     storage/         # Atomic file operations
-    state/           # In-memory state + dirty flag sync
+    state/           # Shared state, locked read-modify-write per change
     daemon/          # Unix socket server
     agent/           # External harness coordination
     ion_repl/        # Impulse-native coding-agent runtime

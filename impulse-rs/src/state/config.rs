@@ -154,7 +154,10 @@ pub struct Config {
     // LLM provider, harness, and coordination settings for the Impulse agent.
     /// Impulse Agent: LLM provider (anthropic, openai, minimax)
     pub impulse_agent_provider: Option<String>,
-    /// Impulse Agent: API key (or set via env var)
+    /// Impulse Agent: API key (or set via env var). Never written to disk, so
+    /// it lives only in this process's copy; [`Config::keep_process_local`]
+    /// carries it across a refresh from disk. Any new `skip_serializing`
+    /// field belongs there too.
     #[serde(default, skip_serializing)]
     pub impulse_agent_api_key: Option<String>,
     /// Impulse Agent: model override
@@ -338,6 +341,12 @@ impl Default for Config {
 // ── Path resolution helpers ───────────────────────────────────────────────
 
 impl Config {
+    /// Copy the fields that are never written to `config.json` from
+    /// `previous`, this process's copy, onto `self`, freshly read from disk.
+    pub(super) fn keep_process_local(&mut self, previous: &Config) {
+        self.impulse_agent_api_key = previous.impulse_agent_api_key.clone();
+    }
+
     pub fn resolve_path_setting(&self, value: &str) -> std::path::PathBuf {
         self.resolve_path_setting_from(
             &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),

@@ -598,6 +598,8 @@ fn add_detached_worktree(
     label: &str,
 ) -> Result<()> {
     validate_oid(subject_revision)?;
+    // Only a directory this add created may be deleted during cleanup.
+    let created_here = checkout.symlink_metadata().is_err();
     let mut command = hook_free_git(source_workspace);
     command
         .args(["worktree", "add", "--detach"])
@@ -607,19 +609,19 @@ fn add_detached_worktree(
         match run_bounded_process(&mut command, &format!("{label} materialization"), timeout) {
             Ok(output) => output,
             Err(error) => {
-                let _ = cleanup_detached_worktree(source_workspace, checkout);
+                cleanup_partial_worktree(source_workspace, checkout, created_here);
                 return Err(error);
             }
         };
     let completed = match git_completed_successfully(&output, "git worktree add --detach") {
         Ok(completed) => completed,
         Err(error) => {
-            let _ = cleanup_detached_worktree(source_workspace, checkout);
+            cleanup_partial_worktree(source_workspace, checkout, created_here);
             return Err(error).with_context(|| format!("{label} materialization"));
         }
     };
     if !completed {
-        let _ = cleanup_detached_worktree(source_workspace, checkout);
+        cleanup_partial_worktree(source_workspace, checkout, created_here);
         anyhow::bail!("failed to materialize {label}");
     }
     Ok(())
@@ -630,6 +632,43 @@ struct DetachedVerificationWorkspace {
     checkout: PathBuf,
     target_dir: PathBuf,
     temporary_root: Option<tempfile::TempDir>,
+}
+
+/// Best-effort removal after a failed `git worktree add`. The failure itself is
+/// what the caller reports; a cleanup that also fails is logged with what Git
+/// still lists, because a leftover registration otherwise goes unnoticed.
+///
+/// A `git worktree add` killed after it created the checkout directory but
+/// before it wrote the checkout's `.git` file leaves an entry that
+/// `git worktree remove` refuses even with double force ("validation failed"):
+/// Git tolerates a missing directory, not one without its `.git` file. When this
+/// add created the directory, it is deleted and the remove retried.
+fn cleanup_partial_worktree(source_workspace: &Path, checkout: &Path, created_here: bool) {
+    if cleanup_detached_worktree(source_workspace, checkout) {
+        return;
+    }
+    if created_here && checkout.symlink_metadata().is_ok() {
+        if let Err(error) = std::fs::remove_dir_all(checkout) {
+            tracing::warn!(
+                checkout = %checkout.display(),
+                error = %error,
+                "failed to delete a partial detached worktree directory"
+            );
+        }
+    }
+    if !cleanup_detached_worktree(source_workspace, checkout) {
+        let listed = successful_git_text(
+            source_workspace,
+            &["worktree", "list", "--porcelain"],
+            "worktree list after failed cleanup",
+        )
+        .unwrap_or_else(|error| format!("<unavailable: {error:#}>"));
+        tracing::warn!(
+            checkout = %checkout.display(),
+            worktrees = %listed,
+            "failed to unregister a partial detached worktree"
+        );
+    }
 }
 
 fn cleanup_detached_worktree(source_workspace: &Path, checkout: &Path) -> bool {
@@ -860,6 +899,11 @@ fn is_untracked_impulse_runtime_artifact(path: &[u8]) -> bool {
             // promotion, which is only reachable *after* an approval, failed on
             // a tree the daemon had dirtied itself.
             | b".impulse/MEMORY_CANDIDATES.json"
+            // ADR-0020's retrieval-index marker. `impulse init` gitignores it,
+            // but every promotion and reindex rewrites it, so in a project
+            // whose `.impulse` is not gitignored the first promotion dirtied
+            // the canonical tree exactly as MEMORY_CANDIDATES.json once did.
+            | b".impulse/MEMORY_INDEX.json"
             // ADR-0023's blackboard. Ion opens it inside whatever worktree it
             // runs in, including a staged Builder worktree, the moment a tool
             // result spills; an ungitignored `.impulse` would then report the
@@ -870,6 +914,7 @@ fn is_untracked_impulse_runtime_artifact(path: &[u8]) -> bool {
         || path.starts_with(b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-")
         || path.starts_with(b".impulse/PRODUCER_RESERVATIONS.tmp.")
         || path.starts_with(b".impulse/MEMORY_CANDIDATES.tmp.")
+        || path.starts_with(b".impulse/MEMORY_INDEX.tmp.")
         || path.starts_with(b".impulse/worktrees/")
         || is_impulse_memory_evidence_artifact(path)
 }
@@ -2678,18 +2723,30 @@ pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromot
         ));
     }
 
-    if !compare_and_swap_canonical_branch(&workspace, &branch_ref, &initial, &accepted_revision)? {
+    // From the compare-and-swap on, the canonical branch may already have
+    // moved. A failure past this point does not show that nothing happened,
+    // so it is marked as post-dispatch: the reservation journal records the
+    // effect as unknown and the request reruns (the reflog check above then
+    // recognizes a promotion that did land). Only a swap that reports a clean
+    // "ref did not match" is a definite, effect-free outcome.
+    let dispatched = crate::state::EffectDispatchedError::wrap;
+    let swapped =
+        compare_and_swap_canonical_branch(&workspace, &branch_ref, &initial, &accepted_revision)
+            .map_err(dispatched)?;
+    if !swapped {
         let observed = observe_head_oid(&workspace).unwrap_or(canonical_head);
         return Ok(blocked(
             observed,
             PromotionBlockedReason::ConcurrentBranchUpdate,
         ));
     }
-    sync_canonical_worktree(&workspace, &accepted_revision)?;
+    sync_canonical_worktree(&workspace, &accepted_revision).map_err(dispatched)?;
 
-    let promoted = observe_clean_git_subject(&workspace, Some(&initial))?;
+    let promoted = observe_clean_git_subject(&workspace, Some(&initial)).map_err(dispatched)?;
     if promoted != accepted_revision {
-        anyhow::bail!("canonical head did not land the accepted revision after promotion");
+        return Err(dispatched(anyhow::anyhow!(
+            "canonical head did not land the accepted revision after promotion"
+        )));
     }
     Ok(GovernedPromotionInput {
         actor: staged_system_actor(),
@@ -2704,9 +2761,28 @@ pub fn promote_governed_outcome(task: &GovernedTaskRun) -> Result<GovernedPromot
 pub async fn promote_governed_outcome_async(
     task: GovernedTaskRun,
 ) -> Result<GovernedPromotionInput> {
-    tokio::task::spawn_blocking(move || promote_governed_outcome(&task))
+    run_blocking_effect("governed outcome promotion worker panicked", move || {
+        promote_governed_outcome(&task)
+    })
+    .await?
+}
+
+/// Run a blocking side effect on the blocking pool. A panic there can land
+/// after the effect was dispatched (a promotion's compare-and-swap moved the
+/// branch, then the sync panicked), so the join failure is marked dispatched:
+/// the journal records it as unknown, never as a known failure.
+async fn run_blocking_effect<T, F>(panic_context: &'static str, effect: F) -> Result<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(effect)
         .await
-        .context("governed outcome promotion worker panicked")?
+        .map_err(|join_error| {
+            crate::state::EffectDispatchedError::wrap(
+                anyhow::Error::new(join_error).context(panic_context),
+            )
+        })
 }
 
 /// Remove a staged worktree and its administrative entry. Called after a
@@ -2745,6 +2821,27 @@ mod tests {
         GovernedTaskId, GovernedVerification, SupervisorVerdictKind, WorkerCompletionClaim,
     };
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn test_run_blocking_effect_marks_a_panic_as_dispatched() {
+        let error = run_blocking_effect("effect worker panicked", || -> u8 {
+            panic!("panicked after the compare-and-swap")
+        })
+        .await
+        .unwrap_err();
+        assert!(error.is::<crate::state::EffectDispatchedError>());
+        assert!(format!("{error:#}").contains("effect worker panicked"));
+        assert!(matches!(
+            crate::state::classify_producer_error(error),
+            crate::state::ProducerSideEffectError::Dispatched(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_run_blocking_effect_returns_the_effect_value() {
+        let value = run_blocking_effect("unused", || 7_u8).await.unwrap();
+        assert_eq!(value, 7);
+    }
 
     fn run(repo: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
@@ -3059,6 +3156,19 @@ mod tests {
     }
 
     #[test]
+    fn memory_index_marker_is_an_untracked_runtime_artifact() {
+        assert!(is_untracked_impulse_runtime_artifact(
+            b".impulse/MEMORY_INDEX.json"
+        ));
+        assert!(is_untracked_impulse_runtime_artifact(
+            b".impulse/MEMORY_INDEX.tmp.123-4-5"
+        ));
+        assert!(!is_untracked_impulse_runtime_artifact(
+            b".impulse/MEMORY_INDEX.json.bak"
+        ));
+    }
+
+    #[test]
     fn tracked_status_and_path_rejects_a_bare_rename_origin_record() {
         // A `-z` rename emits the origin path as its own bare record.
         assert!(tracked_status_and_path(b".impulse/MEMORY.jsonl").is_none());
@@ -3068,6 +3178,66 @@ mod tests {
             tracked_status_and_path(b" M .impulse/MEMORY.jsonl"),
             Some((b" M".as_slice(), b".impulse/MEMORY.jsonl".as_slice()))
         );
+    }
+
+    /// Simulates a `git worktree add` killed after creating the checkout
+    /// directory but before writing its `.git` file: the entry is locked and
+    /// `git worktree remove --force --force` alone refuses it.
+    fn half_initialized_worktree(repo: &Path, checkout: &Path) {
+        let checkout_arg = checkout.to_str().unwrap();
+        successful_git_text(
+            repo,
+            &["worktree", "add", "--detach", checkout_arg, "HEAD"],
+            "test worktree add",
+        )
+        .unwrap();
+        successful_git_text(
+            repo,
+            &["worktree", "lock", "--reason", "initializing", checkout_arg],
+            "test worktree lock",
+        )
+        .unwrap();
+        std::fs::remove_file(checkout.join(".git")).unwrap();
+        assert!(!cleanup_detached_worktree(repo, checkout));
+    }
+
+    fn listed_worktree_count(repo: &Path) -> usize {
+        successful_git_text(
+            repo,
+            &["worktree", "list", "--porcelain"],
+            "test worktree list",
+        )
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count()
+    }
+
+    #[test]
+    fn cleanup_partial_worktree_removes_entry_whose_git_file_was_never_written() {
+        let repo = init_repo();
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("subject");
+        half_initialized_worktree(repo.path(), &checkout);
+
+        cleanup_partial_worktree(repo.path(), &checkout, true);
+
+        assert!(!checkout.exists());
+        assert_eq!(listed_worktree_count(repo.path()), 1);
+    }
+
+    #[test]
+    fn cleanup_partial_worktree_never_deletes_a_directory_it_did_not_create() {
+        let repo = init_repo();
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("subject");
+        half_initialized_worktree(repo.path(), &checkout);
+        std::fs::write(checkout.join("keep.txt"), "someone else's file").unwrap();
+
+        cleanup_partial_worktree(repo.path(), &checkout, false);
+
+        assert!(checkout.join("keep.txt").exists());
+        assert_eq!(listed_worktree_count(repo.path()), 2);
     }
 
     #[cfg(unix)]
@@ -3095,7 +3265,7 @@ mod tests {
                 .filter(|line| line.starts_with("worktree "))
                 .count(),
             1,
-            "failed materialization must unregister its partial worktree"
+            "failed materialization must unregister its partial worktree; git lists:\n{worktrees}"
         );
     }
 
@@ -3694,6 +3864,7 @@ mod tests {
             expected_revision: registered.revision,
             summary: "done".to_string(),
             artifact_ids: Vec::new(),
+            generation: None,
         };
         let claim = derive_claim(&registered, &request).unwrap();
 
@@ -3801,6 +3972,7 @@ mod tests {
             expected_revision: registered.revision,
             summary: "done".to_string(),
             artifact_ids: Vec::new(),
+            generation: None,
         };
         let claim_input = derive_claim(&registered, &request).unwrap();
         assert_eq!(claim_input.subject_revision, builder_commit);
@@ -3882,6 +4054,7 @@ mod tests {
             expected_revision: registered.revision,
             summary: "done".to_string(),
             artifact_ids: Vec::new(),
+            generation: None,
         };
         let error = derive_claim(&registered, &request)
             .expect_err("the claim producer refuses the same way");
@@ -4067,6 +4240,7 @@ mod tests {
             expected_revision: task.revision,
             summary: "done".to_string(),
             artifact_ids: Vec::new(),
+            generation: None,
         }
     }
 

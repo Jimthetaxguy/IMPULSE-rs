@@ -1474,4 +1474,98 @@ command = "ratchet"
             "the reconciled backend contract remains observable to control-plane clients"
         );
     }
+
+    #[test]
+    fn test_agent_platform_id_is_a_plain_string_on_the_wire_and_validates() {
+        let id = AgentPlatformId::try_new("claude-code").unwrap();
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, r#""claude-code""#);
+        assert_eq!(serde_json::from_str::<AgentPlatformId>(&json).unwrap(), id);
+        for invalid in [r#""""#, r#""   ""#, r#""claude code""#, r#""tab\tid""#] {
+            assert!(
+                serde_json::from_str::<AgentPlatformId>(invalid).is_err(),
+                "{invalid} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn test_agent_capabilities_non_default_round_trip() {
+        let caps = AgentCapabilities {
+            uses_xml_context: true,
+            startup_delay_ms: 1_250,
+        };
+        let json = serde_json::to_string(&caps).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AgentCapabilities>(&json).unwrap(),
+            caps
+        );
+    }
+
+    fn descriptor_with_runtime_capabilities() -> AgentDescriptor {
+        AgentDescriptor {
+            id: AgentPlatformId::try_new("ion").unwrap(),
+            label: "Ion".into(),
+            command: "ion".into(),
+            invocation_args: vec!["--print".into()],
+            aliases: vec!["impulse-ion".into()],
+            capabilities: AgentCapabilities {
+                uses_xml_context: true,
+                startup_delay_ms: 900,
+            },
+            runtime_capabilities: vec![RuntimeCapabilitySupport {
+                capability: RuntimeCapabilityId::try_new("process.lifecycle").unwrap(),
+                enforcement: EnforcementStrength::Mediated,
+            }],
+        }
+    }
+
+    #[test]
+    fn test_descriptor_with_runtime_capabilities_round_trips_and_minimal_json_parses() {
+        let descriptor = descriptor_with_runtime_capabilities();
+        let json = serde_json::to_value(&descriptor).unwrap();
+        assert_eq!(
+            json["runtime_capabilities"][0],
+            serde_json::json!({"capability": "process.lifecycle", "enforcement": "mediated"})
+        );
+        assert_eq!(
+            serde_json::from_value::<AgentDescriptor>(json).unwrap(),
+            descriptor
+        );
+
+        let minimal: AgentDescriptor = serde_json::from_value(serde_json::json!({
+            "id": "x", "label": "X", "command": "x"
+        }))
+        .unwrap();
+        assert!(minimal.invocation_args.is_empty());
+        assert!(minimal.aliases.is_empty());
+        assert_eq!(minimal.capabilities, AgentCapabilities::default());
+        assert!(minimal.runtime_capabilities.is_empty());
+        let reserialized = serde_json::to_value(&minimal).unwrap();
+        assert!(reserialized.get("runtime_capabilities").is_none());
+    }
+
+    #[test]
+    fn test_agent_platform_info_round_trips_and_omits_empty_runtime_capabilities() {
+        let descriptor = descriptor_with_runtime_capabilities();
+        let info = AgentPlatformInfo {
+            id: descriptor.id,
+            label: descriptor.label,
+            command: descriptor.command,
+            runtime_capabilities: descriptor.runtime_capabilities,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AgentPlatformInfo>(&json).unwrap(),
+            info
+        );
+
+        let legacy: AgentPlatformInfo = serde_json::from_value(serde_json::json!({
+            "id": "codex", "label": "Codex", "command": "codex"
+        }))
+        .unwrap();
+        assert!(legacy.runtime_capabilities.is_empty());
+        let reserialized = serde_json::to_value(&legacy).unwrap();
+        assert!(reserialized.get("runtime_capabilities").is_none());
+    }
 }

@@ -471,6 +471,9 @@ const PANE_INPUT_QUEUE: usize = 256;
 /// writing large pastes to a pane that is not reading could queue without
 /// bound. One write of any size still goes through when nothing is queued.
 const PANE_INPUT_BYTES: usize = 16 * 1024 * 1024;
+/// The writer thread writes each queued input in slices of this size and
+/// checks between slices whether the pane is closing.
+const PANE_INPUT_SLICE: usize = 64 * 1024;
 
 /// A pane's input path: a bounded queue drained by one writer thread, so the
 /// PTY write, which blocks while the child is not reading, never runs on the
@@ -484,6 +487,11 @@ struct PaneInput {
     failure: Arc<Mutex<Option<String>>>,
     /// Bytes queued and not yet written.
     queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Set by [`Self::stop`] before the pane's child is killed. The PTY
+    /// echoes input, and on macOS a killed child does not finish exiting
+    /// until that echo drains, so a writer still feeding megabytes of queued
+    /// paste kept `close` waiting past the reap deadline.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PaneInput {
@@ -496,13 +504,19 @@ impl PaneInput {
         let thread_failure = Arc::clone(&failure);
         let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let thread_queued = Arc::clone(&queued_bytes);
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stopping = Arc::clone(&stopping);
         thread::Builder::new()
             .name(format!("pane-input-{agent_id}"))
             .spawn(move || {
                 // Ends when the record, and with it the sender, is dropped,
-                // or when a write fails because the PTY closed.
+                // when the pane is stopped for closing, or when a write fails
+                // because the PTY closed.
                 while let Ok(data) = receiver.recv() {
-                    let written = write_queue.write_user_input(&data);
+                    let written = data
+                        .chunks(PANE_INPUT_SLICE)
+                        .take_while(|_| !thread_stopping.load(std::sync::atomic::Ordering::SeqCst))
+                        .try_for_each(|slice| write_queue.write_user_input(slice));
                     thread_queued.fetch_sub(data.len(), std::sync::atomic::Ordering::SeqCst);
                     if let Err(error) = written {
                         *thread_failure
@@ -511,13 +525,35 @@ impl PaneInput {
                             Some(error.to_string());
                         break;
                     }
+                    if thread_stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                        // Discard what is still queued, so the count says
+                        // nothing is waiting to be written.
+                        while let Ok(dropped) = receiver.try_recv() {
+                            thread_queued
+                                .fetch_sub(dropped.len(), std::sync::atomic::Ordering::SeqCst);
+                        }
+                        break;
+                    }
                 }
             })?;
         Ok(Self {
             sender,
             failure,
             queued_bytes,
+            stopping,
         })
+    }
+
+    /// Stop writing: the writer drops what is queued after its current
+    /// slice, and later sends report that the pane's input was stopped.
+    fn stop(&self) {
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("the pane's input was stopped to close it".to_string());
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn send(&self, data: Vec<u8>) -> Result<(), DesktopBridgeError> {
@@ -690,6 +726,9 @@ impl Drop for DesktopRuntimeInner {
             .map(|(_, record)| record)
             .collect::<Vec<_>>();
         for record in records {
+            // As in `close_agent`: a writer still feeding queued input would
+            // keep the child from exiting before the reap deadline.
+            record.input.stop();
             if let Err(error) = record.backend.kill() {
                 let message = format!(
                     "desktop shutdown could not confirm runtime termination for {}: {error}",
@@ -1114,6 +1153,7 @@ impl DesktopRuntime {
             let Some(record) = removed else {
                 return;
             };
+            record.input.stop();
             if let Err(error) = record.backend.kill() {
                 let message = format!(
                     "terminal EOF observed for {exit_agent_id}, but its process could not be confirmed terminated: {error}"
@@ -1243,6 +1283,7 @@ impl DesktopRuntime {
                 mutation: GovernedTaskMutation::MarkRunning {
                     actor: governed_system_actor("desktop-runtime"),
                 },
+                fencing_generation: None,
             });
             match running {
                 Ok(updated) => {
@@ -1616,13 +1657,14 @@ impl DesktopRuntime {
             },
         )?;
         let governed_task = record.governed_task.clone();
+        record.input.stop();
         if let Err(error) = record.backend.kill() {
             self.lock_state()
                 .agents
                 .insert(request.session_id.clone(), record);
             return Err(DesktopBridgeError::TerminalTerminationFailed {
                 message: format!(
-                    "session {} remains managed because process termination was not confirmed: {error}",
+                    "session {} remains managed because process termination was not confirmed (its input is stopped): {error}",
                     request.session_id
                 ),
             });
@@ -2884,6 +2926,13 @@ fn runtime_env(
     if let Some(task) = governed_task {
         env.push(("IMPULSE_GOVERNED_TASK_ID", task.id.to_string()));
         env.push(("IMPULSE_PROJECT_ID", task.project_id.clone()));
+        // The worker's lease token. Without it, every claim after the first
+        // takeover is refused as `Missing`, so a relaunched worker could
+        // never claim the task again.
+        env.push((
+            impulse_ops::governed_task::GOVERNED_LEASE_GENERATION_ENV,
+            task.lease_generation().to_string(),
+        ));
         if let Some(profile) = task.verification_profile {
             let profile = match profile {
                 GovernedVerificationProfile::RustWorkspaceV1 => "rust_workspace_v1",
@@ -3181,6 +3230,7 @@ mod tests {
                 task_id: task_id.clone(),
                 expected_revision: current.revision,
                 mutation,
+                fencing_generation: None,
             })
         }
     }
@@ -4674,11 +4724,17 @@ mod tests {
             refused.to_string().contains("bytes are already queued"),
             "{refused}"
         );
-        runtime
-            .close_agent(TerminalCloseRequest {
-                session_id: "agent-1".to_string(),
-            })
-            .expect("close the busy pane");
+        // Cleanup only. A child killed while megabytes of input sit in its
+        // terminal can take longer than the reap deadline to exit on a loaded
+        // macOS runner; the runtime reports that as a typed termination
+        // failure by design (see `TerminalBackend::kill`), which is not what
+        // this test checks.
+        match runtime.close_agent(TerminalCloseRequest {
+            session_id: "agent-1".to_string(),
+        }) {
+            Ok(_) | Err(DesktopBridgeError::TerminalTerminationFailed { .. }) => {}
+            Err(error) => panic!("close the busy pane: {error:?}"),
+        }
     }
 
     /// Round 3 on 84493f1: writes a failed writer left in the channel stay
@@ -4694,11 +4750,75 @@ mod tests {
                 "Input/output error (os error 5)".to_string(),
             ))),
             queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(PANE_INPUT_BYTES)),
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         assert_eq!(
             input.send(vec![b'x'; 16]),
             Err(DesktopBridgeError::TerminalWriteFailed {
                 message: "Input/output error (os error 5)".to_string(),
+            })
+        );
+    }
+
+    /// A PTY writer that is slow per call and counts what it was given.
+    struct SlowCountingWriter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl std::io::Write for SlowCountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(2));
+            self.0
+                .fetch_add(buf.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Closing a pane mid-paste: the writer kept feeding the queued input to
+    /// the PTY while the child was being killed, and on macOS the echo kept
+    /// the child from exiting before the 5 s reap deadline (CI, PR #145).
+    #[test]
+    fn test_pane_input_stop_drops_queued_input_after_the_current_slice() {
+        let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer: Box<dyn std::io::Write + Send> =
+            Box::new(SlowCountingWriter(Arc::clone(&written)));
+        let queue =
+            impulse_term::backend::WriteQueue::new(Arc::new(parking_lot::Mutex::new(writer)));
+        let input = PaneInput::spawn("agent-stop", queue).expect("spawn the writer thread");
+        let total = 8 * 1024 * 1024;
+        input
+            .send(vec![b'x'; total / 2])
+            .expect("first paste queues");
+        input
+            .send(vec![b'x'; total / 2])
+            .expect("second paste queues");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while written.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "writer never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        input.stop();
+        while input.queued_bytes.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            assert!(Instant::now() < deadline, "writer kept the input queued");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let after_stop = written.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            after_stop < total,
+            "wrote all {after_stop} bytes after stop"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            written.load(std::sync::atomic::Ordering::SeqCst),
+            after_stop
+        );
+        assert_eq!(
+            input.send(vec![b'x'; 16]),
+            Err(DesktopBridgeError::TerminalWriteFailed {
+                message: "the pane's input was stopped to close it".to_string(),
             })
         );
     }
@@ -4874,6 +4994,52 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert!(a.starts_with("fnv1a64:"));
+    }
+
+    #[test]
+    fn test_runtime_env_carries_the_current_lease_generation() {
+        let gateway = TestGovernedTaskGateway::default();
+        let mut task = gateway
+            .register(
+                GovernedTaskRegistration::builder(
+                    "register-lease",
+                    "task-lease",
+                    "workspace",
+                    "/tmp/workspace",
+                    "relaunch after a takeover",
+                    "agent-1",
+                    "codex",
+                )
+                .build()
+                .expect("valid registration"),
+            )
+            .expect("test gateway registers");
+        let request = spawn_request(24, 80, Some("sh"));
+        let generation = |task: &GovernedTaskRun| {
+            runtime_env("agent-1", &request, "sh", None, Some(task), None)
+                .into_iter()
+                .find(|(key, _)| *key == "IMPULSE_GOVERNED_LEASE_GENERATION")
+                .map(|(_, value)| value)
+        };
+        assert_eq!(generation(&task).as_deref(), Some("0"));
+
+        task.events
+            .push(impulse_ops::governed_task::GovernedTaskEvent {
+                id: impulse_ops::governed_task::GovernedRecordId::try_new("event-takeover")
+                    .unwrap(),
+                revision: 1,
+                kind: impulse_ops::governed_task::GovernedTaskEventKind::WorkerTakenOver,
+                actor: impulse_ops::governed_task::GovernedActor {
+                    kind: impulse_ops::governed_task::GovernedActorKind::Operator,
+                    id: "operator".to_string(),
+                },
+                detail: "previous worker stalled".to_string(),
+                created_at: impulse_ops::now_rfc3339(),
+            });
+        assert_eq!(generation(&task).as_deref(), Some("1"));
+        assert!(runtime_env("agent-1", &request, "sh", None, None, None)
+            .iter()
+            .all(|(key, _)| *key != "IMPULSE_GOVERNED_LEASE_GENERATION"));
     }
 
     #[test]
@@ -5065,5 +5231,50 @@ mod tests {
         let json = serde_json::to_string(&ws).unwrap();
         let recovered: WorkspaceTarget = serde_json::from_str(&json).unwrap();
         assert_eq!(ws, recovered);
+    }
+
+    #[test]
+    fn test_desktop_event_type_tag_differs_from_host_event_name() {
+        // Pinned, not aliased. The serde `type` tag is the variant name, while
+        // `name()` is the host event name JS listens on. `host_event_envelope`
+        // sends `name()` plus only the `data` content, so the tag never reaches
+        // JS, and nothing deserializes a DesktopEvent from the page.
+        let events = [
+            DesktopEvent::TerminalOutput {
+                agent_id: "a".to_string(),
+                data: vec![1],
+            },
+            DesktopEvent::TerminalExit {
+                agent_id: "a".to_string(),
+            },
+            DesktopEvent::OpsUpdate {
+                payload: serde_json::json!({}),
+            },
+            DesktopEvent::OpsConnectionUpdate {
+                connected: true,
+                error: None,
+            },
+        ];
+        for event in &events {
+            let value = serde_json::to_value(event).unwrap();
+            let tag = value["type"].as_str().unwrap();
+            assert_ne!(tag, event.name());
+            let mut swapped = value.clone();
+            swapped["type"] = serde_json::Value::String(event.name().to_string());
+            assert!(serde_json::from_value::<DesktopEvent>(swapped).is_err());
+        }
+        let tags: Vec<_> = events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap()["type"].clone())
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                "TerminalOutput",
+                "TerminalExit",
+                "OpsUpdate",
+                "OpsConnectionUpdate"
+            ]
+        );
     }
 }
