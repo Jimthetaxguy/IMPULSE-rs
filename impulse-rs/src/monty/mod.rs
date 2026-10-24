@@ -1,39 +1,9 @@
-//! Monty integration module for Impulse
+//! Keyword routing, injection selection, KDB helpers, and swarm heuristics.
 //!
-//! This module provides computed routing and dynamic context injection capabilities
-//! using pydantic-monty, a minimal Python interpreter written in Rust.
-//!
-//! ## Features
-//!
-//! - **Computed Routing**: LLM-generated routing logic evaluated in a sandbox
-//! - **Dynamic Injection**: Intelligent context bundle selection
-//! - **KDB Integration**: Extract and query knowledge database
-//! - **Resource Limits**: Memory, time, and stack depth controls
-//!
-//! ## Usage
-//!
-//! Enable Monty support in Cargo.toml:
-//! ```toml
-//! [features]
-//! monty-support = ["dep:pyo3"]
-//! ```
-//!
-//! Install the Python dependency:
-//! ```bash
-//! pip install pydantic-monty
-//! ```
-//!
-//! ## Architecture
-//!
-//! The module provides external functions that Monty's sandboxed Python code
-//! can call to access Impulse's context:
-//!
-//! - `route_to(tool_name)` - Route to a specific tool
-//! - `search_history(query, limit)` - Search session history
-//! - `get_genome_decisions(topic)` - Get genome decisions
-//! - `inject(context, priority)` - Mark context for injection
-//! - `extract_findings(content)` - Extract findings from content
-//! - `search_similar(query, limit)` - Search for similar sessions
+//! This module does not run Python. `calc`, `exec`, `calculator`, and `python_exec`
+//! use the in-process `monty` crate in `crate::tools::python` (ADR-0021). The old
+//! optional PyO3 `monty-support` feature and `python.rs` stub were removed; they
+//! never compiled an extension.
 
 mod datafusion;
 mod kdb;
@@ -56,8 +26,6 @@ pub mod analytics {
 }
 
 use serde::{Deserialize, Serialize};
-
-mod python;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoutingTarget {
@@ -136,10 +104,7 @@ impl Default for MontyConfig {
     }
 }
 
-/// Primary computed routing entry point.
-///
-/// Uses keyword-based routing. Future: `#[cfg(feature = "monty-support")]`
-/// enables PyO3 computed routing.
+/// Primary computed routing entry point. Keyword matching only.
 pub fn execute_computed_routing(
     context: &str,
     _config: &MontyConfig,
@@ -147,20 +112,12 @@ pub fn execute_computed_routing(
     routing::route_by_keywords(context)
 }
 
-/// Primary injection selection entry point.
-///
-/// Uses keyword-based selection. Future: `#[cfg(feature = "monty-support")]`
-/// enables PyO3 computed injection.
+/// Primary injection selection entry point. Keyword matching only.
 pub fn execute_injection_selection(
     context: &str,
     _config: &MontyConfig,
 ) -> Result<Vec<InjectionDecision>, String> {
     routing::select_injection_by_keywords(context)
-}
-
-/// Check if PyO3 Monty support is compiled in
-pub fn is_monty_available() -> bool {
-    cfg!(feature = "monty-support")
 }
 
 #[cfg(test)]

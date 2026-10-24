@@ -846,6 +846,7 @@ mod tests {
                         rationale: "approved".to_string(),
                     },
                 },
+                fencing_generation: None,
             },
         }
     }

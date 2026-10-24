@@ -209,6 +209,7 @@ async fn mutate_task(
                     task_id: task.id.clone(),
                     expected_revision: task.revision,
                     mutation,
+                    fencing_generation: None,
                 },
             })
             .await
@@ -270,6 +271,7 @@ async fn real_daemon_builder_cli_verification_and_restart_preserve_evidence() {
                             id: "process-test-desktop".to_string(),
                         },
                     },
+                    fencing_generation: None,
                 },
             })
             .await
@@ -512,6 +514,7 @@ async fn real_daemon_accepted_run_candidate_is_stable_across_replay_and_restart(
                 rationale: operator_prose.to_string(),
             },
         },
+        fencing_generation: None,
     };
     let accepted = task_from_response(
         client
