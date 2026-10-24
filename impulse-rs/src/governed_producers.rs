@@ -598,6 +598,8 @@ fn add_detached_worktree(
     label: &str,
 ) -> Result<()> {
     validate_oid(subject_revision)?;
+    // Only a directory this add created may be deleted during cleanup.
+    let created_here = checkout.symlink_metadata().is_err();
     let mut command = hook_free_git(source_workspace);
     command
         .args(["worktree", "add", "--detach"])
@@ -607,19 +609,19 @@ fn add_detached_worktree(
         match run_bounded_process(&mut command, &format!("{label} materialization"), timeout) {
             Ok(output) => output,
             Err(error) => {
-                let _ = cleanup_detached_worktree(source_workspace, checkout);
+                cleanup_partial_worktree(source_workspace, checkout, created_here);
                 return Err(error);
             }
         };
     let completed = match git_completed_successfully(&output, "git worktree add --detach") {
         Ok(completed) => completed,
         Err(error) => {
-            let _ = cleanup_detached_worktree(source_workspace, checkout);
+            cleanup_partial_worktree(source_workspace, checkout, created_here);
             return Err(error).with_context(|| format!("{label} materialization"));
         }
     };
     if !completed {
-        let _ = cleanup_detached_worktree(source_workspace, checkout);
+        cleanup_partial_worktree(source_workspace, checkout, created_here);
         anyhow::bail!("failed to materialize {label}");
     }
     Ok(())
@@ -630,6 +632,43 @@ struct DetachedVerificationWorkspace {
     checkout: PathBuf,
     target_dir: PathBuf,
     temporary_root: Option<tempfile::TempDir>,
+}
+
+/// Best-effort removal after a failed `git worktree add`. The failure itself is
+/// what the caller reports; a cleanup that also fails is logged with what Git
+/// still lists, because a leftover registration otherwise goes unnoticed.
+///
+/// A `git worktree add` killed after it created the checkout directory but
+/// before it wrote the checkout's `.git` file leaves an entry that
+/// `git worktree remove` refuses even with double force ("validation failed"):
+/// Git tolerates a missing directory, not one without its `.git` file. When this
+/// add created the directory, it is deleted and the remove retried.
+fn cleanup_partial_worktree(source_workspace: &Path, checkout: &Path, created_here: bool) {
+    if cleanup_detached_worktree(source_workspace, checkout) {
+        return;
+    }
+    if created_here && checkout.symlink_metadata().is_ok() {
+        if let Err(error) = std::fs::remove_dir_all(checkout) {
+            tracing::warn!(
+                checkout = %checkout.display(),
+                error = %error,
+                "failed to delete a partial detached worktree directory"
+            );
+        }
+    }
+    if !cleanup_detached_worktree(source_workspace, checkout) {
+        let listed = successful_git_text(
+            source_workspace,
+            &["worktree", "list", "--porcelain"],
+            "worktree list after failed cleanup",
+        )
+        .unwrap_or_else(|error| format!("<unavailable: {error:#}>"));
+        tracing::warn!(
+            checkout = %checkout.display(),
+            worktrees = %listed,
+            "failed to unregister a partial detached worktree"
+        );
+    }
 }
 
 fn cleanup_detached_worktree(source_workspace: &Path, checkout: &Path) -> bool {
@@ -3070,6 +3109,66 @@ mod tests {
         );
     }
 
+    /// Simulates a `git worktree add` killed after creating the checkout
+    /// directory but before writing its `.git` file: the entry is locked and
+    /// `git worktree remove --force --force` alone refuses it.
+    fn half_initialized_worktree(repo: &Path, checkout: &Path) {
+        let checkout_arg = checkout.to_str().unwrap();
+        successful_git_text(
+            repo,
+            &["worktree", "add", "--detach", checkout_arg, "HEAD"],
+            "test worktree add",
+        )
+        .unwrap();
+        successful_git_text(
+            repo,
+            &["worktree", "lock", "--reason", "initializing", checkout_arg],
+            "test worktree lock",
+        )
+        .unwrap();
+        std::fs::remove_file(checkout.join(".git")).unwrap();
+        assert!(!cleanup_detached_worktree(repo, checkout));
+    }
+
+    fn listed_worktree_count(repo: &Path) -> usize {
+        successful_git_text(
+            repo,
+            &["worktree", "list", "--porcelain"],
+            "test worktree list",
+        )
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count()
+    }
+
+    #[test]
+    fn cleanup_partial_worktree_removes_entry_whose_git_file_was_never_written() {
+        let repo = init_repo();
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("subject");
+        half_initialized_worktree(repo.path(), &checkout);
+
+        cleanup_partial_worktree(repo.path(), &checkout, true);
+
+        assert!(!checkout.exists());
+        assert_eq!(listed_worktree_count(repo.path()), 1);
+    }
+
+    #[test]
+    fn cleanup_partial_worktree_never_deletes_a_directory_it_did_not_create() {
+        let repo = init_repo();
+        let temporary = tempfile::tempdir().unwrap();
+        let checkout = temporary.path().join("subject");
+        half_initialized_worktree(repo.path(), &checkout);
+        std::fs::write(checkout.join("keep.txt"), "someone else's file").unwrap();
+
+        cleanup_partial_worktree(repo.path(), &checkout, false);
+
+        assert!(checkout.join("keep.txt").exists());
+        assert_eq!(listed_worktree_count(repo.path()), 2);
+    }
+
     #[cfg(unix)]
     #[test]
     fn detached_materialization_bounds_hanging_smudge_filters() {
@@ -3095,7 +3194,7 @@ mod tests {
                 .filter(|line| line.starts_with("worktree "))
                 .count(),
             1,
-            "failed materialization must unregister its partial worktree"
+            "failed materialization must unregister its partial worktree; git lists:\n{worktrees}"
         );
     }
 

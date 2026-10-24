@@ -471,6 +471,9 @@ const PANE_INPUT_QUEUE: usize = 256;
 /// writing large pastes to a pane that is not reading could queue without
 /// bound. One write of any size still goes through when nothing is queued.
 const PANE_INPUT_BYTES: usize = 16 * 1024 * 1024;
+/// The writer thread writes each queued input in slices of this size and
+/// checks between slices whether the pane is closing.
+const PANE_INPUT_SLICE: usize = 64 * 1024;
 
 /// A pane's input path: a bounded queue drained by one writer thread, so the
 /// PTY write, which blocks while the child is not reading, never runs on the
@@ -484,6 +487,11 @@ struct PaneInput {
     failure: Arc<Mutex<Option<String>>>,
     /// Bytes queued and not yet written.
     queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    /// Set by [`Self::stop`] before the pane's child is killed. The PTY
+    /// echoes input, and on macOS a killed child does not finish exiting
+    /// until that echo drains, so a writer still feeding megabytes of queued
+    /// paste kept `close` waiting past the reap deadline.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PaneInput {
@@ -496,13 +504,19 @@ impl PaneInput {
         let thread_failure = Arc::clone(&failure);
         let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let thread_queued = Arc::clone(&queued_bytes);
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stopping = Arc::clone(&stopping);
         thread::Builder::new()
             .name(format!("pane-input-{agent_id}"))
             .spawn(move || {
                 // Ends when the record, and with it the sender, is dropped,
-                // or when a write fails because the PTY closed.
+                // when the pane is stopped for closing, or when a write fails
+                // because the PTY closed.
                 while let Ok(data) = receiver.recv() {
-                    let written = write_queue.write_user_input(&data);
+                    let written = data
+                        .chunks(PANE_INPUT_SLICE)
+                        .take_while(|_| !thread_stopping.load(std::sync::atomic::Ordering::SeqCst))
+                        .try_for_each(|slice| write_queue.write_user_input(slice));
                     thread_queued.fetch_sub(data.len(), std::sync::atomic::Ordering::SeqCst);
                     if let Err(error) = written {
                         *thread_failure
@@ -511,13 +525,35 @@ impl PaneInput {
                             Some(error.to_string());
                         break;
                     }
+                    if thread_stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                        // Discard what is still queued, so the count says
+                        // nothing is waiting to be written.
+                        while let Ok(dropped) = receiver.try_recv() {
+                            thread_queued
+                                .fetch_sub(dropped.len(), std::sync::atomic::Ordering::SeqCst);
+                        }
+                        break;
+                    }
                 }
             })?;
         Ok(Self {
             sender,
             failure,
             queued_bytes,
+            stopping,
         })
+    }
+
+    /// Stop writing: the writer drops what is queued after its current
+    /// slice, and later sends report that the pane's input was stopped.
+    fn stop(&self) {
+        *self
+            .failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some("the pane's input was stopped to close it".to_string());
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn send(&self, data: Vec<u8>) -> Result<(), DesktopBridgeError> {
@@ -690,6 +726,9 @@ impl Drop for DesktopRuntimeInner {
             .map(|(_, record)| record)
             .collect::<Vec<_>>();
         for record in records {
+            // As in `close_agent`: a writer still feeding queued input would
+            // keep the child from exiting before the reap deadline.
+            record.input.stop();
             if let Err(error) = record.backend.kill() {
                 let message = format!(
                     "desktop shutdown could not confirm runtime termination for {}: {error}",
@@ -1114,6 +1153,7 @@ impl DesktopRuntime {
             let Some(record) = removed else {
                 return;
             };
+            record.input.stop();
             if let Err(error) = record.backend.kill() {
                 let message = format!(
                     "terminal EOF observed for {exit_agent_id}, but its process could not be confirmed terminated: {error}"
@@ -1616,13 +1656,14 @@ impl DesktopRuntime {
             },
         )?;
         let governed_task = record.governed_task.clone();
+        record.input.stop();
         if let Err(error) = record.backend.kill() {
             self.lock_state()
                 .agents
                 .insert(request.session_id.clone(), record);
             return Err(DesktopBridgeError::TerminalTerminationFailed {
                 message: format!(
-                    "session {} remains managed because process termination was not confirmed: {error}",
+                    "session {} remains managed because process termination was not confirmed (its input is stopped): {error}",
                     request.session_id
                 ),
             });
@@ -4694,11 +4735,75 @@ mod tests {
                 "Input/output error (os error 5)".to_string(),
             ))),
             queued_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(PANE_INPUT_BYTES)),
+            stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         assert_eq!(
             input.send(vec![b'x'; 16]),
             Err(DesktopBridgeError::TerminalWriteFailed {
                 message: "Input/output error (os error 5)".to_string(),
+            })
+        );
+    }
+
+    /// A PTY writer that is slow per call and counts what it was given.
+    struct SlowCountingWriter(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl std::io::Write for SlowCountingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(2));
+            self.0
+                .fetch_add(buf.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Closing a pane mid-paste: the writer kept feeding the queued input to
+    /// the PTY while the child was being killed, and on macOS the echo kept
+    /// the child from exiting before the 5 s reap deadline (CI, PR #145).
+    #[test]
+    fn test_pane_input_stop_drops_queued_input_after_the_current_slice() {
+        let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer: Box<dyn std::io::Write + Send> =
+            Box::new(SlowCountingWriter(Arc::clone(&written)));
+        let queue =
+            impulse_term::backend::WriteQueue::new(Arc::new(parking_lot::Mutex::new(writer)));
+        let input = PaneInput::spawn("agent-stop", queue).expect("spawn the writer thread");
+        let total = 8 * 1024 * 1024;
+        input
+            .send(vec![b'x'; total / 2])
+            .expect("first paste queues");
+        input
+            .send(vec![b'x'; total / 2])
+            .expect("second paste queues");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while written.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "writer never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        input.stop();
+        while input.queued_bytes.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            assert!(Instant::now() < deadline, "writer kept the input queued");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let after_stop = written.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            after_stop < total,
+            "wrote all {after_stop} bytes after stop"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(
+            written.load(std::sync::atomic::Ordering::SeqCst),
+            after_stop
+        );
+        assert_eq!(
+            input.send(vec![b'x'; 16]),
+            Err(DesktopBridgeError::TerminalWriteFailed {
+                message: "the pane's input was stopped to close it".to_string(),
             })
         );
     }
