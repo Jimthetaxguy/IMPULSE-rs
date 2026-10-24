@@ -1467,6 +1467,7 @@ mod tests {
                             id: "desktop".into(),
                         },
                     },
+                    fencing_generation: Some(1),
                 },
             },
             WorkbenchDaemonRequest::SubmitGovernedClaim {
@@ -1477,6 +1478,7 @@ mod tests {
                     expected_revision: 2,
                     summary: "implemented".into(),
                     artifact_ids: vec!["artifact-1".into()],
+                    generation: Some(1),
                 },
             },
             WorkbenchDaemonRequest::RunGovernedVerification {
