@@ -317,6 +317,20 @@ impl Storage {
     /// can't be locked (some network mounts, NFS among them) the update runs
     /// unlocked with a warning, as before the lock existed.
     pub fn lock_exclusive(&self) -> Result<StorageLock> {
+        self.lock_exclusive_with(None)
+    }
+
+    /// [`Self::lock_exclusive`], giving up with an error after `wait`.
+    ///
+    /// For updates made on behalf of a hook or a daemon request: a holder that
+    /// never finishes (a suspended CLI, a history append stuck on a full or
+    /// hung disk) would otherwise hang every later hook and daemon worker
+    /// instead of failing them.
+    pub fn lock_exclusive_within(&self, wait: std::time::Duration) -> Result<StorageLock> {
+        self.lock_exclusive_with(Some(wait))
+    }
+
+    fn lock_exclusive_with(&self, wait: Option<std::time::Duration>) -> Result<StorageLock> {
         self.ensure_dir()?;
         #[cfg(unix)]
         {
@@ -324,16 +338,33 @@ impl Storage {
             let dir = File::open(&self.base_path).with_context(|| {
                 format!("Failed to open {} to lock it", self.base_path.display())
             })?;
+            let deadline = wait.map(|wait| std::time::Instant::now() + wait);
+            let operation = if deadline.is_some() {
+                libc::LOCK_EX | libc::LOCK_NB
+            } else {
+                libc::LOCK_EX
+            };
             loop {
                 // SAFETY: `dir` is open for the whole call, so the
                 // descriptor is valid; `flock` only takes an advisory lock
                 // on it and reads no memory.
-                if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                if unsafe { libc::flock(dir.as_raw_fd(), operation) } == 0 {
                     return Ok(StorageLock { _dir: Some(dir) });
                 }
                 let error = std::io::Error::last_os_error();
                 match error.raw_os_error() {
                     Some(libc::EINTR) => continue,
+                    Some(libc::EWOULDBLOCK) if deadline.is_some() => {
+                        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                            anyhow::bail!(
+                                "timed out after {:?} waiting for the lock on {}: another \
+                                 Impulse process is holding it",
+                                wait.unwrap_or_default(),
+                                self.base_path.display()
+                            );
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                     // EBADF: NFS emulates `flock` with byte-range locks, and
                     // an exclusive one needs a descriptor open for writing,
                     // which a directory can't be. The descriptor itself is
@@ -853,6 +884,24 @@ mod tests {
             handle.join().unwrap();
         }
         assert!(!overlapped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_lock_exclusive_within_times_out_while_another_holder_keeps_it() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new(dir.path().to_path_buf());
+        let held = storage.lock_exclusive().unwrap();
+
+        let error = match storage.lock_exclusive_within(std::time::Duration::from_millis(50)) {
+            Ok(_) => panic!("a held lock must not be taken"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+
+        drop(held);
+        assert!(storage
+            .lock_exclusive_within(std::time::Duration::from_millis(50))
+            .is_ok());
     }
 
     #[test]

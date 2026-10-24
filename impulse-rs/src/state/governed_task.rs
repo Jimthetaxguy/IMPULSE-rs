@@ -124,6 +124,17 @@ impl Default for GovernedTaskLedger {
     }
 }
 
+/// Every governed task as `GOVERNED_TASKS.json` holds it now, bypassing this
+/// process's copy. Memory-candidate reconciliation compares against this under
+/// the storage lock, since a direct-mode process's copy can predate a task the
+/// daemon accepted since.
+pub(super) fn governed_tasks_on_disk(storage: &Storage) -> Result<Vec<GovernedTaskRun>> {
+    Ok(GovernedTaskLedger::load(storage)?
+        .tasks
+        .into_values()
+        .collect())
+}
+
 impl GovernedTaskLedger {
     fn load(storage: &Storage) -> Result<Self> {
         let ledger: Self = storage

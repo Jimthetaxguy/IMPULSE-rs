@@ -1,21 +1,27 @@
-//! In-memory state with dirty-flag sync and Drop persistence.
+//! Project state shared by every process that opens a project.
 //!
 //! Core types: [`Config`] (runtime settings), [`State`] (session/file tracking),
-//! [`LiveState`] (ephemeral session state). All wrapped in `Arc<RwLock<_>>`
-//! for concurrent access. Syncs to `.impulse/` files only when dirty.
+//! [`LiveState`] (ephemeral session state). Each process (the daemon and every
+//! direct-mode hook) keeps its own in-memory copy, so a change is never written
+//! by saving that copy whole: it runs as one read-modify-write of the file on
+//! disk under [`Storage::lock_exclusive`], and the copy is refreshed from what
+//! was written. See [`State::update_live_state`] and [`State::update_config`].
 
 use super::*;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
 
 use crate::storage::Storage;
 
 const LIVE_STATE_FILE: &str = "LIVE_STATE.json";
+/// How long a state update waits for another process's update to finish
+/// before failing. Generous: the longest holder appends and syncs one history
+/// line or one memory decision.
+const STATE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const HISTORY_FILE: &str = "HISTORY.jsonl";
 const CONFLICTS_FILE: &str = "CONFLICTS.jsonl";
 
@@ -58,21 +64,16 @@ pub struct State {
     governed_producer_locks: tokio::sync::Mutex<
         HashMap<impulse_ops::governed_task::GovernedTaskId, Arc<tokio::sync::Mutex<()>>>,
     >,
+    /// This process's copy of `LIVE_STATE.json`, as of its last read or write.
+    /// Only [`State::update_live_state`] replaces it.
     live_state: RwLock<LiveState>,
-    /// Sessions whose history `end_session` is writing. They stay in
-    /// `live_state` until it is written; the mark lets only one end record a
-    /// session.
-    ending_sessions: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Set on every mutation, cleared after a sync. A lock-free `AtomicBool`
-    /// so `mark_dirty` (sync, called from async mutators) and the `Drop` flush
-    /// can never silently fail to set/read it under lock contention — a dropped
-    /// set would lose the mutation that triggered it.
-    dirty: AtomicBool,
-    /// Serializes every `LIVE_STATE.json` write from snapshot to rename. Without
-    /// it two daemon tasks could clone in one order and rename in the other,
-    /// leaving the older snapshot on disk with `dirty` already cleared.
-    live_state_write: std::sync::Mutex<()>,
+    /// This process's copy of `config.json`. Only [`State::update_config`]
+    /// replaces it.
     config: RwLock<Config>,
+    /// Sessions whose history line `end_session` appended but whose removal
+    /// from `LIVE_STATE.json` failed to save, with that line. A retry here
+    /// finishes the end instead of recording the session twice.
+    half_ended_sessions: std::sync::Mutex<HashMap<String, HistoryEntry>>,
 }
 
 impl std::fmt::Debug for State {
@@ -80,19 +81,6 @@ impl std::fmt::Debug for State {
         f.debug_struct("State")
             .field("storage", &self.storage.base_path())
             .finish()
-    }
-}
-
-impl Drop for State {
-    fn drop(&mut self) {
-        if self.dirty.load(Ordering::Acquire) {
-            let _write = self.live_state_write.lock();
-            if let Ok(state) = self.live_state.read() {
-                if let Err(err) = self.storage.write_json(LIVE_STATE_FILE, &*state) {
-                    tracing::error!("failed to persist live state on drop: {}", err);
-                }
-            }
-        }
     }
 }
 
@@ -124,10 +112,8 @@ impl State {
             producer_reservations,
             governed_producer_locks: tokio::sync::Mutex::new(HashMap::new()),
             live_state: RwLock::new(live_state),
-            ending_sessions: std::sync::Mutex::new(std::collections::HashSet::new()),
-            dirty: AtomicBool::new(false),
-            live_state_write: std::sync::Mutex::new(()),
             config: RwLock::new(config),
+            half_ended_sessions: std::sync::Mutex::new(HashMap::new()),
         };
         state.reconcile_accepted_run_memory_candidates()?;
         // Must follow candidate reconciliation: the log is cross-checked against
@@ -144,6 +130,15 @@ impl State {
 
     pub fn storage(&self) -> &Storage {
         &self.storage
+    }
+
+    /// Take the project-wide lock every read-modify-write of shared state
+    /// holds, failing after [`STATE_LOCK_WAIT`] rather than hanging behind a
+    /// holder that never finishes. Not re-entrant.
+    pub(super) fn lock_project_state(&self, purpose: &str) -> Result<crate::storage::StorageLock> {
+        self.storage
+            .lock_exclusive_within(STATE_LOCK_WAIT)
+            .with_context(|| format!("Failed to lock project state to {purpose}"))
     }
 
     /// Serialize daemon-owned producer side effects per governed task.
@@ -165,24 +160,29 @@ impl State {
         lock.lock_owned().await
     }
 
-    fn mark_dirty(&self) {
-        // Release so a subsequent Acquire load (Drop / sync) sees this set
-        // along with the mutation that preceded it.
-        self.dirty.store(true, Ordering::Release);
-    }
-
-    pub async fn sync_immediate(&self) -> Result<()> {
-        let _write = self.live_state_write.lock().map_err(lock_err)?;
-        // Cleared before the snapshot, not after the write: a mutation that
-        // lands between the two sets it again and is flushed later, instead of
-        // being marked clean without ever reaching disk.
-        self.dirty.store(false, Ordering::Release);
-        let state = self.live_state.read().map_err(lock_err)?.clone();
-        if let Err(error) = self.storage.write_json(LIVE_STATE_FILE, &state) {
-            self.mark_dirty();
-            return Err(error).context("Failed to write live state to disk");
-        }
-        Ok(())
+    /// Apply `change` to `LIVE_STATE.json` as it is on disk now, then save it.
+    ///
+    /// Every process that opens the project holds its own copy of the live
+    /// state, and saving that copy whole replaced whatever another process had
+    /// saved since it was loaded: a session one hook created vanished when a
+    /// concurrent hook saved, and a stale daemon task could rename an older
+    /// snapshot over a newer one. Each change now runs under the storage
+    /// directory lock against the current file, and this process's copy is
+    /// replaced with what was written. A failed `change` writes nothing.
+    ///
+    /// The lock is not re-entrant, so `change` must not start another update.
+    fn update_live_state<T>(&self, change: impl FnOnce(&mut LiveState) -> Result<T>) -> Result<T> {
+        let _lock = self.lock_project_state("update the live state")?;
+        let mut current = self
+            .storage
+            .read_json::<LiveState>(LIVE_STATE_FILE)
+            .context("Failed to read live state from disk")?;
+        let result = change(&mut current)?;
+        self.storage
+            .write_json(LIVE_STATE_FILE, &current)
+            .context("Failed to write live state to disk")?;
+        *self.live_state.write().map_err(lock_err)? = current;
+        Ok(result)
     }
 
     pub async fn create_session(
@@ -191,17 +191,11 @@ impl State {
         platform: Option<Platform>,
     ) -> Result<Session> {
         let session = Session::new(name, platform);
-
-        {
-            let mut state = self.live_state.write().map_err(lock_err)?;
+        self.update_live_state(|state| {
             state.add_session(session.clone());
-        }
-
-        self.mark_dirty();
-        self.sync_immediate()
-            .await
-            .context("Failed to sync state after creating session")?;
-
+            Ok(())
+        })
+        .context("Failed to sync state after creating session")?;
         Ok(session)
     }
 
@@ -210,67 +204,57 @@ impl State {
         session_id: &str,
         summary: String,
     ) -> Result<Option<HistoryEntry>> {
-        // Mark the session as ending under the lock, then write its history
-        // without the lock: the append syncs to disk, and holding the state's
-        // write lock across that made every state reader wait on the disk.
-        // The session stays in place until its history is written, so a save
-        // meanwhile still includes it and a failed append (disk full,
-        // unwritable file) loses nothing; taking it out early lost it when
-        // another session's save landed before the failure put it back. The
-        // mark lets only one of two concurrent ends record it.
-        let claimed = {
-            let state = self.live_state.read().map_err(lock_err)?;
-            match state.get_session(session_id) {
-                Some(session) => {
-                    if !self
-                        .ending_sessions
-                        .lock()
-                        .map_err(lock_err)?
-                        .insert(session_id.to_string())
-                    {
-                        anyhow::bail!("Session {session_id} is already being ended");
-                    }
-                    Some(HistoryEntry {
-                        session_id: session.id.clone(),
-                        session_name: session.name.clone(),
-                        platform: session.platform,
-                        started_at: session.created_at,
-                        ended_at: Utc::now(),
-                        summary,
-                        files_touched: session.active_files.clone(),
-                        tools_used: session.recent_tools.clone(),
-                    })
-                }
-                None => None,
+        // The history line is appended inside the update, before the session
+        // is removed. A failed append writes nothing, so the session stays and
+        // can be ended again. A concurrent end of the same session, in this
+        // process or another, waits for the lock and then finds the session
+        // gone, so it is never recorded twice. The in-memory copy is not locked
+        // during the append, so readers never wait on the disk.
+        let ended = self.update_live_state(|state| {
+            let Some(session) = state.get_session(session_id) else {
+                return Ok(None);
+            };
+            // An earlier end here appended its history line but failed to
+            // save the live state, so the session is still here. Finish that
+            // end rather than recording the session twice.
+            let half_ended = self
+                .half_ended_sessions
+                .lock()
+                .map_err(lock_err)?
+                .get(session_id)
+                .cloned();
+            if let Some(recorded) = half_ended {
+                state.remove_session(session_id);
+                return Ok(Some(recorded));
             }
-        };
-        let history_entry = match claimed {
-            Some(entry) => {
-                let appended = self.storage.append_jsonl(HISTORY_FILE, &entry);
-                // Remove the session before clearing the mark, so a concurrent
-                // end never finds it unmarked after its history was written.
-                if appended.is_ok() {
-                    self.live_state
-                        .write()
-                        .map_err(lock_err)?
-                        .remove_session(session_id);
-                }
-                self.ending_sessions
-                    .lock()
-                    .map_err(lock_err)?
-                    .remove(session_id);
-                appended.context("Failed to append session to history log")?;
-                Some(entry)
-            }
-            None => None,
-        };
-
-        self.mark_dirty();
-        self.sync_immediate()
-            .await
-            .context("Failed to sync state after ending session")?;
-
-        Ok(history_entry)
+            let entry = HistoryEntry {
+                session_id: session.id.clone(),
+                session_name: session.name.clone(),
+                platform: session.platform,
+                started_at: session.created_at,
+                ended_at: Utc::now(),
+                summary,
+                files_touched: session.active_files.clone(),
+                tools_used: session.recent_tools.clone(),
+            };
+            self.storage
+                .append_jsonl(HISTORY_FILE, &entry)
+                .context("Failed to append session to history log")?;
+            // Remembered until the live-state save below succeeds.
+            self.half_ended_sessions
+                .lock()
+                .map_err(lock_err)?
+                .insert(session_id.to_string(), entry.clone());
+            state.remove_session(session_id);
+            Ok(Some(entry))
+        });
+        if ended.is_ok() {
+            self.half_ended_sessions
+                .lock()
+                .map_err(lock_err)?
+                .remove(session_id);
+        }
+        ended
     }
 
     pub async fn track_file(&self, session_id: &str, file_path: &str) -> Result<()> {
@@ -353,38 +337,17 @@ impl State {
     }
 
     /// Helper for common session mutation pattern
-    async fn with_session<F>(&self, session_id: &str, mut f: F) -> Result<()>
+    async fn with_session<F>(&self, session_id: &str, f: F) -> Result<()>
     where
-        F: FnMut(&mut Session),
+        F: FnOnce(&mut Session),
     {
-        let mut updated = false;
-        {
-            let mut state = self.live_state.write().map_err(lock_err)?;
-            // An ending session's history entry is already built; an update
-            // now would report success and then vanish with the session.
-            // Checked under the write lock, which excludes the claim in
-            // `end_session`.
-            if self
-                .ending_sessions
-                .lock()
-                .map_err(lock_err)?
-                .contains(session_id)
-            {
-                anyhow::bail!("Session {session_id} is being ended");
-            }
-            if let Some(session) = state.get_session_mut(session_id) {
-                f(session);
-                updated = true;
-            }
-        }
-        if !updated {
-            anyhow::bail!("Session not found: {}", session_id);
-        }
-        self.mark_dirty();
-        self.sync_immediate()
-            .await
-            .context("Failed to sync state after session update")?;
-        Ok(())
+        self.update_live_state(|state| {
+            let session = state
+                .get_session_mut(session_id)
+                .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
+            f(session);
+            Ok(())
+        })
     }
 
     pub async fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
@@ -411,16 +374,32 @@ impl State {
         Ok(config.get(key))
     }
 
-    /// Set a config value by key
-    pub fn set_config(&self, key: &str, value: &str) -> Result<bool> {
-        let mut config = self.config.write().map_err(lock_err)?;
-        let result = config.set(key, value);
-        if result {
+    /// Apply `change` to `config.json` as it is on disk now, saving it when
+    /// `change` reports a change, and refresh this process's copy.
+    ///
+    /// Writing this process's copy whole, loaded when it started, reverted any
+    /// setting another process had saved since: a daemon that recorded a
+    /// supervisor permission grant undid a `config` command run meanwhile.
+    fn update_config(&self, change: impl FnOnce(&mut Config) -> bool) -> Result<bool> {
+        let _lock = self.lock_project_state("update the config")?;
+        let mut current = self
+            .storage
+            .read_json::<Config>(CONFIG_FILE)
+            .context("Failed to read config from disk")?;
+        current.keep_process_local(&*self.config.read().map_err(lock_err)?);
+        let changed = change(&mut current);
+        if changed {
             self.storage
-                .write_json(CONFIG_FILE, &*config)
+                .write_json(CONFIG_FILE, &current)
                 .context("Failed to persist config to disk")?;
         }
-        Ok(result)
+        *self.config.write().map_err(lock_err)? = current;
+        Ok(changed)
+    }
+
+    /// Set a config value by key
+    pub fn set_config(&self, key: &str, value: &str) -> Result<bool> {
+        self.update_config(|config| config.set(key, value))
     }
 
     /// List all config values
@@ -434,28 +413,55 @@ impl State {
         Ok(config.clone())
     }
 
-    /// Update guardrail rules in config and persist to disk
-    pub fn update_guardrail_rules(&self, rules: Vec<crate::guardrail::GuardRule>) -> Result<()> {
-        let mut config = self.config.write().map_err(lock_err)?;
-        config.guardrails.rules = rules;
-        self.storage
-            .write_json(CONFIG_FILE, &*config)
-            .context("Failed to persist guardrail rules to config")?;
+    /// Change the guardrail rules as they are on disk now and persist them.
+    ///
+    /// Takes the change rather than a finished list, so a rule toggled by
+    /// another process since this one loaded its config is kept.
+    pub fn update_guardrail_rules(
+        &self,
+        change: impl FnOnce(&mut Vec<crate::guardrail::GuardRule>),
+    ) -> Result<()> {
+        self.update_config(|config| {
+            change(&mut config.guardrails.rules);
+            true
+        })
+        .context("Failed to persist guardrail rules to config")?;
         Ok(())
     }
 
+    /// Change the supervisor's baseline permission policy as it is on disk now,
+    /// normalize and persist it, and return the result.
+    ///
+    /// Takes the change rather than a finished policy: a grant built from this
+    /// process's copy reinstated a permission revoked from the CLI since.
     pub fn update_impulse_agent_permissions(
         &self,
-        policy: impulse_ops::SupervisorPermissionPolicy,
-    ) -> Result<()> {
-        let mut config = self.config.write().map_err(lock_err)?;
-        let mut normalized = policy;
-        normalized.normalize();
-        config.impulse_agent_permissions = normalized;
-        self.storage
-            .write_json(CONFIG_FILE, &*config)
-            .context("Failed to persist agent permissions to config")?;
-        Ok(())
+        change: impl FnOnce(&mut impulse_ops::SupervisorPermissionPolicy),
+    ) -> Result<impulse_ops::SupervisorPermissionPolicy> {
+        let mut updated = None;
+        self.update_config(|config| {
+            change(&mut config.impulse_agent_permissions);
+            config.impulse_agent_permissions.normalize();
+            updated = Some(config.impulse_agent_permissions.clone());
+            true
+        })
+        .context("Failed to persist agent permissions to config")?;
+        updated.context("agent permission update did not run")
+    }
+
+    /// The config as `config.json` holds it now, refreshing this process's
+    /// copy. For decisions that must see a change another process made, such
+    /// as a permission revoked from the CLI while the daemon runs; the atomic
+    /// rename means an unlocked read never sees a torn file.
+    pub fn current_config(&self) -> Result<Config> {
+        let mut current = self
+            .storage
+            .read_json::<Config>(CONFIG_FILE)
+            .context("Failed to read config from disk")?;
+        let mut copy = self.config.write().map_err(lock_err)?;
+        current.keep_process_local(&copy);
+        *copy = current.clone();
+        Ok(current)
     }
 
     /// Conflict analytics, built from the audit trail conflict detection
@@ -643,29 +649,192 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// A failed live-state write must leave the state dirty, so the `Drop`
-    /// flush still tries to persist the mutation it could not save.
+    /// Two `State`s on one project stand in for two processes: a direct-mode
+    /// hook and the daemon each load their own copy. Each used to save its
+    /// copy whole, so the second save dropped the first one's session.
     #[tokio::test]
-    async fn test_sync_immediate_failure_leaves_state_dirty() {
+    async fn test_two_states_on_one_project_keep_each_others_sessions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let hook = State::new(dir.path().to_path_buf()).unwrap();
+        let daemon = State::new(dir.path().to_path_buf()).unwrap();
+
+        let first = hook.create_session("hook".to_string(), None).await.unwrap();
+        let second = daemon
+            .create_session("daemon".to_string(), None)
+            .await
+            .unwrap();
+        // The daemon's copy predates the hook's session; tracking it must
+        // still find it on disk.
+        daemon.track_file(&first.id, "src/lib.rs").await.unwrap();
+
+        let reopened = State::new(dir.path().to_path_buf()).unwrap();
+        let sessions = reopened.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 2);
+        let tracked = reopened.get_session(&first.id).await.unwrap().unwrap();
+        assert_eq!(tracked.active_files, vec!["src/lib.rs".to_string()]);
+        assert!(reopened.get_session(&second.id).await.unwrap().is_some());
+    }
+
+    /// A stale copy must neither resurrect an ended session nor record its
+    /// history twice.
+    #[tokio::test]
+    async fn test_a_session_ended_elsewhere_is_not_ended_twice() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let first = State::new(dir.path().to_path_buf()).unwrap();
+        let session = first.create_session("s".to_string(), None).await.unwrap();
+        let stale = State::new(dir.path().to_path_buf()).unwrap();
+
+        assert!(first
+            .end_session(&session.id, "done".to_string())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(stale
+            .end_session(&session.id, "again".to_string())
+            .await
+            .unwrap()
+            .is_none());
+        stale
+            .create_session("other".to_string(), None)
+            .await
+            .unwrap();
+
+        assert_eq!(first.get_history_sync().unwrap().len(), 1);
+        let reopened = State::new(dir.path().to_path_buf()).unwrap();
+        assert!(reopened.get_session(&session.id).await.unwrap().is_none());
+    }
+
+    /// The daemon's copy of the config predates a `config` command run while
+    /// it is up; recording a permission grant used to write that copy back.
+    #[test]
+    fn test_two_states_on_one_project_keep_each_others_config() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let daemon = State::new(dir.path().to_path_buf()).unwrap();
+        let cli = State::new(dir.path().to_path_buf()).unwrap();
+
+        assert!(cli.set_config("log_level", "debug").unwrap());
+        daemon
+            .update_impulse_agent_permissions(|policy| {
+                *policy = impulse_ops::SupervisorPermissionPolicy::default();
+            })
+            .unwrap();
+
+        let reopened = State::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(
+            reopened.get_config("log_level").unwrap().as_deref(),
+            Some("debug")
+        );
+        assert_eq!(
+            daemon.get_config("log_level").unwrap().as_deref(),
+            Some("debug"),
+            "the writer's own copy is refreshed from disk"
+        );
+    }
+
+    /// The API key is never written to `config.json`; refreshing the copy
+    /// from disk on the next update must not drop it.
+    #[test]
+    fn test_config_update_keeps_the_process_local_api_key() {
         let dir = tempfile::TempDir::new().unwrap();
         let state = State::new(dir.path().to_path_buf()).unwrap();
-        state.mark_dirty();
-        // A directory at the target path makes the final rename fail.
-        std::fs::create_dir_all(dir.path().join(LIVE_STATE_FILE).join("blocker")).unwrap();
+        assert!(state
+            .set_config("impulse_agent_api_key", "test-key")
+            .unwrap());
+        assert!(state.set_config("log_level", "debug").unwrap());
 
-        assert!(state.sync_immediate().await.is_err());
-        assert!(state.dirty.load(Ordering::Acquire));
+        assert_eq!(
+            state
+                .config_snapshot()
+                .unwrap()
+                .impulse_agent_api_key
+                .as_deref(),
+            Some("test-key")
+        );
+        let on_disk = std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(!on_disk.contains("test-key"));
+    }
+
+    /// Review: the history append landed but the live-state save failed, so
+    /// the session stayed and ending it again recorded it a second time.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_end_after_a_failed_save_does_not_record_the_session_twice() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = State::new(dir.path().to_path_buf()).unwrap();
+        let session = state.create_session("s".to_string(), None).await.unwrap();
+        // The history file exists, so its append still works when the
+        // directory is read-only; the atomic live-state write does not.
+        std::fs::write(dir.path().join(HISTORY_FILE), "").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let first = state.end_session(&session.id, "done".to_string()).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(first.is_err(), "the live-state save should have failed");
+
+        let second = state
+            .end_session(&session.id, "again".to_string())
+            .await
+            .unwrap()
+            .expect("the session is still recorded as live");
+        assert_eq!(second.summary, "done");
+        assert_eq!(state.get_history_sync().unwrap().len(), 1);
+        assert!(state.get_session(&session.id).await.unwrap().is_none());
+    }
+
+    /// A permission revoked from the CLI while the daemon runs must survive
+    /// the daemon's next grant, which used to start from its stale copy.
+    #[test]
+    fn test_a_permission_grant_keeps_a_revocation_made_elsewhere() {
+        use impulse_ops::SupervisorActionPermission as Permission;
+        let dir = tempfile::TempDir::new().unwrap();
+        let daemon = State::new(dir.path().to_path_buf()).unwrap();
+        let cli = State::new(dir.path().to_path_buf()).unwrap();
+        assert!(daemon
+            .config_snapshot()
+            .unwrap()
+            .impulse_agent_permissions
+            .allows_action(Permission::ModifyPermissions));
+
+        cli.update_impulse_agent_permissions(|policy| {
+            policy
+                .allowed_actions
+                .retain(|action| *action != Permission::ModifyPermissions);
+        })
+        .unwrap();
+        let granted = daemon
+            .update_impulse_agent_permissions(|policy| policy.grant_action(Permission::FocusAgent))
+            .unwrap();
+
+        assert!(!granted.allows_action(Permission::ModifyPermissions));
+        assert!(!daemon
+            .current_config()
+            .unwrap()
+            .impulse_agent_permissions
+            .allows_action(Permission::ModifyPermissions));
     }
 
     #[tokio::test]
-    async fn test_sync_immediate_success_clears_dirty() {
+    async fn test_failed_live_state_write_changes_nothing() {
         let dir = tempfile::TempDir::new().unwrap();
         let state = State::new(dir.path().to_path_buf()).unwrap();
-        state.mark_dirty();
+        // A directory at the target path makes the final rename fail.
+        std::fs::create_dir_all(dir.path().join(LIVE_STATE_FILE).join("blocker")).unwrap();
 
-        state.sync_immediate().await.unwrap();
+        assert!(state.create_session("s".to_string(), None).await.is_err());
+        assert!(state.list_sessions().await.unwrap().is_empty());
+    }
 
-        assert!(!state.dirty.load(Ordering::Acquire));
+    #[test]
+    fn test_corrupt_config_on_disk_fails_an_update_instead_of_overwriting_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = State::new(dir.path().to_path_buf()).unwrap();
+        std::fs::write(dir.path().join(CONFIG_FILE), "{not json").unwrap();
+
+        assert!(state.set_config("log_level", "debug").is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap(),
+            "{not json"
+        );
     }
 
     /// Review P2: try-locks on the Tokio RwLocks failed any call that
@@ -690,7 +859,8 @@ mod tests {
 
     /// Recorded review item: the state's write lock was held across the
     /// history append and its fsync, so every state reader waited on the
-    /// disk. A FIFO stands in for a slow disk: nobody reads it, so a history
+    /// disk. Writers still wait (the end holds the project lock), readers
+    /// must not. A FIFO stands in for a slow disk: nobody reads it, so a history
     /// line larger than its buffer leaves the append waiting in `write`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -714,20 +884,26 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(!end.is_finished(), "the append did not wait on the FIFO");
 
-        // Round 4 (reviewer A): the session was taken out while its history
-        // was written, so a save meanwhile dropped it, and a failed append
-        // then lost it for good. It stays saved, and a second end is refused.
-        // Checked after the FIFO is drained: a failed assertion here would
-        // leave the writer blocked and the test hanging.
-        let saved = state.sync_immediate().await.is_ok()
-            && std::fs::read_to_string(dir.path().join(LIVE_STATE_FILE))
-                .is_ok_and(|saved| saved.contains(&ending_id));
-        let second_end_refused = state
-            .end_session(&ending_id, "again".to_string())
-            .await
+        // A second end and a tracking update, as another process would send
+        // them, wait for the end's lock instead of racing it. Run on a plain
+        // thread so a blocked call cannot stall the runtime.
+        let (writes_sent, writes_received) = std::sync::mpsc::channel();
+        let writer = Arc::clone(&state);
+        let writer_id = ending_id.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let second_end = runtime.block_on(writer.end_session(&writer_id, "again".to_string()));
+            let tracking = runtime.block_on(writer.track_file(&writer_id, "late.rs"));
+            let _ = writes_sent.send((
+                second_end.map(|entry| entry.is_none()).ok(),
+                tracking.is_err(),
+            ));
+        });
+        let writes_waited = writes_received
+            .recv_timeout(std::time::Duration::from_millis(200))
             .is_err();
-        // Round 5 (reviewer A): tracking then reported success and was lost.
-        let tracking_refused = state.track_file(&ending_id, "late.rs").await.is_err();
 
         // Read another session from a plain thread: a held std lock would
         // block it, and a runtime thread blocked that way could not time out.
@@ -754,7 +930,16 @@ mod tests {
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             match std::io::Read::read(&mut drain, &mut buf) {
-                Ok(0) => break,
+                // A FIFO also reads as empty before the writer has connected;
+                // closing it then breaks the writer's pipe and fails the end,
+                // so keep draining until the end has actually finished.
+                Ok(0)
+                    if end.is_finished()
+                        || started.elapsed() > std::time::Duration::from_secs(10) =>
+                {
+                    break
+                }
+                Ok(0) => std::thread::sleep(std::time::Duration::from_millis(5)),
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if end.is_finished() || started.elapsed() > std::time::Duration::from_secs(10) {
@@ -767,14 +952,51 @@ mod tests {
         }
         let _ = tokio::time::timeout(std::time::Duration::from_secs(10), end).await;
 
+        let writes = writes_received.recv_timeout(std::time::Duration::from_secs(10));
+
         assert_eq!(
             readable,
             Ok(Some(true)),
             "state blocked while history was written"
         );
-        assert!(saved, "a save during the end dropped the session");
-        assert!(second_end_refused, "a second end was not refused");
-        assert!(tracking_refused, "tracking an ending session was accepted");
+        assert!(
+            writes_waited,
+            "a write did not wait for the end in progress"
+        );
+        // Whether the end itself succeeds depends on the platform's FIFO
+        // semantics (Linux opens a FIFO read-write without a peer and then
+        // refuses `fsync` on it), so only check that the waiting writes ran
+        // once the lock was released. What they must find after an end is
+        // checked on a regular file in
+        // `test_writes_after_an_end_find_the_session_gone`.
+        assert!(writes.is_ok(), "the waiting writes never ran");
+    }
+
+    /// Round 4/5 (reviewer A): a second end must not record the session
+    /// again, and tracking it must not report success and then vanish.
+    #[tokio::test]
+    async fn test_writes_after_an_end_find_the_session_gone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let state = State::new(dir.path().to_path_buf()).unwrap();
+        let ending = state.create_session("s".to_string(), None).await.unwrap();
+        let other = state.create_session("t".to_string(), None).await.unwrap();
+
+        assert!(state
+            .end_session(&ending.id, "done".to_string())
+            .await
+            .unwrap()
+            .is_some());
+        assert!(state
+            .end_session(&ending.id, "again".to_string())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(state.track_file(&ending.id, "late.rs").await.is_err());
+
+        assert_eq!(state.get_history_sync().unwrap().len(), 1);
+        let saved = std::fs::read_to_string(dir.path().join(LIVE_STATE_FILE)).unwrap();
+        assert!(!saved.contains(&ending.id));
+        assert!(saved.contains(&other.id));
     }
 
     /// Review P2: the session was removed before its history was appended,
