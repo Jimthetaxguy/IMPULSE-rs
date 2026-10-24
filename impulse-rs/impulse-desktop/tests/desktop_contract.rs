@@ -733,10 +733,27 @@ const bridgePromise = eval(bridgeScript);
 if (bridgePromise && typeof bridgePromise.catch === "function") {{
   bridgePromise.catch(() => {{}});
 }}
-setTimeout(() => {{
+// Snapshot once the bridge has stamped its attributes and they have stopped
+// changing for 100 ms, not after a fixed delay: 400 ms was too short on a
+// loaded macOS CI runner (host-kind came back null), and the bridge can still
+// rewrite ops-bridge and add a reason just after the first stamp. Capped so
+// a broken bridge still exits.
+const started = Date.now();
+let last = "";
+let stableSince = Date.now();
+const settle = () => {{
+  const now = JSON.stringify(attrs);
+  if (now !== last) {{ last = now; stableSince = Date.now(); }}
+  const stamped = "data-impulse-host-kind" in attrs && "data-impulse-ops-bridge" in attrs;
+  const quiet = Date.now() - stableSince >= 100;
+  if (!(stamped && quiet) && Date.now() - started < 5000) {{
+    setTimeout(settle, 20);
+    return;
+  }}
   console.log(JSON.stringify({{ attrs, sent, invoked, bridge: window.__impulseOpsBridge }}));
   process.exit(0);
-}}, 400);
+}};
+setTimeout(settle, 20);
 "#,
         bridge_script =
             serde_json::to_string(desktop_event_bridge_script()).expect("serialize bridge script"),
@@ -828,10 +845,27 @@ if (bridgePromise && typeof bridgePromise.catch === "function") {{
     process.exit(1);
   }});
 }}
-setTimeout(() => {{
+// Snapshot once the bridge has stamped its attributes and they have stopped
+// changing for 100 ms, not after a fixed delay: 400 ms was too short on a
+// loaded macOS CI runner (host-kind came back null), and the bridge can still
+// rewrite ops-bridge and add a reason just after the first stamp. Capped so
+// a broken bridge still exits.
+const started = Date.now();
+let last = "";
+let stableSince = Date.now();
+const settle = () => {{
+  const now = JSON.stringify(attrs);
+  if (now !== last) {{ last = now; stableSince = Date.now(); }}
+  const stamped = "data-impulse-host-kind" in attrs && "data-impulse-ops-bridge" in attrs;
+  const quiet = Date.now() - stableSince >= 100;
+  if (!(stamped && quiet) && Date.now() - started < 5000) {{
+    setTimeout(settle, 20);
+    return;
+  }}
   console.log(JSON.stringify({{ attrs, sent, invoked, bridge: window.__impulseOpsBridge }}));
   process.exit(0);
-}}, 400);
+}};
+setTimeout(settle, 20);
 "#,
         bridge_script =
             serde_json::to_string(desktop_event_bridge_script()).expect("serialize bridge script"),
@@ -1158,10 +1192,23 @@ global.dioxus = {{
 }};
 
 eval(bridgeScript);
-setTimeout(() => {{
+// Same settle-then-snapshot as the other bridge smokes (was a fixed 25 ms).
+const started = Date.now();
+let last = "";
+let stableSince = Date.now();
+const settle = () => {{
+  const now = JSON.stringify(attrs);
+  if (now !== last) {{ last = now; stableSince = Date.now(); }}
+  const stamped = "data-impulse-host-kind" in attrs && "data-impulse-ops-bridge" in attrs;
+  const quiet = Date.now() - stableSince >= 100;
+  if (!(stamped && quiet) && Date.now() - started < 5000) {{
+    setTimeout(settle, 20);
+    return;
+  }}
   console.log(JSON.stringify({{ attrs, sent, bridge: window.__impulseOpsBridge }}));
   process.exit(0);
-}}, 25);
+}};
+setTimeout(settle, 20);
 "#,
         bridge_script =
             serde_json::to_string(desktop_event_bridge_script()).expect("serialize bridge script"),
