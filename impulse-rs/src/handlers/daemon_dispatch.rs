@@ -265,6 +265,19 @@ fn print_governed_ack(
             "{label}: {} revision {} review={:?}",
             task.id, task.revision, task.review_state
         );
+        // Blueprint 2.1 change #4: never let a worker's "done" stand in for
+        // evidence. Say so whenever the two disagree.
+        if let Some(promise) = task.claim_evidence_divergence() {
+            println!(
+                "  claimed done, evidence {:?} (latest verification: {}) for claim {}",
+                promise.evidenced_status,
+                promise
+                    .latest_evidence_outcome
+                    .map(|outcome| format!("{outcome:?}"))
+                    .unwrap_or_else(|| "none".to_string()),
+                promise.claim_id
+            );
+        }
     }
     Ok(())
 }
