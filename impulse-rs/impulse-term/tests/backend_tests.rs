@@ -1,7 +1,24 @@
 //! Integration tests for TerminalBackend (PTY lifecycle, output reading, resize, scrollback).
 
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Polls `condition` until it holds or 10 s pass. A fixed sleep before the
+/// assert (100-300 ms here before) flakes on a loaded CI runner where the
+/// PTY echo or the child's exit arrives later; this returns as soon as it
+/// holds, so it costs nothing when the test passes.
+fn eventually(mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
 
 /// Helper: spawn a long-running backend running `cat` (reads stdin until EOF).
 /// cat stays alive until its stdin is closed, making it ideal for write→read tests.
@@ -37,12 +54,10 @@ fn test_write_input_and_read_screen_text() {
         .write_input(b"hello from cat\n")
         .expect("write_input should succeed");
 
-    thread::sleep(Duration::from_millis(100));
-    let text = backend.screen_text();
     assert!(
-        text.contains("hello from cat"),
+        eventually(|| backend.screen_text().contains("hello from cat")),
         "cat should echo our input, got: {:?}",
-        text
+        backend.screen_text()
     );
 }
 
@@ -53,12 +68,10 @@ fn test_visible_char_count_increases() {
     thread::sleep(Duration::from_millis(50));
 
     backend.write_input(b"abcdef\n").unwrap();
-    thread::sleep(Duration::from_millis(100));
-    let count = backend.visible_char_count();
     assert!(
-        count >= 6,
+        eventually(|| backend.visible_char_count() >= 6),
         "visible_char_count should be at least 6 after cat echoes input, got {}",
-        count
+        backend.visible_char_count()
     );
 }
 
@@ -82,12 +95,10 @@ fn test_output_bytes_incremented() {
     // Write to cat and verify bytes increment.
     let backend = spawn_cat();
     backend.write_input(b"ping\n").unwrap();
-    thread::sleep(Duration::from_millis(100));
-    let bytes = backend.output_bytes();
     assert!(
-        bytes > 0,
+        eventually(|| backend.output_bytes() > 0),
         "output_bytes should be > 0 after cat outputs, got {}",
-        bytes
+        backend.output_bytes()
     );
 }
 
@@ -115,7 +126,10 @@ fn test_scrollback_text() {
     thread::sleep(Duration::from_millis(50));
 
     backend.write_input(b"line1\n").unwrap();
-    thread::sleep(Duration::from_millis(100));
+    assert!(
+        eventually(|| backend.scrollback_text(10).contains("line1")),
+        "cat should echo line1 into scrollback"
+    );
 
     // scrollback_text with 0 lines should give visible screen.
     let visible = backend.scrollback_text(0);
@@ -147,12 +161,10 @@ fn test_output_lines_incremented() {
     thread::sleep(Duration::from_millis(50));
 
     backend.write_input(b"line1\nline2\nline3\n").unwrap();
-    thread::sleep(Duration::from_millis(150));
-    let lines = backend.output_lines();
     assert!(
-        lines >= 3,
+        eventually(|| backend.output_lines() >= 3),
         "output_lines should be at least 3 after writing 3 newlines, got {}",
-        lines
+        backend.output_lines()
     );
 }
 
@@ -173,10 +185,9 @@ fn test_reader_thread_eof_sets_alive_false() {
     )
     .expect("echo spawn should succeed");
 
-    // Give the reader thread time to process EOF after echo exits.
-    thread::sleep(Duration::from_millis(300));
+    // The reader thread processes EOF after echo exits.
     assert!(
-        !backend.is_alive(),
+        eventually(|| !backend.is_alive()),
         "backend should report not-alive after child exits naturally"
     );
 }
@@ -195,9 +206,8 @@ fn test_has_new_output_since_detects_new_data() {
     );
 
     backend.write_input(b"new data\n").unwrap();
-    thread::sleep(Duration::from_millis(100));
     assert!(
-        backend.has_new_output_since(baseline),
+        eventually(|| backend.has_new_output_since(baseline)),
         "should detect new output after writing"
     );
 }

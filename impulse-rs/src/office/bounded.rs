@@ -1541,6 +1541,11 @@ mod proptests {
         /// and once it refuses, `push_line` with content that would exceed
         /// the same budget also refuses -- the two must agree, since
         /// `push_line` calls `check_pending` internally before writing.
+        ///
+        /// The agreement holds only for lines `push_line` would write. A
+        /// whitespace-only line is dropped before any budget check (see
+        /// `word_text_builder_drops_whitespace_only_lines`), so it is always
+        /// accepted and adds nothing, whatever the budget.
         #[test]
         fn word_text_builder_check_pending_and_push_line_agree(
             max_chars in 1..64usize,
@@ -1552,7 +1557,12 @@ mod proptests {
 
             let mut builder = WordTextBuilder::new(max_chars);
             let pushed = builder.push_line(&line, "doc.docx").is_ok();
-            prop_assert_eq!(precheck, pushed);
+            if line.trim().is_empty() {
+                prop_assert!(pushed);
+                prop_assert_eq!(builder.chars(), 0);
+            } else {
+                prop_assert_eq!(precheck, pushed);
+            }
         }
     }
 }
