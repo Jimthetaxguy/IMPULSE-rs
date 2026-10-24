@@ -1,8 +1,4 @@
-//! Primary keyword-based routing implementation
-//!
-//! This module provides keyword-based routing for computed routing
-//! and injection selection. Future: #[cfg(feature = "monty-support")]
-//! enables PyO3 computed routing.
+//! Keyword routing for computed routing and injection selection.
 
 use super::{ComputedRoute, InjectionDecision, RoutingTarget};
 

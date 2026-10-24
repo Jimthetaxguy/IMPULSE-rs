@@ -164,7 +164,7 @@ impulse-rs --daemon session-start -n "chat-session"
 | Total lines of code | ~80K active (66K main + 4K term + 7.8K desktop + 1.75K ops); +15K in frozen impulse-gui. ~40K impl SLOC vs ~33K test (28K inline + 5K integration). |
 | Source modules | 38 declared in `main.rs` |
 | Tests passing (`cargo test`) | 1,711 (1381+26 impulse-rs + 31 ops + 114 term + 159 desktop, 5 ignored; impulse-gui frozen/excluded) |
-| Feature flags | `office-support` (default), `monty-support`, `datafusion-support` |
+| Feature flags | `office-support` and `photon-subagent` (default), `datafusion-support` (opt-in). `calc`/`exec` are not feature-gated. |
 | DynamicTools registered | 22 |
 
 ---
@@ -690,7 +690,7 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 | **Now**    | Tool/model/credential management                                       | Rust        | **Complete** |
 | **Now**    | System utilities (calc, exec, health, system)                          | Rust        | **Complete** |
 | **Next**   | Retrieval + review-first context injection (feature-flagged, additive) | Rust+Python | **Complete** |
-| **Next**   | Monty: `src/monty/` PyO3 module is an unbuilt stub (`monty-support` never built by CI); sandboxed Python for calc/exec lives in `tools/python.rs` (ADR-0021) | Rust | **Partial** |
+| **Next**   | Monty sandbox for calc/exec is `tools/python.rs` (ADR-0021). `src/monty/` is keyword routing. The PyO3 `monty-support` stub was removed 2026-10-21. Crash isolation (`monty-pool`) is still open | Rust | **Partial** |
 | **Later**  | Desktop bundle                                                         | Dioxus Desktop | **Open**  |
 | **Later**  | DataFusion analytics (optional)                                        | Rust        | **Open**     |
 | **Future** | Agent VCS + dashboard                                                  | +Rust       | Vision       |
@@ -712,10 +712,10 @@ Config at `.opencode/impulse.json` with equivalent hooks.
 - Retrieval index (`retrieval.db`) with FTS5 keyword search
 - Feature-flagged semantic path with fallback-safe behavior
 - Review-first context injection on daemon chat and direct orchestration
-- `src/monty/` routing, injection, KDB, and SWARM run as keyword heuristics in plain Rust; the PyO3
-  `monty-support` path is an unbuilt stub, not a completed integration
+- `src/monty/` routing, injection, KDB, and SWARM run as keyword heuristics in plain Rust. The PyO3
+  `monty-support` feature and `src/monty/python.rs` were removed on 2026-10-21
 - Sandboxed Python for `calc`, `exec`, `calculator`, and `python_exec` uses the in-process `monty`
-  crate with no filesystem, network, or process access (ADR-0021)
+  crate with no filesystem, network, or process access (ADR-0021). `monty-pool` crash isolation is still open
 
 **Later (Coordination UX):**
 - Advanced coordination UX and agent dashboarding

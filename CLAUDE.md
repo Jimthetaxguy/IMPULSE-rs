@@ -161,7 +161,7 @@ ADR-0020's state and request-type contracts implement candidate decisions, `MEMO
 | State | `RwLock` + dirty flag + sync on Drop |
 | Naming | `PascalCase` structs, `snake_case` functions, `SCREAMING_SNAKE` constants |
 | Testing | Unit tests in `mod tests` per file, integration tests with `DaemonGuard` RAII |
-| Feature flags | `office-support` (default), `monty-support`, `datafusion-support` (opt-in) |
+| Feature flags | `office-support` and `photon-subagent` (default), `datafusion-support` (opt-in). `calc`/`exec` use the `monty` crate and are not feature-gated. |
 
 ---
 
