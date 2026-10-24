@@ -279,6 +279,7 @@ pub(crate) fn register_governed_task(
         mutation: GovernedTaskMutation::MaterializeStagedWorktree {
             staged: staged.clone(),
         },
+        fencing_generation: None,
     };
     match state.mutate_governed_task(mutation_request) {
         Ok(task) => Ok(task),
@@ -416,6 +417,9 @@ async fn promote_governed_outcome(
         ProducerKind::Promotion,
         &request.request_id,
     );
+    // Captured before Git is touched: if the lease is taken over while the
+    // promotion runs, the ledger fences the result instead of recording it.
+    let promotion_generation = task.lease_generation();
     let promotion_task = task.clone();
     let promotion_request = request.clone();
     let updated = reserved_producer(
@@ -433,6 +437,7 @@ async fn promote_governed_outcome(
                 task_id: promotion_request.task_id,
                 expected_revision: promotion_request.expected_revision,
                 mutation: GovernedTaskMutation::RecordPromotion { promotion },
+                fencing_generation: Some(promotion_generation),
             })
         },
     )
@@ -505,6 +510,7 @@ async fn discard_governed_staged_worktree(
             actor: staged_system_actor(),
             reason: request.reason,
         },
+        fencing_generation: None,
     };
     let updated = persist_governed_mutation(state, mutation_request).await?;
     Ok(GovernedStagedWorktreeDiscardAck {
@@ -669,6 +675,7 @@ async fn run_governed_verification(
                 task_id: request.task_id,
                 expected_revision: request.expected_revision,
                 mutation: GovernedTaskMutation::RecordVerification { verification },
+                fencing_generation: Some(task.lease_generation()),
             },
         )
         .await?;
@@ -682,6 +689,9 @@ async fn run_governed_verification(
         ProducerKind::Verification,
         &request.request_id,
     );
+    // Captured before the verification commands run: a takeover while they
+    // run fences this result rather than recording stale evidence.
+    let verification_generation = task.lease_generation();
     let verification_task = task.clone();
     let producer_request = request.clone();
     let updated = reserved_producer(
@@ -699,6 +709,7 @@ async fn run_governed_verification(
                 task_id: producer_request.task_id,
                 expected_revision: producer_request.expected_revision,
                 mutation: GovernedTaskMutation::RecordVerification { verification },
+                fencing_generation: Some(verification_generation),
             })
         },
     )
@@ -747,6 +758,7 @@ pub(crate) async fn handle_governed_supervisor_review(
             task_id: request.task_id,
             expected_revision: request.expected_revision,
             mutation: GovernedTaskMutation::RecordSupervisorVerdict { verdict },
+            fencing_generation: None,
         };
         return match persist_governed_mutation(state, mutation_request).await {
             Ok(updated) => respond_ok(&GovernedProducerAck::new(updated, true, None)),
@@ -813,6 +825,7 @@ pub(crate) async fn handle_governed_supervisor_review(
                 task_id: producer_request.task_id,
                 expected_revision: producer_request.expected_revision,
                 mutation: GovernedTaskMutation::RecordSupervisorVerdict { verdict },
+                fencing_generation: None,
             })
         },
     )
@@ -1003,6 +1016,7 @@ mod tests {
                 task_id: task.id.clone(),
                 expected_revision: task.revision,
                 mutation,
+                fencing_generation: None,
             })
             .unwrap_or_else(|error| panic!("mutation `{id}` must apply: {error}"))
     }
@@ -1589,6 +1603,7 @@ mod tests {
             mutation: GovernedTaskMutation::MarkRunning {
                 actor: staged_system_actor(),
             },
+            fencing_generation: None,
         });
         let launch_error = launch.expect_err("an unpinned worktree must not be launched into");
         assert!(
@@ -1782,6 +1797,7 @@ mod tests {
                     expected_revision: running.revision,
                     summary: "work complete".to_string(),
                     artifact_ids: Vec::new(),
+                    generation: None,
                 },
             },
             &state,
@@ -1868,6 +1884,7 @@ mod tests {
                         expected_revision: running.revision,
                         summary: "work complete".to_string(),
                         artifact_ids: Vec::new(),
+                        generation: None,
                     },
                 },
                 &state,
@@ -2737,6 +2754,7 @@ mod tests {
                         expected_revision: running.revision,
                         summary: "staged work complete".to_string(),
                         artifact_ids: Vec::new(),
+                        generation: None,
                     },
                 },
                 &state,
@@ -2819,6 +2837,7 @@ mod tests {
                                 rationale: "evidence supports the criteria".to_string(),
                             },
                         },
+                        fencing_generation: None,
                     },
                 },
                 &state,

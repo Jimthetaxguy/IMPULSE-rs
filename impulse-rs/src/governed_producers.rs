@@ -3845,6 +3845,7 @@ mod tests {
             expected_revision: registered.revision,
             summary: "done".to_string(),
             artifact_ids: Vec::new(),
+            generation: None,
         };
         let claim = derive_claim(&registered, &request).unwrap();
 
@@ -3952,6 +3953,7 @@ mod tests {
             expected_revision: registered.revision,
             summary: "done".to_string(),
             artifact_ids: Vec::new(),
+            generation: None,
         };
         let claim_input = derive_claim(&registered, &request).unwrap();
         assert_eq!(claim_input.subject_revision, builder_commit);
@@ -4033,6 +4035,7 @@ mod tests {
             expected_revision: registered.revision,
             summary: "done".to_string(),
             artifact_ids: Vec::new(),
+            generation: None,
         };
         let error = derive_claim(&registered, &request)
             .expect_err("the claim producer refuses the same way");
@@ -4218,6 +4221,7 @@ mod tests {
             expected_revision: task.revision,
             summary: "done".to_string(),
             artifact_ids: Vec::new(),
+            generation: None,
         }
     }
 

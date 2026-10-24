@@ -218,6 +218,7 @@ fn mutation_request(
         task_id: task.id.clone(),
         expected_revision: task.revision,
         mutation,
+        fencing_generation: None,
     }
 }
 

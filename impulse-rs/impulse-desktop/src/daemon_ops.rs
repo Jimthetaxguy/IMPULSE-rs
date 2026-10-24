@@ -847,6 +847,7 @@ mod unix {
                     task_id: task_id.clone(),
                     expected_revision: current.revision,
                     mutation: mutation.clone(),
+                    fencing_generation: None,
                 };
                 match self.mutate_governed_task(request) {
                     Ok(task) => return Ok(task),
@@ -2714,6 +2715,7 @@ mod unix {
                             rationale: "approved from the cockpit".to_string(),
                         },
                     },
+                fencing_generation: None,
             };
             let accepted = impulse_ops::governed_task::GovernedTaskRun {
                 id: task_id,
@@ -2974,6 +2976,7 @@ mod unix {
                             rationale: "approved from the cockpit".to_string(),
                         },
                     },
+                fencing_generation: None,
             };
 
             let (connections_tx, connections_rx) = mpsc::channel();
@@ -3053,6 +3056,7 @@ mod unix {
                             rationale: "approved from the cockpit".to_string(),
                         },
                     },
+                fencing_generation: None,
             };
 
             let (requests_tx, requests_rx) = mpsc::channel();

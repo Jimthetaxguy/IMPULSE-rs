@@ -136,6 +136,7 @@ async fn submit_claim(
         expected_revision,
         summary,
         artifact_ids,
+        generation: impulse_ops::governed_task::lease_generation_from_env(),
     };
     request.validate()?;
     match client.submit_governed_claim(request).await? {
