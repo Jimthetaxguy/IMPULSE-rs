@@ -512,8 +512,8 @@ The following files define product truth and must be updated together for contra
 - `VISION.md` (living product north star and target-state boundary)
 - `docs/spec/RUST-CANONICAL-CONTRACT.md` (authoritative contract)
 - `CONTEXT.md` (stable project vocabulary and live/direction boundary)
-- `AGENTS.md` (operator-facing guidance)
-- `CLAUDE.md` (project technical context)
+- `AGENTS.md` (operator and agent guidance: layout, commands, conventions, and guardrails)
+- `CLAUDE.md` (Claude Code pointer to `AGENTS.md`, plus the identity lines the docs validator requires in both files)
 - `docs/INDEX.md` (navigation + source-of-truth routing)
 - `docs/SUMMARY.yaml` (navigation source)
 - `docs/SUMMARY.md` (high-level map)
@@ -529,7 +529,7 @@ The following files define product truth and must be updated together for contra
 
 When adding/changing CLI commands, hooks, state files, or roadmap stage definitions:
 1. Update this contract doc.
-2. Update command/state references in `AGENTS.md` and `CLAUDE.md`.
+2. Update command/state references in `AGENTS.md`. Leave `CLAUDE.md` as the `@AGENTS.md` pointer; it still has to contain the identity lines `docs/validate_docs.py` checks.
 3. Update `docs/INDEX.md`, `docs/SUMMARY.yaml`, and `docs/SUMMARY.md`.
 4. Run `python3 docs/validate_docs.py --contract`.
 5. Include release note fields from `docs/guides/RELEASE-NOTES-TEMPLATE.md`.
@@ -538,13 +538,9 @@ When adding/changing CLI commands, hooks, state files, or roadmap stage definiti
 
 ### Test Density Targets
 
-| Module Category | Target (tests/KLOC) | Current (2026-04-04) | Gap |
-|----------------|---------------------|----------------------|-----|
-| Core (state, daemon, agent) | ≥3.0 | ~1.5 | HIGH |
-| Handlers | ≥2.0 | ~2.5 | IMPROVING |
-| UI/TUI | ≥1.0 | ~0.4 | MEDIUM |
-| Tooling | ≥2.0 | ~17.1 | MET |
-| Integration | Every stable CLI command | 26 tests | PARTIAL |
+The single measured table lives in [`AGENTS.md`](../../AGENTS.md) (source count dated 2026-10-23).
+Targets remain 3.0 tests/KLOC for core, 2.0 for handlers and tooling, 1.0 for UI/TUI, and an
+end-to-end test for every stable CLI command. Do not keep a second measured table here.
 
 **Workspace totals:** The final `cargo test --workspace` output for the current checkout is the
 authority; record its package-level passed, ignored, and failed totals in commit/PR evidence rather
@@ -563,9 +559,10 @@ and fixtures so fresh clones, linked worktrees, and CI execute the same gate.
 
 ### Verification Gate
 
-All changes must pass before commit:
+All changes must pass before commit. Use an isolated `CARGO_TARGET_DIR` (see [`AGENTS.md`](../../AGENTS.md)):
 ```bash
 cd impulse-rs
+export CARGO_TARGET_DIR=target/agent-<name>
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings

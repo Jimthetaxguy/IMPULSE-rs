@@ -197,18 +197,22 @@ Every handoff must include:
 Before claiming a lane is complete, run the verification commands named in the spec or work card.
 
 For Rust workspace changes, the default gate is the one in
-[`CLAUDE.md`](../../CLAUDE.md), which is stricter than CI (it lints tests too):
+[`AGENTS.md`](../../AGENTS.md), which is stricter than CI (it lints tests too).
+Set an isolated `CARGO_TARGET_DIR` for every Cargo command, as that file requires:
 
 ```bash
 cd impulse-rs
+export CARGO_TARGET_DIR=target/agent-<lane-slug>
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-CI also builds and tests with `--no-default-features`. When a change touches feature-gated code, also
-run `cargo clippy --workspace --all-targets --no-default-features -- -D warnings`.
+CI (`.github/workflows/ci.yml`, working directory `impulse-rs/`) runs `cargo test` on the root
+package, `cargo test --no-default-features --lib`, `cargo clippy -- -D warnings`, `cargo fmt --check`,
+`cargo build --release`, and `cargo build --no-default-features`. When a change touches feature-gated
+code, also run `cargo clippy --workspace --all-targets --no-default-features -- -D warnings`.
 
 Record the passed, ignored, and failed totals from the test run in the PR or handoff; a remembered
 count goes stale.
