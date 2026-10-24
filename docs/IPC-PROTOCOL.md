@@ -465,6 +465,12 @@ Returns `AgentAssistResult` with sessions organized by agent role.
 }}}}
 ```
 
+`ModifyPermissions`, `ClearSessionOverride` and `ResetBaselinePermissions` change the policy that
+gates every later action, so they are operator-class: a non-operator connection is refused with the
+typed operator-class error before any policy check runs. `confirmed` is the client's own
+acknowledgement and does not authorize the change. Clients present the operator capability for
+these three actions only.
+
 ### Artifacts
 
 | Request | Data | Since | Description |

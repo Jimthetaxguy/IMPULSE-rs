@@ -13,7 +13,7 @@ pub mod query;
 pub mod store;
 pub mod types;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 use std::{fs::File, io::Write};
@@ -30,11 +30,19 @@ use crate::storage::Storage;
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp_path = path.with_extension(format!("tmp.{}", crate::storage::unique_temp_token()));
-    let mut file = File::create(&temp_path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
+    let mut file = File::create(&temp_path)
+        .with_context(|| format!("Failed to create {}", temp_path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("Failed to write {}", temp_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("Failed to sync {}", temp_path.display()))?;
     drop(file);
-    std::fs::rename(&temp_path, path)?;
+    std::fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "Failed to move the new file into place at {}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -108,7 +116,10 @@ pub fn status(base_path: &Path, config: &Config, check: bool) -> Result<Retrieva
     let state_path = base_path.join("retrieval_index_state.json");
 
     let mut index_state = if state_path.exists() {
-        serde_json::from_slice::<IndexState>(&std::fs::read(&state_path)?)?
+        let bytes = std::fs::read(&state_path)
+            .with_context(|| format!("Failed to read {}", state_path.display()))?;
+        serde_json::from_slice::<IndexState>(&bytes)
+            .with_context(|| format!("Failed to parse {}", state_path.display()))?
     } else {
         IndexState::default()
     };
@@ -245,6 +256,19 @@ mod tests {
     use crate::memory::Genome;
     use crate::state::{Config, Platform};
     use chrono::{DateTime, Utc};
+
+    #[test]
+    fn test_status_with_a_corrupt_index_state_names_the_file() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("retrieval_index_state.json"), "{not json").unwrap();
+        let err = status(tmp.path(), &Config::default(), false).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("Failed to parse"), "{rendered}");
+        assert!(
+            rendered.contains("retrieval_index_state.json"),
+            "{rendered}"
+        );
+    }
 
     #[test]
     fn test_status_default() {

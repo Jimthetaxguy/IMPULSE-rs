@@ -509,4 +509,244 @@ mod tests {
         assert_eq!(deserialized.session_id, "test-123");
         assert_eq!(deserialized.message_count, 42);
     }
+
+    // ---- Serde round-trips for the persisted YAML records ----
+    //
+    // Proposals, session analyses, and project/cross-project memory are
+    // written as YAML under `.impulse/stewardship/`. `approval::list_pending`
+    // skips a proposal it cannot parse, so a wire break would hide proposals
+    // silently. These types lack PartialEq, so the round-trips go through
+    // YAML (the on-disk format) and compare the JSON values of both sides.
+
+    fn fixed_time(rfc3339: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(rfc3339)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn assert_yaml_round_trip<T>(original: &T) -> T
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let yaml = serde_yaml::to_string(original).unwrap();
+        let recovered: T = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(
+            serde_json::to_value(original).unwrap(),
+            serde_json::to_value(&recovered).unwrap()
+        );
+        recovered
+    }
+
+    fn sample_pattern() -> CrossProjectPattern {
+        CrossProjectPattern {
+            id: "p-1".into(),
+            pattern_type: "workflow".into(),
+            description: "Re-runs clippy after every edit".into(),
+            occurrences: 4,
+            projects: vec!["proj-a".into(), "proj-b".into()],
+            insight: "Batch lint runs".into(),
+            first_seen: "2026-02-23".into(),
+            last_seen: "2026-03-01".into(),
+        }
+    }
+
+    #[test]
+    fn round_trip_cleanup_proposal() {
+        let original = CleanupProposal {
+            id: "prop-1".into(),
+            created_at: fixed_time("2026-06-01T12:00:00Z"),
+            session_id: "sess-1".into(),
+            threshold: ThresholdLevel::Thoughtful,
+            strategy: CleanupStrategy::RemoveRot,
+            estimated_tokens_freed: 12_000,
+            regions: vec![ProposalRegion {
+                description: "stale exploration".into(),
+                message_indices: vec![3, 4, 9],
+                estimated_tokens: 8_000,
+            }],
+            preserves: vec!["decision: use YAML".into()],
+            status: ProposalStatus::Approved,
+        };
+        let recovered = assert_yaml_round_trip(&original);
+        assert_eq!(recovered.threshold, ThresholdLevel::Thoughtful);
+        assert_eq!(recovered.strategy, CleanupStrategy::RemoveRot);
+        assert_eq!(recovered.status, ProposalStatus::Approved);
+        assert_eq!(recovered.regions[0].message_indices, vec![3, 4, 9]);
+    }
+
+    #[test]
+    fn round_trip_session_analysis_with_nested_records() {
+        let original = SessionAnalysis {
+            session_id: "sess-1".into(),
+            project_hash: "hash-abc".into(),
+            transcript_path: PathBuf::from("/tmp/sess-1.jsonl"),
+            analyzed_at: fixed_time("2026-06-01T12:00:00Z"),
+            message_count: 42,
+            estimated_tokens: 10_000,
+            estimated_context_pct: 0.25,
+            decisions: vec![ExtractedDecision {
+                description: "Use YAML".into(),
+                context: "storage format".into(),
+                message_index: 5,
+            }],
+            files_touched: vec!["src/main.rs".into()],
+            tool_patterns: vec![ToolPattern {
+                tool_name: "Read".into(),
+                count: 3,
+                input_hash: "abc".into(),
+                first_index: 1,
+                last_index: 8,
+            }],
+            duplicate_regions: vec![DuplicateRegion {
+                tool_name: "Read".into(),
+                occurrences: 2,
+                indices: vec![1, 8],
+                estimated_tokens: 500,
+                input_preview: "{\"file_path\":\"src/main.rs\"}".into(),
+            }],
+            rot_candidates: vec![RotCandidate {
+                description: "abandoned approach".into(),
+                reason: "superseded".into(),
+                message_range: (10, 14),
+                estimated_tokens: 1_200,
+            }],
+            key_insights: vec!["Test insight".into()],
+        };
+        let recovered = assert_yaml_round_trip(&original);
+        assert_eq!(recovered.rot_candidates[0].message_range, (10, 14));
+        assert_eq!(recovered.transcript_path, original.transcript_path);
+    }
+
+    #[test]
+    fn round_trip_cross_project_memory() {
+        let original = CrossProjectMemory {
+            version: "1.0".into(),
+            updated: fixed_time("2026-06-01T12:00:00Z"),
+            patterns: vec![sample_pattern()],
+            learnings: vec!["Prefer atomic writes".into()],
+            stats: CrossProjectStats {
+                total_sessions_analyzed: 9,
+                total_patterns: 1,
+                total_learnings: 1,
+            },
+        };
+        let recovered = assert_yaml_round_trip(&original);
+        assert_eq!(recovered.stats.total_sessions_analyzed, 9);
+        assert_eq!(recovered.patterns[0].projects, vec!["proj-a", "proj-b"]);
+    }
+
+    #[test]
+    fn round_trip_project_memory() {
+        let original = ProjectMemory {
+            project_hash: "hash-abc".into(),
+            project_path: "/work/impulse".into(),
+            updated: fixed_time("2026-06-01T12:00:00Z"),
+            sessions_analyzed: 3,
+            patterns: vec![sample_pattern()],
+            learnings: vec!["Keep CONTEXT.md current".into()],
+        };
+        let recovered = assert_yaml_round_trip(&original);
+        assert_eq!(recovered.sessions_analyzed, 3);
+    }
+
+    #[test]
+    fn round_trip_monitor_check_and_process_result() {
+        let check = MonitorCheck {
+            timestamp: fixed_time("2026-06-01T12:00:00Z"),
+            file_size_bytes: 2048,
+            estimated_tokens: 512,
+            estimated_pct: 0.5,
+            threshold: ThresholdLevel::Surgical,
+            action_taken: Some("queued proposal".into()),
+        };
+        let recovered = assert_yaml_round_trip(&check);
+        assert_eq!(recovered.threshold, ThresholdLevel::Surgical);
+
+        let result = ProcessResult {
+            mode: StewardshipMode::Auto,
+            applied: vec!["prop-1".into()],
+            queued: 2,
+            logged: 1,
+        };
+        let recovered = assert_yaml_round_trip(&result);
+        assert_eq!(recovered.mode, StewardshipMode::Auto);
+    }
+
+    #[test]
+    fn test_tool_use_without_file_path_deserializes_as_none() {
+        let json = r#"{"id":"t1","name":"Bash","input_preview":"ls","input_chars":2}"#;
+        let tool: ToolUse = serde_json::from_str(json).unwrap();
+        assert_eq!(tool.file_path, None);
+        // And `None` is omitted on write, matching the older shape.
+        assert!(!serde_json::to_string(&tool).unwrap().contains("file_path"));
+    }
+
+    #[test]
+    fn test_stewardship_mode_wire_names_are_pinned() {
+        for mode in [
+            StewardshipMode::Auto,
+            StewardshipMode::Review,
+            StewardshipMode::Off,
+        ] {
+            let wire = serde_json::to_value(mode).unwrap();
+            assert_eq!(wire.as_str(), Some(mode.as_str()));
+            assert_eq!(
+                serde_json::from_value::<StewardshipMode>(wire).unwrap(),
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn test_threshold_level_wire_names_are_pinned() {
+        for level in [
+            ThresholdLevel::Passive,
+            ThresholdLevel::Monitor,
+            ThresholdLevel::Surgical,
+            ThresholdLevel::Thoughtful,
+            ThresholdLevel::Emergency,
+        ] {
+            let wire = serde_json::to_value(level).unwrap();
+            assert_eq!(wire.as_str(), Some(level.as_str()));
+            assert_eq!(
+                serde_json::from_value::<ThresholdLevel>(wire).unwrap(),
+                level
+            );
+        }
+    }
+
+    #[test]
+    fn test_cleanup_strategy_wire_names_are_pinned() {
+        for strategy in [
+            CleanupStrategy::Deduplicate,
+            CleanupStrategy::Condense,
+            CleanupStrategy::RemoveRot,
+            CleanupStrategy::Consolidate,
+            CleanupStrategy::EmergencySummarize,
+        ] {
+            let wire = serde_json::to_value(strategy).unwrap();
+            assert_eq!(wire.as_str(), Some(strategy.as_str()));
+            assert_eq!(
+                serde_json::from_value::<CleanupStrategy>(wire).unwrap(),
+                strategy
+            );
+        }
+    }
+
+    #[test]
+    fn test_proposal_status_wire_names_are_pinned() {
+        for status in [
+            ProposalStatus::Pending,
+            ProposalStatus::Approved,
+            ProposalStatus::Applied,
+            ProposalStatus::Rejected,
+        ] {
+            let wire = serde_json::to_value(status).unwrap();
+            assert_eq!(wire.as_str(), Some(status.as_str()));
+            assert_eq!(
+                serde_json::from_value::<ProposalStatus>(wire).unwrap(),
+                status
+            );
+        }
+    }
 }

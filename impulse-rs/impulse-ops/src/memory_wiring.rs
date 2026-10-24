@@ -312,4 +312,94 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
         assert_eq!(decoded, request);
     }
+
+    fn promoted_decision() -> MemoryCandidateDecision {
+        let record = crate::memory_candidate::tests::record('a');
+        MemoryCandidateDecision {
+            request_id: GovernedRequestId::try_new("request-a").unwrap(),
+            candidate_id: crate::memory_candidate::tests::candidate().id,
+            decision: MemoryCandidateDecisionKind::Promote,
+            actor: actor(),
+            authentication: OperatorAuthentication::CapabilityAuthenticated,
+            decided_at: "2026-09-12T10:00:00Z".to_string(),
+            based_on_ledger_revision: 3,
+            resulting_ledger_revision: 4,
+            record_id: Some(record.id),
+        }
+    }
+
+    #[test]
+    fn test_decision_kind_wire_tags() {
+        assert_eq!(
+            serde_json::to_value(MemoryCandidateDecisionKind::Promote).unwrap(),
+            serde_json::json!({"kind": "promote"})
+        );
+        let dismiss = MemoryCandidateDecisionKind::Dismiss {
+            reason: "stale".to_string(),
+        };
+        let json = serde_json::to_value(&dismiss).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"kind": "dismiss", "data": {"reason": "stale"}})
+        );
+        assert_eq!(json["kind"], dismiss.label());
+        assert_eq!(
+            serde_json::from_value::<MemoryCandidateDecisionKind>(json).unwrap(),
+            dismiss
+        );
+        // A dismissal without its reason is not representable on the wire.
+        assert!(serde_json::from_value::<MemoryCandidateDecisionKind>(
+            serde_json::json!({"kind": "dismiss", "data": {}})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_authenticated_promotion_decision_round_trips_with_its_record_id() {
+        let decision = promoted_decision();
+        let json = serde_json::to_value(&decision).unwrap();
+        assert_eq!(json["authentication"], "capability_authenticated");
+        assert!(json["record_id"].is_string());
+        assert_eq!(
+            serde_json::from_value::<MemoryCandidateDecision>(json).unwrap(),
+            decision
+        );
+    }
+
+    #[test]
+    fn test_outcome_and_ack_round_trip_and_record_is_optional() {
+        let outcome = MemoryCandidateDecisionOutcome {
+            decision: promoted_decision(),
+            candidate: crate::memory_candidate::tests::candidate(),
+            record: Some(crate::memory_candidate::tests::record('a')),
+            replayed: true,
+            projection_digest: format!("sha256:{}", "e".repeat(64)),
+            retrieval_index_dirty: true,
+        };
+        let ack = DecideMemoryCandidateAck { outcome };
+        let decoded: DecideMemoryCandidateAck =
+            serde_json::from_str(&serde_json::to_string(&ack).unwrap()).unwrap();
+        assert_eq!(decoded, ack);
+
+        let mut dismissed = ack.outcome;
+        dismissed.record = None;
+        let json = serde_json::to_value(&dismissed).unwrap();
+        assert!(json.get("record").is_none());
+        assert_eq!(
+            serde_json::from_value::<MemoryCandidateDecisionOutcome>(json).unwrap(),
+            dismissed
+        );
+    }
+
+    #[test]
+    fn test_request_rejects_unknown_fields_at_the_envelope() {
+        let mut json = serde_json::to_value(DecideMemoryCandidateRequest {
+            decision: input(MemoryCandidateDecisionKind::Promote),
+        })
+        .unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("authentication".to_string(), serde_json::json!("declared"));
+        assert!(serde_json::from_value::<DecideMemoryCandidateRequest>(json).is_err());
+    }
 }

@@ -899,6 +899,11 @@ fn is_untracked_impulse_runtime_artifact(path: &[u8]) -> bool {
             // promotion, which is only reachable *after* an approval, failed on
             // a tree the daemon had dirtied itself.
             | b".impulse/MEMORY_CANDIDATES.json"
+            // ADR-0020's retrieval-index marker. `impulse init` gitignores it,
+            // but every promotion and reindex rewrites it, so in a project
+            // whose `.impulse` is not gitignored the first promotion dirtied
+            // the canonical tree exactly as MEMORY_CANDIDATES.json once did.
+            | b".impulse/MEMORY_INDEX.json"
             // ADR-0023's blackboard. Ion opens it inside whatever worktree it
             // runs in, including a staged Builder worktree, the moment a tool
             // result spills; an ungitignored `.impulse` would then report the
@@ -909,6 +914,7 @@ fn is_untracked_impulse_runtime_artifact(path: &[u8]) -> bool {
         || path.starts_with(b".impulse/DESKTOP_GOVERNED_LIFECYCLE_OUTBOX.tmp-")
         || path.starts_with(b".impulse/PRODUCER_RESERVATIONS.tmp.")
         || path.starts_with(b".impulse/MEMORY_CANDIDATES.tmp.")
+        || path.starts_with(b".impulse/MEMORY_INDEX.tmp.")
         || path.starts_with(b".impulse/worktrees/")
         || is_impulse_memory_evidence_artifact(path)
 }
@@ -3146,6 +3152,19 @@ mod tests {
         assert!(!is_impulse_memory_evidence_artifact(b".impulse/GENOME.md"));
         assert!(!is_impulse_memory_evidence_artifact(
             b".impulse/HISTORY.jsonl"
+        ));
+    }
+
+    #[test]
+    fn memory_index_marker_is_an_untracked_runtime_artifact() {
+        assert!(is_untracked_impulse_runtime_artifact(
+            b".impulse/MEMORY_INDEX.json"
+        ));
+        assert!(is_untracked_impulse_runtime_artifact(
+            b".impulse/MEMORY_INDEX.tmp.123-4-5"
+        ));
+        assert!(!is_untracked_impulse_runtime_artifact(
+            b".impulse/MEMORY_INDEX.json.bak"
         ));
     }
 

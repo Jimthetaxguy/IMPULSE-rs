@@ -5232,4 +5232,49 @@ mod tests {
         let recovered: WorkspaceTarget = serde_json::from_str(&json).unwrap();
         assert_eq!(ws, recovered);
     }
+
+    #[test]
+    fn test_desktop_event_type_tag_differs_from_host_event_name() {
+        // Pinned, not aliased. The serde `type` tag is the variant name, while
+        // `name()` is the host event name JS listens on. `host_event_envelope`
+        // sends `name()` plus only the `data` content, so the tag never reaches
+        // JS, and nothing deserializes a DesktopEvent from the page.
+        let events = [
+            DesktopEvent::TerminalOutput {
+                agent_id: "a".to_string(),
+                data: vec![1],
+            },
+            DesktopEvent::TerminalExit {
+                agent_id: "a".to_string(),
+            },
+            DesktopEvent::OpsUpdate {
+                payload: serde_json::json!({}),
+            },
+            DesktopEvent::OpsConnectionUpdate {
+                connected: true,
+                error: None,
+            },
+        ];
+        for event in &events {
+            let value = serde_json::to_value(event).unwrap();
+            let tag = value["type"].as_str().unwrap();
+            assert_ne!(tag, event.name());
+            let mut swapped = value.clone();
+            swapped["type"] = serde_json::Value::String(event.name().to_string());
+            assert!(serde_json::from_value::<DesktopEvent>(swapped).is_err());
+        }
+        let tags: Vec<_> = events
+            .iter()
+            .map(|event| serde_json::to_value(event).unwrap()["type"].clone())
+            .collect();
+        assert_eq!(
+            tags,
+            [
+                "TerminalOutput",
+                "TerminalExit",
+                "OpsUpdate",
+                "OpsConnectionUpdate"
+            ]
+        );
+    }
 }

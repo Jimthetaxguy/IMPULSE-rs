@@ -1083,4 +1083,913 @@ mod tests {
             );
         }
     }
+
+    // ── Wire contract: every variant's tag, value round-trips, older clients ──
+    //
+    // Clients (the TUI, the Dioxus cockpit, the CLI, `impulse_ops`) match on the
+    // adjacently tagged `"type"` field, so each tag below is part of protocol v9.
+    // `DaemonRequest` and `DaemonResponse` do not derive `PartialEq`, so these
+    // tests compare the re-serialized `serde_json::Value` instead.
+
+    /// Number of `DaemonRequest` variants. `request_type_name` is an exhaustive
+    /// match, so adding a variant fails to compile there; bump this and add the
+    /// variant to `every_daemon_request` in the same change.
+    const DAEMON_REQUEST_VARIANT_COUNT: usize = 51;
+
+    fn wire_timestamp() -> chrono::DateTime<chrono::Utc> {
+        "2026-10-23T12:34:56Z".parse().unwrap()
+    }
+
+    fn wire_insight() -> ExtractedInsight {
+        ExtractedInsight {
+            pane_id: 4,
+            agent_kind: crate::context_lifecycle::types::AgentKind::Codex,
+            timestamp: wire_timestamp(),
+            insight_type: crate::context_lifecycle::types::InsightType::ErrorEncountered,
+            content: "error[E0382]: borrow of moved value".into(),
+            intent: Some(crate::context_lifecycle::intent::IntentCategory::Debugging),
+        }
+    }
+
+    fn wire_recommendation() -> crate::agent::coordinator::Recommendation {
+        crate::agent::coordinator::Recommendation {
+            recommendation_type: crate::agent::coordinator::RecommendationType::FileConflict,
+            panes_involved: vec!["pane-1".into(), "pane-2".into()],
+            description: "Multiple agents modifying: src/lib.rs".into(),
+            action: "Pause pane-2".into(),
+            priority: 90,
+        }
+    }
+
+    fn governed_request_id(id: &str) -> impulse_ops::governed_task::GovernedRequestId {
+        impulse_ops::governed_task::GovernedRequestId::try_new(id).unwrap()
+    }
+
+    fn governed_task_id() -> impulse_ops::governed_task::GovernedTaskId {
+        impulse_ops::governed_task::GovernedTaskId::try_new("task-7").unwrap()
+    }
+
+    /// One non-default value of every `DaemonRequest` variant, paired with the
+    /// wire tag clients send for it.
+    fn every_daemon_request() -> Vec<(&'static str, DaemonRequest)> {
+        use impulse_ops::governed_task as gt;
+        let registration = gt::GovernedTaskRegistration::builder(
+            "request-register",
+            "task-7",
+            "demo",
+            "/tmp/demo",
+            "pin the wire contract",
+            "agent-1",
+            "codex",
+        )
+        .build()
+        .unwrap();
+        vec![
+            ("Ping", DaemonRequest::Ping),
+            ("Status", DaemonRequest::Status),
+            (
+                "PresentOperatorCapability",
+                DaemonRequest::PresentOperatorCapability(
+                    impulse_ops::operator_capability::OperatorCapabilityPresentation {
+                        token: "f".repeat(64),
+                    },
+                ),
+            ),
+            (
+                "CreateSession",
+                DaemonRequest::CreateSession {
+                    name: "wire".into(),
+                    platform: Some("codex".into()),
+                },
+            ),
+            (
+                "EndSession",
+                DaemonRequest::EndSession {
+                    session_id: "s-1".into(),
+                    summary: "done".into(),
+                },
+            ),
+            (
+                "TrackFile",
+                DaemonRequest::TrackFile {
+                    session_id: "s-1".into(),
+                    file_path: "src/lib.rs".into(),
+                },
+            ),
+            (
+                "TrackTool",
+                DaemonRequest::TrackTool {
+                    session_id: "s-1".into(),
+                    tool_name: "Edit".into(),
+                },
+            ),
+            (
+                "GetSession",
+                DaemonRequest::GetSession {
+                    session_id: "s-1".into(),
+                },
+            ),
+            ("ListSessions", DaemonRequest::ListSessions),
+            (
+                "Chat",
+                DaemonRequest::Chat {
+                    session_id: "s-1".into(),
+                    message: "hello".into(),
+                    inject_mode: Some("review".into()),
+                    inject_explain: true,
+                },
+            ),
+            ("StewardStatus", DaemonRequest::StewardStatus),
+            (
+                "StewardProposals",
+                DaemonRequest::StewardProposals {
+                    action: "approve".into(),
+                    id: Some("p-1".into()),
+                },
+            ),
+            ("StewardMemory", DaemonRequest::StewardMemory),
+            (
+                "ListTools",
+                DaemonRequest::ListTools {
+                    category: Some("analysis".into()),
+                },
+            ),
+            (
+                "DescribeTool",
+                DaemonRequest::DescribeTool {
+                    name: "grep".into(),
+                },
+            ),
+            (
+                "InvokeTool",
+                DaemonRequest::InvokeTool {
+                    name: "grep".into(),
+                    params: serde_json::json!({"pattern": "fn main", "limit": 3}),
+                },
+            ),
+            ("ToolSchema", DaemonRequest::ToolSchema),
+            ("GetOpsSnapshot", DaemonRequest::GetOpsSnapshot),
+            (
+                "SubscribeOps",
+                DaemonRequest::SubscribeOps {
+                    since_seq: Some(42),
+                },
+            ),
+            (
+                "PublishTerminalOps",
+                DaemonRequest::PublishTerminalOps {
+                    report: impulse_ops::TerminalOpsReport {
+                        source_id: "gui-1".into(),
+                        published_at: "2026-10-23T12:34:56Z".into(),
+                        agents: Vec::new(),
+                        context: impulse_ops::ContextHealthSummary {
+                            tier: "essential".into(),
+                            usage_fraction: 0.5,
+                            estimated_tokens: 1000,
+                            window_tokens: 2000,
+                            compaction_count: 1,
+                            ..Default::default()
+                        },
+                        interventions: vec![impulse_ops::InterventionRecommendation {
+                            id: "i-1".into(),
+                            title: "Compact".into(),
+                            severity: "warn".into(),
+                            target_agent_id: Some("tab-1".into()),
+                            ..Default::default()
+                        }],
+                    },
+                },
+            ),
+            (
+                "GetSupervisorPermissions",
+                DaemonRequest::GetSupervisorPermissions,
+            ),
+            (
+                "SupervisorChat",
+                DaemonRequest::SupervisorChat {
+                    prompt: "status?".into(),
+                    context: Some("two panes".into()),
+                },
+            ),
+            (
+                "RunSupervisorAction",
+                DaemonRequest::RunSupervisorAction {
+                    action: impulse_ops::SupervisorAction::SendInput {
+                        agent_id: "tab-1".into(),
+                        session_id: Some("s-1".into()),
+                        content: "continue".into(),
+                        confirmed: true,
+                    },
+                },
+            ),
+            (
+                "ListArtifacts",
+                DaemonRequest::ListArtifacts { limit: Some(5) },
+            ),
+            (
+                "GetArtifact",
+                DaemonRequest::GetArtifact {
+                    artifact_id: "artifact-1".into(),
+                },
+            ),
+            (
+                "RunArtifactAction",
+                DaemonRequest::RunArtifactAction {
+                    artifact_id: "artifact-1".into(),
+                    action_id: "review".into(),
+                    params: serde_json::json!({"note": "ok"}),
+                },
+            ),
+            (
+                "RegisterGovernedTask",
+                DaemonRequest::RegisterGovernedTask { registration },
+            ),
+            (
+                "GetGovernedTask",
+                DaemonRequest::GetGovernedTask {
+                    project_id: "demo".into(),
+                    task_id: governed_task_id(),
+                },
+            ),
+            (
+                "ListGovernedTasks",
+                DaemonRequest::ListGovernedTasks {
+                    project_id: "demo".into(),
+                },
+            ),
+            (
+                "MutateGovernedTask",
+                DaemonRequest::MutateGovernedTask {
+                    request: gt::GovernedTaskMutationRequest {
+                        request_id: governed_request_id("request-mutate"),
+                        project_id: "demo".into(),
+                        task_id: governed_task_id(),
+                        expected_revision: 1,
+                        mutation: gt::GovernedTaskMutation::MarkRunning {
+                            actor: gt::GovernedActor {
+                                kind: gt::GovernedActorKind::System,
+                                id: "desktop".into(),
+                            },
+                        },
+                        fencing_generation: Some(1),
+                    },
+                },
+            ),
+            (
+                "SubmitGovernedClaim",
+                DaemonRequest::SubmitGovernedClaim {
+                    request: gt::GovernedClaimRequest {
+                        request_id: governed_request_id("request-claim"),
+                        project_id: "demo".into(),
+                        task_id: governed_task_id(),
+                        expected_revision: 2,
+                        summary: "implemented".into(),
+                        artifact_ids: vec!["artifact-1".into()],
+                        generation: Some(1),
+                    },
+                },
+            ),
+            (
+                "RunGovernedVerification",
+                DaemonRequest::RunGovernedVerification {
+                    request: gt::GovernedVerificationRequest {
+                        request_id: governed_request_id("request-verify"),
+                        project_id: "demo".into(),
+                        task_id: governed_task_id(),
+                        expected_revision: 3,
+                    },
+                },
+            ),
+            (
+                "RunGovernedSupervisorReview",
+                DaemonRequest::RunGovernedSupervisorReview {
+                    request: gt::GovernedSupervisorReviewRequest {
+                        request_id: governed_request_id("request-review"),
+                        project_id: "demo".into(),
+                        task_id: governed_task_id(),
+                        expected_revision: 4,
+                    },
+                },
+            ),
+            (
+                "PromoteGovernedOutcome",
+                DaemonRequest::PromoteGovernedOutcome {
+                    request: impulse_ops::governed_wiring::GovernedPromotionRequest {
+                        request_id: governed_request_id("request-promote"),
+                        project_id: "demo".into(),
+                        task_id: governed_task_id(),
+                        expected_revision: 5,
+                    },
+                },
+            ),
+            (
+                "DiscardGovernedStagedWorktree",
+                DaemonRequest::DiscardGovernedStagedWorktree {
+                    request: impulse_ops::governed_wiring::GovernedStagedWorktreeDiscardRequest {
+                        request_id: governed_request_id("request-discard"),
+                        project_id: "demo".into(),
+                        task_id: governed_task_id(),
+                        expected_revision: 6,
+                        reason: "rejected".into(),
+                    },
+                },
+            ),
+            (
+                "AgentAssist",
+                DaemonRequest::AgentAssist {
+                    prompt: "coordinate".into(),
+                    context: Some("two panes".into()),
+                    insights: vec![wire_insight()],
+                },
+            ),
+            (
+                "GuardEvaluate",
+                DaemonRequest::GuardEvaluate {
+                    target: "bash".into(),
+                    action: "git push --force main".into(),
+                },
+            ),
+            ("GuardList", DaemonRequest::GuardList),
+            (
+                "CheckConflict",
+                DaemonRequest::CheckConflict {
+                    session_id: "s-1".into(),
+                    file_path: "src/lib.rs".into(),
+                },
+            ),
+            ("DebugSnapshot", DaemonRequest::DebugSnapshot),
+            ("ListPlugins", DaemonRequest::ListPlugins),
+            (
+                "InvokePlugin",
+                DaemonRequest::InvokePlugin {
+                    name: "office".into(),
+                    input: crate::plugin::PluginInput::new()
+                        .with_path(std::path::PathBuf::from("/tmp/report.docx"))
+                        .with_query("tables")
+                        .with_options(serde_json::json!({"max_pages": 2})),
+                },
+            ),
+            (
+                "RegisterDelegation",
+                DaemonRequest::RegisterDelegation {
+                    spec: crate::delegation::types::DelegationSpec {
+                        task: "refactor auth".into(),
+                        target_files: vec!["src/auth.rs".into()],
+                        constraints: Some("no new deps".into()),
+                        max_depth: 1,
+                        restricted_tools: vec!["bash_exec".into()],
+                    },
+                    coordinator_pane_id: 3,
+                    context_snapshot: "coordinator context".into(),
+                },
+            ),
+            (
+                "CompleteDelegation",
+                DaemonRequest::CompleteDelegation {
+                    delegation_id: "del-1".into(),
+                    summary: "refactored".into(),
+                    tool_trace: vec![impulse_ops::ToolInvocationRecord {
+                        kind: "edit".into(),
+                        target: "src/auth.rs".into(),
+                        timestamp: Some("2026-10-23T12:34:56Z".into()),
+                    }],
+                    diff_summary: Some(impulse_ops::DiffSummary {
+                        files_changed: 1,
+                        lines_added: 10,
+                        lines_removed: 4,
+                    }),
+                },
+            ),
+            ("ListDelegations", DaemonRequest::ListDelegations),
+            ("GetAgentPool", DaemonRequest::GetAgentPool),
+            (
+                "AgentReviewCode",
+                DaemonRequest::AgentReviewCode {
+                    file_path: "src/lib.rs".into(),
+                    diff: "+fn main() {}".into(),
+                    insights: vec![wire_insight()],
+                },
+            ),
+            (
+                "AgentAnalyzeError",
+                DaemonRequest::AgentAnalyzeError {
+                    error_text: "panicked".into(),
+                    context: "cargo test".into(),
+                    insights: vec![wire_insight()],
+                },
+            ),
+            (
+                "AgentSummarizePane",
+                DaemonRequest::AgentSummarizePane {
+                    pane_id: 2,
+                    raw_output: "Compiling impulse-rs".into(),
+                    insights: vec![wire_insight()],
+                },
+            ),
+            ("GetConflictHistory", DaemonRequest::GetConflictHistory),
+            (
+                "ClearResolvedConflicts",
+                DaemonRequest::ClearResolvedConflicts,
+            ),
+        ]
+    }
+
+    /// Serialize to a JSON line, parse it back, and require the re-serialized
+    /// value to be identical. Returns the wire value for further assertions.
+    fn request_wire_round_trip(request: &DaemonRequest) -> serde_json::Value {
+        let line = serde_json::to_string(request).unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let parsed: DaemonRequest = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            wire,
+            "{} changed across a round trip",
+            request_type_name(request)
+        );
+        wire
+    }
+
+    fn response_wire_round_trip(response: &DaemonResponse) -> serde_json::Value {
+        let line = serde_json::to_string(response).unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let parsed: DaemonResponse = serde_json::from_str(&line).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), wire);
+        wire
+    }
+
+    #[test]
+    fn test_daemon_request_every_variant_pins_wire_tag_and_round_trips() {
+        let requests = every_daemon_request();
+        let tags: std::collections::BTreeSet<&str> = requests.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tags.len(), requests.len(), "duplicate tag in the table");
+        assert_eq!(requests.len(), DAEMON_REQUEST_VARIANT_COUNT);
+
+        for (tag, request) in &requests {
+            let wire = request_wire_round_trip(request);
+            assert_eq!(wire["type"], *tag, "wire tag for {tag}");
+            assert_eq!(request_type_name(request), *tag);
+            let object = wire.as_object().unwrap();
+            assert!(
+                object.keys().all(|k| k == "type" || k == "data"),
+                "{tag} wire carries unexpected top-level keys: {object:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_daemon_request_unit_variants_serialize_without_data() {
+        for (tag, request) in every_daemon_request() {
+            let wire = serde_json::to_value(&request).unwrap();
+            let is_unit = matches!(
+                request,
+                DaemonRequest::Ping
+                    | DaemonRequest::Status
+                    | DaemonRequest::ListSessions
+                    | DaemonRequest::StewardStatus
+                    | DaemonRequest::StewardMemory
+                    | DaemonRequest::ToolSchema
+                    | DaemonRequest::GetOpsSnapshot
+                    | DaemonRequest::GetSupervisorPermissions
+                    | DaemonRequest::GuardList
+                    | DaemonRequest::DebugSnapshot
+                    | DaemonRequest::ListPlugins
+                    | DaemonRequest::ListDelegations
+                    | DaemonRequest::GetAgentPool
+                    | DaemonRequest::GetConflictHistory
+                    | DaemonRequest::ClearResolvedConflicts
+            );
+            assert_eq!(
+                wire.get("data").is_none(),
+                is_unit,
+                "{tag}: unit variants carry no data, struct variants always do"
+            );
+            if is_unit {
+                let parsed: DaemonRequest =
+                    serde_json::from_str(&format!(r#"{{"type":"{tag}"}}"#)).unwrap();
+                assert_eq!(request_type_name(&parsed), tag);
+            }
+        }
+    }
+
+    #[test]
+    fn test_daemon_request_payload_fields_survive_round_trip() {
+        let requests = every_daemon_request();
+        let wire_of = |tag: &str| {
+            let (_, request) = requests.iter().find(|(t, _)| *t == tag).unwrap();
+            request_wire_round_trip(request)
+        };
+
+        let assist = wire_of("AgentAssist");
+        let insight = &assist["data"]["insights"][0];
+        assert_eq!(insight["pane_id"], 4);
+        assert_eq!(insight["agent_kind"], "codex");
+        assert_eq!(insight["intent"], "debugging");
+        assert_eq!(insight["timestamp"], "2026-10-23T12:34:56Z");
+
+        let plugin = wire_of("InvokePlugin");
+        assert_eq!(plugin["data"]["input"]["path"], "/tmp/report.docx");
+        assert_eq!(plugin["data"]["input"]["options"]["max_pages"], 2);
+
+        let delegation = wire_of("RegisterDelegation");
+        assert_eq!(delegation["data"]["spec"]["max_depth"], 1);
+        assert_eq!(
+            delegation["data"]["spec"]["restricted_tools"][0],
+            "bash_exec"
+        );
+
+        let completion = wire_of("CompleteDelegation");
+        assert_eq!(completion["data"]["tool_trace"][0]["kind"], "edit");
+        assert_eq!(completion["data"]["diff_summary"]["lines_removed"], 4);
+
+        let action = wire_of("RunSupervisorAction");
+        assert_eq!(action["data"]["action"]["kind"], "send_input");
+        assert_eq!(action["data"]["action"]["confirmed"], true);
+    }
+
+    #[test]
+    fn test_daemon_request_insight_without_intent_is_omitted_from_wire() {
+        let mut insight = wire_insight();
+        insight.intent = None;
+        let request = DaemonRequest::AgentSummarizePane {
+            pane_id: 1,
+            raw_output: String::new(),
+            insights: vec![insight],
+        };
+        let wire = request_wire_round_trip(&request);
+        assert!(
+            wire["data"]["insights"][0].get("intent").is_none(),
+            "skip_serializing_if must keep `intent` off the wire when None"
+        );
+    }
+
+    #[test]
+    fn test_daemon_request_older_clients_may_omit_defaulted_fields() {
+        let cases = [
+            r#"{"type":"Chat","data":{"session_id":"s","message":"m"}}"#,
+            r#"{"type":"ListTools","data":{}}"#,
+            r#"{"type":"InvokeTool","data":{"name":"grep"}}"#,
+            r#"{"type":"SubscribeOps","data":{}}"#,
+            r#"{"type":"ListArtifacts","data":{}}"#,
+            r#"{"type":"RunArtifactAction","data":{"artifact_id":"a","action_id":"b"}}"#,
+            r#"{"type":"AgentAssist","data":{"prompt":"p"}}"#,
+            r#"{"type":"RegisterDelegation","data":{"spec":{"task":"t"},"coordinator_pane_id":1}}"#,
+            r#"{"type":"CompleteDelegation","data":{"delegation_id":"d","summary":"s"}}"#,
+            r#"{"type":"AgentReviewCode","data":{"file_path":"f","diff":"d"}}"#,
+            r#"{"type":"AgentAnalyzeError","data":{"error_text":"e","context":"c"}}"#,
+            r#"{"type":"AgentSummarizePane","data":{"pane_id":2}}"#,
+            r#"{"type":"PublishTerminalOps","data":{"report":{"source_id":"g","published_at":"t"}}}"#,
+            r#"{"type":"AgentAssist","data":{"prompt":"p","insights":[{"pane_id":1,"agent_kind":"codex","timestamp":"2026-10-23T12:34:56Z","insight_type":"error_encountered","content":"x"}]}}"#,
+        ];
+        for line in cases {
+            let parsed: DaemonRequest = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("older-client line rejected: {line}: {e}"));
+            request_wire_round_trip(&parsed);
+        }
+
+        match serde_json::from_str(cases[0]).unwrap() {
+            DaemonRequest::Chat {
+                inject_mode,
+                inject_explain,
+                ..
+            } => {
+                assert!(inject_mode.is_none());
+                assert!(!inject_explain);
+            }
+            other => panic!("expected Chat, got {}", request_type_name(&other)),
+        }
+        match serde_json::from_str(cases[2]).unwrap() {
+            DaemonRequest::InvokeTool { params, .. } => assert!(params.is_null()),
+            other => panic!("expected InvokeTool, got {}", request_type_name(&other)),
+        }
+        match serde_json::from_str(cases[7]).unwrap() {
+            DaemonRequest::RegisterDelegation {
+                spec,
+                context_snapshot,
+                ..
+            } => {
+                assert_eq!(
+                    spec.max_depth,
+                    crate::delegation::types::MAX_DELEGATION_DEPTH
+                );
+                assert!(context_snapshot.is_empty());
+            }
+            other => panic!(
+                "expected RegisterDelegation, got {}",
+                request_type_name(&other)
+            ),
+        }
+        match serde_json::from_str(cases[8]).unwrap() {
+            DaemonRequest::CompleteDelegation {
+                tool_trace,
+                diff_summary,
+                ..
+            } => {
+                assert!(tool_trace.is_empty());
+                assert!(diff_summary.is_none());
+            }
+            other => panic!(
+                "expected CompleteDelegation, got {}",
+                request_type_name(&other)
+            ),
+        }
+        match serde_json::from_str(cases[11]).unwrap() {
+            DaemonRequest::AgentSummarizePane {
+                raw_output,
+                insights,
+                ..
+            } => {
+                assert!(raw_output.is_empty());
+                assert!(insights.is_empty());
+            }
+            other => panic!(
+                "expected AgentSummarizePane, got {}",
+                request_type_name(&other)
+            ),
+        }
+        match serde_json::from_str(cases[13]).unwrap() {
+            DaemonRequest::AgentAssist { insights, .. } => assert!(insights[0].intent.is_none()),
+            other => panic!("expected AgentAssist, got {}", request_type_name(&other)),
+        }
+    }
+
+    #[test]
+    fn test_daemon_request_rejects_unknown_tag() {
+        let err = serde_json::from_str::<DaemonRequest>(r#"{"type":"NoSuchRequest"}"#)
+            .expect_err("an unknown tag must not parse");
+        assert!(err.to_string().contains("NoSuchRequest"), "{err}");
+    }
+
+    #[test]
+    fn test_supervisor_action_every_variant_pins_kind_and_round_trips() {
+        use impulse_ops::{
+            PermissionChangeScope, SupervisorAction, SupervisorActionPermission, ToolCapabilityId,
+        };
+        let actions = [
+            (
+                "focus_agent",
+                SupervisorAction::FocusAgent {
+                    agent_id: "tab-1".into(),
+                    session_id: Some("s-1".into()),
+                },
+            ),
+            (
+                "send_input",
+                SupervisorAction::SendInput {
+                    agent_id: "tab-1".into(),
+                    session_id: None,
+                    content: "continue".into(),
+                    confirmed: true,
+                },
+            ),
+            (
+                "inject_context",
+                SupervisorAction::InjectContext {
+                    agent_id: Some("tab-1".into()),
+                    session_id: Some("s-1".into()),
+                    query: "auth design".into(),
+                    confirmed: true,
+                },
+            ),
+            (
+                "cleanup_context",
+                SupervisorAction::CleanupContext {
+                    agent_id: Some("tab-1".into()),
+                    session_id: None,
+                    goal: Some("trim logs".into()),
+                    confirmed: true,
+                },
+            ),
+            (
+                "handoff_context",
+                SupervisorAction::HandoffContext {
+                    session_id: Some("s-1".into()),
+                    target_tool: "codex".into(),
+                    task: "finish tests".into(),
+                    notes: Some("see PR".into()),
+                    confirmed: true,
+                },
+            ),
+            (
+                "open_artifact_review",
+                SupervisorAction::OpenArtifactReview {
+                    artifact_id: "artifact-1".into(),
+                },
+            ),
+            (
+                "search_memory",
+                SupervisorAction::SearchMemory {
+                    query: "compaction".into(),
+                },
+            ),
+            (
+                "modify_permissions",
+                SupervisorAction::ModifyPermissions {
+                    scope: PermissionChangeScope::SessionOverride,
+                    grant_actions: vec![SupervisorActionPermission::SendInput],
+                    grant_tool_capabilities: vec![ToolCapabilityId::Network],
+                    confirmed: true,
+                },
+            ),
+            (
+                "clear_session_override",
+                SupervisorAction::ClearSessionOverride { confirmed: true },
+            ),
+            (
+                "reset_baseline_permissions",
+                SupervisorAction::ResetBaselinePermissions { confirmed: true },
+            ),
+        ];
+        for (kind, action) in actions {
+            let request = DaemonRequest::RunSupervisorAction {
+                action: action.clone(),
+            };
+            let wire = request_wire_round_trip(&request);
+            assert_eq!(wire["data"]["action"]["kind"], kind);
+            let parsed: SupervisorAction =
+                serde_json::from_value(wire["data"]["action"].clone()).unwrap();
+            assert_eq!(parsed, action);
+        }
+
+        let modify = serde_json::to_value(SupervisorAction::ModifyPermissions {
+            scope: PermissionChangeScope::PersistentDefault,
+            grant_actions: vec![SupervisorActionPermission::HandoffContext],
+            grant_tool_capabilities: vec![ToolCapabilityId::FileSystemWrite],
+            confirmed: false,
+        })
+        .unwrap();
+        assert_eq!(modify["scope"], "persistent_default");
+        assert_eq!(modify["grant_actions"][0], "handoff_context");
+        assert_eq!(modify["grant_tool_capabilities"][0], "file_system_write");
+    }
+
+    #[test]
+    fn test_supervisor_action_older_clients_may_omit_defaulted_fields() {
+        use impulse_ops::{PermissionChangeScope, SupervisorAction};
+        let cases = [
+            (
+                r#"{"kind":"focus_agent","agent_id":"a"}"#,
+                SupervisorAction::FocusAgent {
+                    agent_id: "a".into(),
+                    session_id: None,
+                },
+            ),
+            (
+                r#"{"kind":"send_input","agent_id":"a","content":"c"}"#,
+                SupervisorAction::SendInput {
+                    agent_id: "a".into(),
+                    session_id: None,
+                    content: "c".into(),
+                    confirmed: false,
+                },
+            ),
+            (
+                r#"{"kind":"inject_context","query":"q"}"#,
+                SupervisorAction::InjectContext {
+                    agent_id: None,
+                    session_id: None,
+                    query: "q".into(),
+                    confirmed: false,
+                },
+            ),
+            (
+                r#"{"kind":"cleanup_context"}"#,
+                SupervisorAction::CleanupContext {
+                    agent_id: None,
+                    session_id: None,
+                    goal: None,
+                    confirmed: false,
+                },
+            ),
+            (
+                r#"{"kind":"handoff_context","target_tool":"t","task":"k"}"#,
+                SupervisorAction::HandoffContext {
+                    session_id: None,
+                    target_tool: "t".into(),
+                    task: "k".into(),
+                    notes: None,
+                    confirmed: false,
+                },
+            ),
+            (
+                r#"{"kind":"modify_permissions","scope":"session_override"}"#,
+                SupervisorAction::ModifyPermissions {
+                    scope: PermissionChangeScope::SessionOverride,
+                    grant_actions: Vec::new(),
+                    grant_tool_capabilities: Vec::new(),
+                    confirmed: false,
+                },
+            ),
+            (
+                r#"{"kind":"clear_session_override"}"#,
+                SupervisorAction::ClearSessionOverride { confirmed: false },
+            ),
+            (
+                r#"{"kind":"reset_baseline_permissions"}"#,
+                SupervisorAction::ResetBaselinePermissions { confirmed: false },
+            ),
+        ];
+        for (line, expected) in cases {
+            let parsed: SupervisorAction = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("older-client action rejected: {line}: {e}"));
+            assert_eq!(parsed, expected, "{line}");
+        }
+    }
+
+    #[test]
+    fn test_daemon_response_every_variant_pins_wire_tag_and_round_trips() {
+        let responses = [
+            (
+                "Ok",
+                DaemonResponse::Ok {
+                    result: serde_json::json!({"sessions": [1, 2], "ok": true}),
+                },
+            ),
+            (
+                "Error",
+                DaemonResponse::Error {
+                    message: "socket closed".into(),
+                },
+            ),
+            (
+                "Busy",
+                DaemonResponse::Busy {
+                    resource: impulse_ops::DaemonBusyResource::AgentTurn,
+                    retry_after_ms: 250,
+                },
+            ),
+            (
+                "AgentAssistResult",
+                DaemonResponse::AgentAssistResult {
+                    success: true,
+                    response: "pause pane-2".into(),
+                    recommendations: vec![wire_recommendation()],
+                    pane_summaries: vec![(
+                        "pane-1".into(),
+                        vec!["edited src/lib.rs".into(), "ran tests".into()],
+                    )],
+                },
+            ),
+            (
+                "AgentSpecializedResult",
+                DaemonResponse::AgentSpecializedResult {
+                    success: false,
+                    response: "no provider".into(),
+                },
+            ),
+            (
+                "ConflictCheck",
+                DaemonResponse::ConflictCheck {
+                    has_conflict: true,
+                    conflicting_sessions: vec!["s-2".into()],
+                },
+            ),
+        ];
+        for (tag, response) in &responses {
+            let wire = response_wire_round_trip(response);
+            assert_eq!(wire["type"], *tag);
+            assert!(wire.get("data").is_some(), "{tag} always carries data");
+        }
+
+        let busy = serde_json::to_value(&responses[2].1).unwrap();
+        assert_eq!(busy["data"]["resource"], "agent_turn");
+        let assist = serde_json::to_value(&responses[3].1).unwrap();
+        let recommendation = &assist["data"]["recommendations"][0];
+        assert_eq!(recommendation["recommendation_type"], "file_conflict");
+        assert_eq!(recommendation["priority"], 90);
+        // Tuples travel as two-element arrays.
+        assert_eq!(
+            assist["data"]["pane_summaries"][0],
+            serde_json::json!(["pane-1", ["edited src/lib.rs", "ran tests"]])
+        );
+    }
+
+    #[test]
+    fn test_daemon_response_older_daemons_may_omit_defaulted_fields() {
+        let line = r#"{"type":"AgentAssistResult","data":{"success":true,"response":"r"}}"#;
+        match serde_json::from_str::<DaemonResponse>(line).unwrap() {
+            DaemonResponse::AgentAssistResult {
+                recommendations,
+                pane_summaries,
+                ..
+            } => {
+                assert!(recommendations.is_empty());
+                assert!(pane_summaries.is_empty());
+            }
+            other => panic!("expected AgentAssistResult, got {other:?}"),
+        }
+
+        let line = r#"{"type":"AgentAssistResult","data":{"success":true,"response":"r","recommendations":[{"recommendation_type":"error_assist","panes_involved":[],"description":"d","action":"a"}]}}"#;
+        match serde_json::from_str::<DaemonResponse>(line).unwrap() {
+            DaemonResponse::AgentAssistResult {
+                recommendations, ..
+            } => assert_eq!(recommendations[0].priority, 50, "priority defaults to 50"),
+            other => panic!("expected AgentAssistResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_daemon_response_rejects_unknown_busy_resource() {
+        let line = r#"{"type":"Busy","data":{"resource":"gpu","retry_after_ms":1}}"#;
+        assert!(serde_json::from_str::<DaemonResponse>(line).is_err());
+    }
 }

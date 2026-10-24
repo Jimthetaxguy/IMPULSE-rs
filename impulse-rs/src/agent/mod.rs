@@ -2318,4 +2318,54 @@ mod tests {
             [(default.temperature, Some(default.max_tokens))]
         );
     }
+
+    #[test]
+    fn test_impulse_provider_wire_names_match_as_str() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                ImpulseProvider::Anthropic,
+                ImpulseProvider::OpenAi,
+                ImpulseProvider::Minimax,
+            ],
+            None,
+            |v| {
+                assert_eq!(ImpulseProvider::parse(v.as_str()), Some(*v));
+                v.as_str().to_string()
+            },
+        );
+    }
+
+    #[test]
+    fn test_impulse_harness_wire_names_differ_from_as_str_for_opencode() {
+        // Pinned, not aliased. kebab-case splits OpenCode into "open-code";
+        // `as_str` says "opencode". Config and CLI input reach a harness
+        // through `ImpulseHarness::parse` (`resolve_from_config`), which
+        // accepts both spellings; no serde input path carries an
+        // `AgentMode`/`ImpulseHarness`, so the serde name is never read back.
+        let rows = crate::test_support::wire_vs_str_api(
+            &[
+                ImpulseHarness::ClaudeCode,
+                ImpulseHarness::OpenCode,
+                ImpulseHarness::Codex,
+                ImpulseHarness::Gemini,
+            ],
+            None,
+            |v| v.as_str().to_string(),
+        );
+        assert_eq!(
+            rows,
+            crate::test_support::expected_rows(&[
+                ("claude-code", "claude-code", true),
+                ("open-code", "opencode", false),
+                ("codex", "codex", true),
+                ("gemini", "gemini", true),
+            ])
+        );
+        for (wire, _, _) in &rows {
+            assert!(
+                ImpulseHarness::parse(wire).is_some(),
+                "parse rejects {wire}"
+            );
+        }
+    }
 }

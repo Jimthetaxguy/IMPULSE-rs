@@ -813,4 +813,17 @@ mod tests {
             assert!(err.contains(part), "{err}");
         }
     }
+
+    #[test]
+    fn test_wire_protocol_wire_names_match_display() {
+        crate::test_support::assert_wire_names_match_str_api(
+            &[
+                WireProtocol::AnthropicMessages,
+                WireProtocol::OpenaiChat,
+                WireProtocol::OpenaiResponses,
+            ],
+            None,
+            |v| v.to_string(),
+        );
+    }
 }
