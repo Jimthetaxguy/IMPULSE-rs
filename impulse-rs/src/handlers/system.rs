@@ -5,8 +5,9 @@ use std::sync::Arc;
 use crate::{mcp, monty, state, stewardship, tooling};
 
 use super::{
-    build_claude_hook_config, build_opencode_hook_config, build_tool_context, build_tool_registry,
-    get_session_id, print_json, refresh_capabilities_manifest, write_hook_validation_kit,
+    build_claude_hook_config, build_opencode_hook_config, build_remote_tool_context,
+    build_tool_registry, get_session_id, print_json, refresh_capabilities_manifest,
+    write_hook_validation_kit,
 };
 
 pub fn handle_system() -> Result<()> {
@@ -418,11 +419,10 @@ pub(crate) async fn handle_mcp(
         crate::McpCommands::Serve { transport, port } => {
             let config = state.config_snapshot()?;
             let registry = Arc::new(build_tool_registry(impulse_dir, &config)?);
-            let tool_context = build_tool_context(
+            let tool_context = build_remote_tool_context(
                 impulse_dir,
                 &config,
                 tooling::ExecutionOrigin::Mcp,
-                false,
                 get_session_id(None),
             );
             let _ = refresh_capabilities_manifest(state.storage().base_path(), registry.as_ref())?;

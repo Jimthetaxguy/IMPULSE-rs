@@ -381,6 +381,18 @@ pub(crate) fn build_tool_context(
     }
 }
 
+/// Build the shared deny-by-default context used by remote tool entrypoints.
+/// Keeping MCP and daemon requests on this helper prevents either transport
+/// from accidentally opting into the direct-CLI capability set.
+pub(crate) fn build_remote_tool_context(
+    impulse_dir: &Path,
+    config: &state::Config,
+    origin: tooling::ExecutionOrigin,
+    session_id: Option<String>,
+) -> tooling::ToolContext {
+    build_tool_context(impulse_dir, config, origin, false, session_id)
+}
+
 pub(crate) fn refresh_capabilities_manifest(
     impulse_dir: &Path,
     registry: &tooling::ToolRegistry,

@@ -346,7 +346,62 @@ fn render_tool_result(output: serde_json::Value) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tooling::{ExecutionOrigin, ToolRegistry};
+    use crate::tooling::{
+        Capability, DynamicTool, ExecutionOrigin, ToolCategory, ToolContext, ToolDescriptor,
+        ToolError, ToolRegistry, ToolResult,
+    };
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct AdmissionProbe {
+        id: &'static str,
+        capability: Capability,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl DynamicTool for AdmissionProbe {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn descriptor(&self) -> ToolDescriptor {
+            ToolDescriptor {
+                id: self.id.into(),
+                name: self.id.into(),
+                description: "Admission test probe".into(),
+                version: "1.0.0".into(),
+                category: ToolCategory::Utility,
+                params: Vec::new(),
+            }
+        }
+
+        fn validate_params(
+            &self,
+            params: &serde_json::Value,
+        ) -> std::result::Result<(), ToolError> {
+            if params.is_object() {
+                Ok(())
+            } else {
+                Err(ToolError::InvalidParams(
+                    "arguments must be an object".into(),
+                ))
+            }
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> std::result::Result<ToolResult, ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::text("probe executed"))
+        }
+
+        fn required_capabilities(&self) -> Vec<Capability> {
+            vec![self.capability]
+        }
+    }
 
     fn test_server() -> McpServer {
         McpServer::new(
@@ -356,6 +411,47 @@ mod tests {
                 ..ToolContext::with_all_capabilities()
             },
         )
+    }
+
+    async fn invoke_daemon_request(
+        request: crate::daemon::protocol::DaemonRequest,
+        registry: &ToolRegistry,
+        tool_context: &ToolContext,
+        state: &crate::state::SharedState,
+    ) -> crate::daemon::protocol::DaemonResponse {
+        use crate::daemon::actor_provenance::ConnectionClass;
+        use crate::daemon::handlers::ProcessRequestContext;
+
+        let wire = serde_json::to_vec(&request).unwrap();
+        let request = serde_json::from_slice(&wire).unwrap();
+        let terminal_telemetry = Arc::new(tokio::sync::RwLock::new(
+            crate::ops_workbench::TerminalOpsTelemetryStore::default(),
+        ));
+        let supervisor_session_override = Arc::new(tokio::sync::RwLock::new(None));
+        let conflict_resolver = Arc::new(tokio::sync::RwLock::new(
+            crate::agent::coordinator::ConflictResolver::new(),
+        ));
+        let delegation_tracker = Arc::new(tokio::sync::RwLock::new(
+            crate::delegation::DelegationTracker::new(),
+        ));
+        let cached_agent: Arc<tokio::sync::Mutex<Option<crate::agent::ImpulseAgent>>> =
+            Arc::new(tokio::sync::Mutex::new(None));
+
+        crate::daemon::handlers::process_request(
+            request,
+            ProcessRequestContext {
+                state: state.clone(),
+                registry,
+                tool_context,
+                terminal_telemetry: &terminal_telemetry,
+                supervisor_session_override: &supervisor_session_override,
+                conflict_resolver: &conflict_resolver,
+                delegation_tracker: &delegation_tracker,
+                cached_agent: &cached_agent,
+                connection_class: ConnectionClass::NonOperator,
+            },
+        )
+        .await
     }
 
     #[tokio::test]
@@ -393,6 +489,134 @@ mod tests {
             .await;
         assert!(response["content"].is_array());
         assert_ne!(response["isError"], serde_json::json!(true));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_and_daemon_tool_calls_share_deny_by_default_admission() {
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let write_calls = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Box::new(AdmissionProbe {
+                id: "read_probe",
+                capability: Capability::FileSystemRead,
+                calls: read_calls.clone(),
+            }))
+            .unwrap();
+        registry
+            .register(Box::new(AdmissionProbe {
+                id: "write_probe",
+                capability: Capability::FileSystemWrite,
+                calls: write_calls.clone(),
+            }))
+            .unwrap();
+        let registry = Arc::new(registry);
+        let temp = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::state::State::new(temp.path().to_path_buf()).unwrap());
+        let config = crate::state::Config::default();
+        let mcp_context = crate::handlers::build_remote_tool_context(
+            temp.path(),
+            &config,
+            ExecutionOrigin::Mcp,
+            None,
+        );
+        let daemon_context = crate::handlers::build_remote_tool_context(
+            temp.path(),
+            &config,
+            ExecutionOrigin::Daemon,
+            None,
+        );
+        assert_eq!(
+            mcp_context.allowed_capabilities,
+            daemon_context.allowed_capabilities
+        );
+        assert!(mcp_context.has_capability(Capability::FileSystemRead));
+        assert!(!mcp_context.has_capability(Capability::FileSystemWrite));
+
+        let mcp = McpServer::new(registry.clone(), mcp_context);
+        let mcp_read = mcp
+            .process_request(
+                r#"{"method":"tools/call","params":{"name":"read_probe","arguments":{}}}"#,
+            )
+            .await;
+        assert_ne!(mcp_read["isError"], serde_json::json!(true));
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+
+        let mcp_bad_args = mcp
+            .process_request(
+                r#"{"method":"tools/call","params":{"name":"read_probe","arguments":[]}}"#,
+            )
+            .await;
+        assert_eq!(mcp_bad_args["isError"], serde_json::json!(true));
+        assert!(mcp_bad_args["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid parameters"));
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+
+        let mcp_denied = mcp
+            .process_request(
+                r#"{"method":"tools/call","params":{"name":"write_probe","arguments":{}}}"#,
+            )
+            .await;
+        assert_eq!(mcp_denied["isError"], serde_json::json!(true));
+        assert!(mcp_denied["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Missing required capability"));
+        assert_eq!(write_calls.load(Ordering::SeqCst), 0);
+
+        let daemon_denied = invoke_daemon_request(
+            crate::daemon::protocol::DaemonRequest::InvokeTool {
+                name: "write_probe".into(),
+                params: serde_json::json!({}),
+            },
+            registry.as_ref(),
+            &daemon_context,
+            &state,
+        )
+        .await;
+        match daemon_denied {
+            crate::daemon::protocol::DaemonResponse::Error { message } => {
+                assert!(message.contains("Missing required capability"), "{message}");
+            }
+            other => panic!("expected a denied tool error, got {other:?}"),
+        }
+        assert_eq!(write_calls.load(Ordering::SeqCst), 0);
+
+        let daemon_bad_args = invoke_daemon_request(
+            crate::daemon::protocol::DaemonRequest::InvokeTool {
+                name: "read_probe".into(),
+                params: serde_json::json!([]),
+            },
+            registry.as_ref(),
+            &daemon_context,
+            &state,
+        )
+        .await;
+        match daemon_bad_args {
+            crate::daemon::protocol::DaemonResponse::Error { message } => {
+                assert!(message.contains("Invalid parameters"), "{message}");
+            }
+            other => panic!("expected malformed arguments to fail, got {other:?}"),
+        }
+        assert_eq!(read_calls.load(Ordering::SeqCst), 1);
+
+        let daemon_read = invoke_daemon_request(
+            crate::daemon::protocol::DaemonRequest::InvokeTool {
+                name: "read_probe".into(),
+                params: serde_json::json!({}),
+            },
+            registry.as_ref(),
+            &daemon_context,
+            &state,
+        )
+        .await;
+        assert!(matches!(
+            daemon_read,
+            crate::daemon::protocol::DaemonResponse::Ok { .. }
+        ));
+        assert_eq!(read_calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

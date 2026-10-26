@@ -114,19 +114,6 @@ where
     }
 }
 
-fn build_remote_tool_context(
-    impulse_dir: &std::path::Path,
-    config: &crate::state::Config,
-) -> crate::tooling::ToolContext {
-    crate::handlers::build_tool_context(
-        impulse_dir,
-        config,
-        crate::tooling::ExecutionOrigin::Daemon,
-        false,
-        None,
-    )
-}
-
 /// Takes the per-project daemon lock, failing at once if another process
 /// holds it. The returned file holds the lock until it is dropped. On a
 /// filesystem that does not support `flock` (some network mounts) the
@@ -264,7 +251,12 @@ impl Daemon {
         ) {
             startup_warnings.push(format!("failed to refresh capabilities manifest: {err}"));
         }
-        let tool_context = build_remote_tool_context(state.storage().base_path(), &config_snapshot);
+        let tool_context = crate::handlers::build_remote_tool_context(
+            state.storage().base_path(),
+            &config_snapshot,
+            crate::tooling::ExecutionOrigin::Daemon,
+            None,
+        );
 
         // Initialize the global plugin registry so ListPlugins/InvokePlugin work.
         crate::plugin::registry::init_global_registry();
