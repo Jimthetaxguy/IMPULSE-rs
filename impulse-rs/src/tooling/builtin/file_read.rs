@@ -119,19 +119,28 @@ impl DynamicTool for FileReadTool {
         let content = std::fs::read_to_string(&path)
             .map_err(|e| ToolError::ExecutionFailed(format!("Failed to read file: {}", e)))?;
 
-        // Collect once to avoid double traversal
-        let all_lines: Vec<&str> = content.lines().collect();
-        let total_lines = all_lines.len();
-        let start = start_line.saturating_sub(1).min(total_lines);
-        let end = start.saturating_add(max_lines).min(total_lines);
-        let lines = &all_lines[start..end];
+        let start = start_line.saturating_sub(1);
+        let end = start.saturating_add(max_lines);
+        let mut selected = String::new();
+        let mut lines_returned = 0;
+        let mut total_lines = 0;
+        for (index, line) in content.lines().enumerate() {
+            total_lines = index + 1;
+            if index >= start && index < end {
+                if lines_returned > 0 {
+                    selected.push('\n');
+                }
+                selected.push_str(line);
+                lines_returned += 1;
+            }
+        }
         let truncated = end < total_lines;
 
         Ok(ToolResult::json(serde_json::json!({
             "path": path_str,
-            "content": lines.join("\n"),
+            "content": selected,
             "start_line": start_line,
-            "lines_returned": lines.len(),
+            "lines_returned": lines_returned,
             "total_lines": total_lines,
             "truncated": truncated,
             "size_bytes": metadata.len(),
@@ -146,6 +155,110 @@ impl DynamicTool for FileReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn test_execute_page_matches_prior_line_semantics(
+            characters in proptest::collection::vec(any::<char>(), 0..512),
+            start_line in prop_oneof![0u64..32, Just(u64::MAX)],
+            max_lines in prop_oneof![0u64..32, Just(u64::MAX)],
+        ) {
+            let content: String = characters.into_iter().collect();
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("page.txt");
+            std::fs::write(&path, &content).unwrap();
+            let ctx = ToolContext::with_all_capabilities();
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let result = runtime.block_on(FileReadTool.execute(
+                serde_json::json!({"path": path, "start_line": start_line, "max_lines": max_lines}),
+                &ctx,
+            )).unwrap();
+            let normalized_start = start_line.max(1).min(usize::MAX as u64) as usize;
+            let normalized_max = max_lines.min(usize::MAX as u64) as usize;
+            let all_lines: Vec<_> = content.lines().collect();
+            let start = normalized_start.saturating_sub(1).min(all_lines.len());
+            let end = start.saturating_add(normalized_max).min(all_lines.len());
+            prop_assert_eq!(result.output, serde_json::json!({
+                "path": path,
+                "content": all_lines[start..end].join("\n"),
+                "start_line": normalized_start,
+                "lines_returned": end - start,
+                "total_lines": all_lines.len(),
+                "truncated": end < all_lines.len(),
+                "size_bytes": content.len(),
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_line_boundaries_preserve_content_and_counts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("page.txt");
+        let ctx = ToolContext::with_all_capabilities();
+        for content in ["", "\n", "\n\n", "alpha\r\nβeta\n終\r", "alpha\n\n", "only"] {
+            std::fs::write(&path, content).unwrap();
+            for (start_line, max_lines) in [
+                (1usize, 0usize),
+                (1, 200),
+                (2, 1),
+                (4, 4),
+                (usize::MAX, usize::MAX),
+            ] {
+                let result = FileReadTool.execute(
+                    serde_json::json!({"path": path, "start_line": start_line, "max_lines": max_lines}),
+                    &ctx,
+                ).await.unwrap();
+                let all_lines: Vec<_> = content.lines().collect();
+                let start = start_line.saturating_sub(1).min(all_lines.len());
+                let end = start.saturating_add(max_lines).min(all_lines.len());
+                assert_eq!(result.output["content"], all_lines[start..end].join("\n"));
+                assert_eq!(result.output["total_lines"], all_lines.len());
+                assert_eq!(result.output["lines_returned"], end - start);
+                assert_eq!(result.output["truncated"], end < all_lines.len());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_dense_newline_file_returns_bounded_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("dense.txt");
+        std::fs::write(&path, "\n".repeat(MAX_FILE_BYTES)).unwrap();
+        let result = FileReadTool
+            .execute(
+                serde_json::json!({"path": path}),
+                &ToolContext::with_all_capabilities(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.output["content"], "\n".repeat(199));
+        assert_eq!(result.output["lines_returned"], 200);
+        assert_eq!(result.output["total_lines"], MAX_FILE_BYTES);
+        assert_eq!(result.output["truncated"], true);
+    }
+
+    #[tokio::test]
+    #[ignore = "manual dense-file performance measurement"]
+    async fn test_benchmark_dense_file_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("dense.txt");
+        std::fs::write(&path, "\n".repeat(MAX_FILE_BYTES)).unwrap();
+        let ctx = ToolContext::with_all_capabilities();
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            let result = FileReadTool
+                .execute(serde_json::json!({"path": path}), &ctx)
+                .await
+                .unwrap();
+            assert_eq!(result.output["lines_returned"], 200);
+            assert_eq!(result.output["total_lines"], MAX_FILE_BYTES);
+        }
+        eprintln!(
+            "dense_file_page_iterations=100 elapsed_us={}",
+            started.elapsed().as_micros()
+        );
+    }
 
     #[test]
     fn test_descriptor() {
