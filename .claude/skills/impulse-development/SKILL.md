@@ -1,8 +1,8 @@
 ---
 name: impulse-development
 description: "Use when adding features to the Impulse codebase — CLI commands, daemon IPC messages, GUI views, dynamic tools, context lifecycle, or guardrails. Routes to detailed step-by-step guides."
-version: 1.0.0
-updated: 2026-09-12
+version: 1.1.0
+updated: 2026-10-29
 domain: engineering
 category: languages
 maturity: silver
@@ -181,15 +181,38 @@ let guard = DaemonGuard::spawn(&tempdir).await?;
 ```
 Each test gets a unique socket path to support parallel execution.
 
-### Verification Before Commit
+### Prove It Yourself (Before You Open or Update a PR)
+
+Run the whole gate yourself and paste the results into the PR body. Nobody
+should have to ask for proof, and a PR that skipped a step should say which
+step and why.
+
+1. **Install the pinned toolchain first.** `impulse-rs/rust-toolchain.toml`
+   pins `stable` with `clippy` and `rustfmt`, and the package needs Rust 1.96
+   or newer. Some cloud images ship Rust 1.83, which fails before any test
+   runs (`edition2024` errors). From `impulse-rs/`, run `rustup toolchain install`
+   and then `cargo --version` and `cargo clippy --version`. Do not go on until
+   both report the pinned toolchain.
+2. **Use an isolated target dir.** Follow the `CARGO_TARGET_DIR` rule in
+   `AGENTS.md`. It is not repeated here, so the two files cannot drift.
+3. **Run the four gate commands from `impulse-rs/`.**
+
 ```bash
-cd impulse-rs
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked --no-fail-fast
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
+cargo build --locked --release --bin impulse-rs
 ```
-All four must pass. Never skip with `--no-verify`. Crate-local checks (`cargo test -p impulse-desktop`) are extra, not a substitute.
+
+   All four must pass. Never skip hooks with `--no-verify`. Crate-local checks
+   (`cargo test -p impulse-desktop`) are extra, not a substitute.
+4. **Keep `impulse-rs/Cargo.lock` out of the commit unless the PR is about it.**
+   If a probe or a toolchain mismatch rewrites the lock, restore it with
+   `git checkout -- impulse-rs/Cargo.lock` before committing. If the change
+   really needs new lock entries, say so in the PR body and name the crate.
+5. **Report in the PR body.** For each command, give the pass or fail line
+   (for tests, the passed, failed and ignored counts), the toolchain version,
+   and any step you could not finish with the reason.
 
 ---
 
