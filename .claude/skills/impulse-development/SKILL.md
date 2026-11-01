@@ -190,9 +190,10 @@ step and why.
 1. **Install the pinned toolchain first.** `impulse-rs/rust-toolchain.toml`
    pins `stable` with `clippy` and `rustfmt`, and the package needs Rust 1.96
    or newer. Some cloud images ship Rust 1.83, which fails before any test
-   runs (`edition2024` errors). From `impulse-rs/`, run `rustup toolchain install`
-   and then `cargo --version` and `cargo clippy --version`. Do not go on until
-   both report the pinned toolchain.
+   runs (`edition2024` errors), even with the pin present. From `impulse-rs/`,
+   run `rustup toolchain install stable --component clippy rustfmt`, then
+   `cargo --version` and `cargo clippy --version`. Do not go on until both
+   report 1.96 or newer.
 2. **Use an isolated target dir.** Follow the `CARGO_TARGET_DIR` rule in
    `AGENTS.md`. It is not repeated here, so the two files cannot drift.
 3. **Run the four gate commands from `impulse-rs/`.**
@@ -206,6 +207,15 @@ cargo build --locked --release --bin impulse-rs
 
    All four must pass. Never skip hooks with `--no-verify`. Crate-local checks
    (`cargo test -p impulse-desktop`) are extra, not a substitute.
+
+   `.github/workflows/ci.yml` also builds without default features, which the
+   four commands above do not cover. Run these two as well, because a PR can
+   pass the local gate and still break them:
+
+```bash
+cargo test --no-default-features --lib
+cargo build --no-default-features
+```
 4. **Keep `impulse-rs/Cargo.lock` out of the commit unless the PR is about it.**
    If a probe or a toolchain mismatch rewrites the lock, restore it with
    `git checkout -- impulse-rs/Cargo.lock` before committing. If the change
