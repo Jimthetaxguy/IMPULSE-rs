@@ -196,26 +196,21 @@ step and why.
    report 1.96 or newer.
 2. **Use an isolated target dir.** Follow the `CARGO_TARGET_DIR` rule in
    `AGENTS.md`. It is not repeated here, so the two files cannot drift.
-3. **Run the four gate commands from `impulse-rs/`.**
+3. **Run the six gate commands from `impulse-rs/`.**
 
 ```bash
 cargo test --workspace --locked --no-fail-fast
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all -- --check
 cargo build --locked --release --bin impulse-rs
-```
-
-   All four must pass. Never skip hooks with `--no-verify`. Crate-local checks
-   (`cargo test -p impulse-desktop`) are extra, not a substitute.
-
-   `.github/workflows/ci.yml` also builds without default features, which the
-   four commands above do not cover. Run these two as well, because a PR can
-   pass the local gate and still break them:
-
-```bash
 cargo test --no-default-features --lib
 cargo build --no-default-features
 ```
+
+   All six must pass. This local run is the gate: GitHub Actions does not
+   gate merges, so do not count on `ci.yml` to catch the two builds without
+   default features. Never skip hooks with `--no-verify`. Crate-local checks
+   (`cargo test -p impulse-desktop`) are extra, not a substitute.
 4. **Keep `impulse-rs/Cargo.lock` out of the commit unless the PR is about it.**
    If a probe or a toolchain mismatch rewrites the lock, restore it with
    `git checkout -- impulse-rs/Cargo.lock` before committing. If the change
