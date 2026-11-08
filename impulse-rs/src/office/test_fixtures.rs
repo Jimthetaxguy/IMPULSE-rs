@@ -3,38 +3,46 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+/// Writes a real OPC/OOXML document for reader tests, without a production writer.
+/// `body` is XML assembled only from synthetic test literals below.
+pub(crate) fn write_docx_body(path: &Path, body: &str) {
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+    let document = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
+    );
+    for (name, text) in [
+        (
+            "[Content_Types].xml",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#,
+        ),
+        (
+            "_rels/.rels",
+            r#"<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#,
+        ),
+        ("word/document.xml", document.as_str()),
+    ] {
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(text.as_bytes()).unwrap();
+    }
+    zip.finish().unwrap();
+}
+
 /// Writes a `.docx` with an `Intro` paragraph, one table row holding the
 /// cells `A` and `B`, and `Outro`.
 pub fn write_docx_with_table(dir: &Path) -> PathBuf {
-    use docx::{Docx, Paragraph, Run, Table, TableCell, TableRow};
-
-    let cell = |text: &str| {
-        TableCell::new().add_paragraph(Paragraph::new().add_run(Run::new().add_text(text)))
-    };
     let path = dir.join("table.docx");
-    Docx::new()
-        .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Intro")))
-        .add_table(Table::new(vec![TableRow::new(vec![cell("A"), cell("B")])]))
-        .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Outro")))
-        .build()
-        .pack(std::fs::File::create(&path).unwrap())
-        .unwrap();
+    write_docx_body(&path, "<w:p><w:r><w:t>Intro</w:t></w:r></w:p><w:tbl><w:tblPr/><w:tblGrid><w:gridCol/><w:gridCol/></w:tblGrid><w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>B</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p><w:r><w:t>Outro</w:t></w:r></w:p>");
     path
 }
 
 /// Writes a `.docx` of `count` one-line paragraphs, `line 0` onward.
 pub fn write_docx_lines(dir: &Path, count: usize) -> PathBuf {
-    use docx::{Docx, Paragraph, Run};
-
     let path = dir.join("lines.docx");
-    let mut docx = Docx::new();
-    for i in 0..count {
-        docx =
-            docx.add_paragraph(Paragraph::new().add_run(Run::new().add_text(format!("line {i}"))));
-    }
-    docx.build()
-        .pack(std::fs::File::create(&path).unwrap())
-        .unwrap();
+    let body: String = (0..count)
+        .map(|i| format!("<w:p><w:r><w:t>line {i}</w:t></w:r></w:p>"))
+        .collect();
+    write_docx_body(&path, &body);
     path
 }
 
@@ -45,13 +53,13 @@ pub fn write_docx_lines(dir: &Path, count: usize) -> PathBuf {
 /// brings the dense grid back.
 pub fn write_far_apart_workbook(dir: &Path) -> PathBuf {
     let path = dir.join("far.xlsx");
-    let mut workbook = rust_xlsxwriter::Workbook::new(path.to_str().unwrap());
+    let mut workbook = rust_xlsxwriter::Workbook::new();
     let data = workbook.add_worksheet();
     data.set_name("Data").unwrap();
-    data.write_string_only(0, 0, "start").unwrap();
-    data.write_string_only(3000, 300, "end").unwrap();
+    data.write_string(0, 0, "start").unwrap();
+    data.write_string(3000, 300, "end").unwrap();
     workbook.add_worksheet().set_name("Empty").unwrap();
-    workbook.close().unwrap();
+    workbook.save(&path).unwrap();
     path
 }
 
@@ -62,7 +70,7 @@ pub fn rewrite_zip(original: &Path, path: &Path, edit: impl Fn(&str, &str) -> Op
     let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).unwrap();
-        let name = entry.name().to_string();
+        let name = entry.name().unwrap().into_owned();
         let mut data = Vec::new();
         std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
         if let Some(text) = std::str::from_utf8(&data)
@@ -71,7 +79,7 @@ pub fn rewrite_zip(original: &Path, path: &Path, edit: impl Fn(&str, &str) -> Op
         {
             data = text.into_bytes();
         }
-        zip.start_file(name, zip::write::FileOptions::default())
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
             .unwrap();
         zip.write_all(&data).unwrap();
     }
@@ -82,12 +90,9 @@ pub fn rewrite_zip(original: &Path, path: &Path, edit: impl Fn(&str, &str) -> Op
 /// sheet, and returns its path.
 fn one_cell_workbook(dir: &Path, stem: &str) -> PathBuf {
     let path = dir.join(format!("{stem}.original.xlsx"));
-    let mut workbook = rust_xlsxwriter::Workbook::new(path.to_str().unwrap());
-    workbook
-        .add_worksheet()
-        .write_string_only(0, 0, "x")
-        .unwrap();
-    workbook.close().unwrap();
+    let mut workbook = rust_xlsxwriter::Workbook::new();
+    workbook.add_worksheet().write_string(0, 0, "x").unwrap();
+    workbook.save(&path).unwrap();
     path
 }
 
@@ -136,7 +141,7 @@ pub fn write_docx_bomb(dir: &Path, max_inflated: u64) -> PathBuf {
     const MIB: u64 = 1 << 20;
 
     let mut seed = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-    seed.start_file("zeros.bin", zip::write::FileOptions::default())
+    seed.start_file("zeros.bin", zip::write::SimpleFileOptions::default())
         .unwrap();
     seed.write_all(&vec![0u8; MIB as usize]).unwrap();
     let seed = seed.finish().unwrap().into_inner();
@@ -144,8 +149,11 @@ pub fn write_docx_bomb(dir: &Path, max_inflated: u64) -> PathBuf {
 
     let path = dir.join("bomb.docx");
     let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
-    zip.start_file("word/document.xml", zip::write::FileOptions::default())
-        .unwrap();
+    zip.start_file(
+        "word/document.xml",
+        zip::write::SimpleFileOptions::default(),
+    )
+    .unwrap();
     zip.write_all(
         br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>hi</w:t></w:r></w:p></w:body></w:document>"#,
     )

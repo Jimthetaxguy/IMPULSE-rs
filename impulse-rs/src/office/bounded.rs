@@ -163,7 +163,12 @@ pub fn preflight_container_with_limit(
             anyhow::anyhow!("{label} could not be parsed: unreadable {ext} entry ({e})")
         })?;
         let remaining = max_uncompressed.saturating_sub(inflated_total);
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|e| {
+                anyhow::anyhow!("{label} could not be parsed: unreadable {ext} entry name ({e})")
+            })?
+            .into_owned();
         let inflated = std::io::copy(
             &mut (&mut entry).take(remaining.saturating_add(1)),
             &mut std::io::sink(),
@@ -624,11 +629,18 @@ pub fn extract_word(path: &Path, label: &str, budget: ExtractBudget) -> Result<P
     // OPC part names compare case-insensitively, and calamine resolves
     // workbook parts the same way; a writer that emits `word/Document.xml`
     // produces a file every reader opens, so this one opens it too.
-    let part = archive
-        .file_names()
-        .find(|name| name.eq_ignore_ascii_case(DOCUMENT_PART))
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow::anyhow!("{label} could not be parsed: no {DOCUMENT_PART}"))?;
+    let mut part = None;
+    for name in archive.file_names() {
+        let name = name.map_err(|e| {
+            anyhow::anyhow!("{label} could not be parsed: unreadable docx entry name ({e})")
+        })?;
+        if name.eq_ignore_ascii_case(DOCUMENT_PART) {
+            part = Some(name.into_owned());
+            break;
+        }
+    }
+    let part =
+        part.ok_or_else(|| anyhow::anyhow!("{label} could not be parsed: no {DOCUMENT_PART}"))?;
     let entry = archive
         .by_name(&part)
         .map_err(|e| anyhow::anyhow!("{label} could not be parsed: no {DOCUMENT_PART} ({e})"))?;
@@ -1099,11 +1111,11 @@ mod tests {
     fn test_extract_workbook_counts_sheet_headers_against_the_budget() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("one.xlsx");
-        let mut workbook = rust_xlsxwriter::Workbook::new(path.to_str().unwrap());
+        let mut workbook = rust_xlsxwriter::Workbook::new();
         let sheet = workbook.add_worksheet();
         sheet.set_name("Data").unwrap();
-        sheet.write_string_only(0, 0, "x").unwrap();
-        workbook.close().unwrap();
+        sheet.write_string(0, 0, "x").unwrap();
+        workbook.save(&path).unwrap();
 
         // "=== Sheet: Data ===\n", "x" and "\n\n" make 23 characters.
         let budget = |max_chars| ExtractBudget {
@@ -1127,14 +1139,14 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let original = dir.path().join("original.xlsx");
-        let mut workbook = rust_xlsxwriter::Workbook::new(original.to_str().unwrap());
+        let mut workbook = rust_xlsxwriter::Workbook::new();
         let sheet = workbook.add_worksheet();
         sheet.set_name("A").unwrap();
-        sheet.write_string_only(0, 0, "x").unwrap();
+        sheet.write_string(0, 0, "x").unwrap();
         let blank = workbook.add_worksheet();
         blank.set_name("Blank").unwrap();
-        blank.write_string_only(0, 0, "y").unwrap();
-        workbook.close().unwrap();
+        blank.write_string(0, 0, "y").unwrap();
+        workbook.save(&original).unwrap();
         // The Blank sheet's one cell becomes a formula whose cached result
         // is the empty string.
         let path = dir.path().join("blank.xlsx");
@@ -1190,7 +1202,7 @@ mod tests {
             let path = dir.path().join(name);
             let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
             for i in 0..entries {
-                zip.start_file(format!("e{i}"), zip::write::FileOptions::default())
+                zip.start_file(format!("e{i}"), zip::write::SimpleFileOptions::default())
                     .unwrap();
                 zip.write_all(b"x").unwrap();
             }

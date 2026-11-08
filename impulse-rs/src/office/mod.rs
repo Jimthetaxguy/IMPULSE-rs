@@ -314,9 +314,8 @@ mod tests {
             );
         }
 
-        /// calamine panics on a shared-string index past the end of the
-        /// table in every build, and with overflow checks on, as in tests,
-        /// on an inverted `<dimension>` and on a cell reference whose row
+        /// With overflow checks on, as in tests, calamine panics on an
+        /// inverted `<dimension>` and on a cell reference whose row
         /// overflows `u32`. The office CLI and context provider call the
         /// reader synchronously, so the panic must fail the one document
         /// rather than unwind the caller.
@@ -345,8 +344,13 @@ mod tests {
                 let err = result.unwrap_err();
                 assert!(err.contains("the parser panicked"), "{err}");
             }
+        }
 
-            // Bounds checks stay on in release, so this one panics there too.
+        /// Calamine 0.37 reports a missing shared string as an error instead
+        /// of panicking. The document must still be refused in every build.
+        #[test]
+        fn test_parse_document_rejects_a_missing_shared_string() {
+            let dir = tempfile::tempdir().unwrap();
             let bad_string = write_workbook_with_edited_sheet(dir.path(), "bad_string", |xml| {
                 let start = xml.find("<c r=\"A1\"").unwrap();
                 let end = start + xml[start..].find("</c>").unwrap() + "</c>".len();
@@ -357,7 +361,10 @@ mod tests {
                 )
             });
             let err = parse_document(&bad_string).unwrap_err();
-            assert!(err.contains("the parser panicked"), "{err}");
+            assert!(
+                err.contains("Cell string index not found in shared strings table"),
+                "{err}"
+            );
         }
 
         /// Each chunk is the span of `content` one section covers, so a Word

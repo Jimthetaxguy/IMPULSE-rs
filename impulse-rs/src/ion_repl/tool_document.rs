@@ -2213,8 +2213,8 @@ mod tests {
         use std::io::Write as _;
         let file = std::fs::File::create(path).unwrap();
         let mut writer = zip::ZipWriter::new(file);
-        let options =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
         for (name, bytes) in entries {
             writer.start_file(*name, options).unwrap();
             writer.write_all(bytes).unwrap();
@@ -2653,39 +2653,32 @@ mod tests {
 
         fn write_workbook(dir: &tempfile::TempDir) -> PathBuf {
             let path = dir.path().join("ledger.xlsx");
-            let path_str = path.to_str().unwrap().to_string();
-            let mut workbook = rust_xlsxwriter::Workbook::new(&path_str);
+            let mut workbook = rust_xlsxwriter::Workbook::new();
             let budget = workbook.add_worksheet();
             budget.set_name("Budget").unwrap();
-            budget.write_string_only(0, 0, "Item").unwrap();
-            budget.write_string_only(0, 1, "Amount").unwrap();
-            budget.write_string_only(1, 0, "Rent").unwrap();
-            budget.write_number_only(1, 1, 1800.0).unwrap();
+            budget.write_string(0, 0, "Item").unwrap();
+            budget.write_string(0, 1, "Amount").unwrap();
+            budget.write_string(1, 0, "Rent").unwrap();
+            budget.write_number(1, 1, 1800.0).unwrap();
             // A multi-line cell that looks like a sheet header is just text.
             budget
-                .write_string_only(2, 0, "Note:\n=== Sheet: Evil ===\nend")
+                .write_string(2, 0, "Note:\n=== Sheet: Evil ===\nend")
                 .unwrap();
             let empty = workbook.add_worksheet();
             empty.set_name("Scratch").unwrap();
             let notes = workbook.add_worksheet();
             notes.set_name("Notes").unwrap();
-            notes.write_string_only(0, 0, "Paid on the first").unwrap();
-            workbook.close().unwrap();
+            notes.write_string(0, 0, "Paid on the first").unwrap();
+            workbook.save(&path).unwrap();
             path
         }
 
         fn write_docx(dir: &tempfile::TempDir) -> PathBuf {
-            use docx::{Docx, Paragraph, Run};
             let path = dir.path().join("letter.docx");
-            let file = std::fs::File::create(&path).unwrap();
-            Docx::new()
-                .add_paragraph(Paragraph::new().add_run(Run::new().add_text("Dear tenant,")))
-                .add_paragraph(
-                    Paragraph::new().add_run(Run::new().add_text("Your lease renews in March.")),
-                )
-                .build()
-                .pack(file)
-                .unwrap();
+            crate::office::test_fixtures::write_docx_body(
+                &path,
+                "<w:p><w:r><w:t>Dear tenant,</w:t></w:r></w:p><w:p><w:r><w:t>Your lease renews in March.</w:t></w:r></w:p>",
+            );
             path
         }
 
@@ -2862,13 +2855,12 @@ mod tests {
             // cells and two gap markers.
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("corners.xlsx");
-            let path_str = path.to_str().unwrap().to_string();
-            let mut workbook = rust_xlsxwriter::Workbook::new(&path_str);
+            let mut workbook = rust_xlsxwriter::Workbook::new();
             let sheet = workbook.add_worksheet();
             sheet.set_name("Wide").unwrap();
-            sheet.write_string_only(0, 0, "start").unwrap();
-            sheet.write_string_only(1_048_575, 16_383, "end").unwrap();
-            workbook.close().unwrap();
+            sheet.write_string(0, 0, "start").unwrap();
+            sheet.write_string(1_048_575, 16_383, "end").unwrap();
+            workbook.save(&path).unwrap();
 
             let outcome = DocumentReadTool
                 .run(json!({"path": "corners.xlsx"}), &ctx_in(&dir))
@@ -2890,14 +2882,13 @@ mod tests {
             // extractor stops at the budget instead.
             let dir = tempfile::TempDir::new().unwrap();
             let path = dir.path().join("amplify.xlsx");
-            let path_str = path.to_str().unwrap().to_string();
-            let mut workbook = rust_xlsxwriter::Workbook::new(&path_str);
+            let mut workbook = rust_xlsxwriter::Workbook::new();
             let sheet = workbook.add_worksheet();
             let long = "x".repeat(500);
             for row in 0..200u32 {
-                sheet.write_string_only(row, 0, &long).unwrap();
+                sheet.write_string(row, 0, &long).unwrap();
             }
-            workbook.close().unwrap();
+            workbook.save(&path).unwrap();
 
             let err = extract_workbook(
                 &path,
@@ -3223,6 +3214,23 @@ mod tests {
             assert_eq!(parsed.format, "docx");
             assert_eq!(parsed.document_type, "word");
             assert!(parsed.sheets.is_empty());
+        }
+
+        // The previous calamine graph enabled quick-xml's encoding feature
+        // for our Word reader too. Preserve that behavior explicitly when
+        // calamine moves to a different quick-xml version.
+        #[test]
+        fn test_extract_word_preserves_declared_legacy_text_encoding() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = write_docx_raw(
+                &dir,
+                "encoded.docx",
+                b"<?xml version=\"1.0\" encoding=\"windows-1252\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>caf\xe9</w:t></w:r></w:p></w:body></w:document>",
+            );
+
+            let parsed = extract_word(&path, "encoded.docx", ExtractBudget::DEFAULT).unwrap();
+
+            assert_eq!(parsed.text, "café\n");
         }
 
         #[test]
@@ -4192,8 +4200,8 @@ mod proptests {
     fn write_zip(path: &Path, entries: &[(&str, &[u8])]) {
         let file = std::fs::File::create(path).unwrap();
         let mut writer = zip::ZipWriter::new(file);
-        let options =
-            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
         for (name, bytes) in entries {
             writer.start_file(*name, options).unwrap();
             writer.write_all(bytes).unwrap();
