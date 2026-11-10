@@ -3065,6 +3065,7 @@ mod tests {
         corrupt_registration: bool,
         reject_running: bool,
         corrupt_running: bool,
+        reject_runtime_exit: bool,
     }
 
     impl TestGovernedTaskGateway {
@@ -3076,6 +3077,7 @@ mod tests {
                 corrupt_registration: false,
                 reject_running: false,
                 corrupt_running: false,
+                reject_runtime_exit: false,
             }
         }
 
@@ -3096,6 +3098,13 @@ mod tests {
         fn corrupting_running() -> Self {
             Self {
                 corrupt_running: true,
+                ..Self::default()
+            }
+        }
+
+        fn rejecting_runtime_exit() -> Self {
+            Self {
+                reject_runtime_exit: true,
                 ..Self::default()
             }
         }
@@ -3197,6 +3206,9 @@ mod tests {
                     task.execution_state = GovernedExecutionState::LaunchFailed;
                 }
                 GovernedTaskMutation::MarkRuntimeExited { exit_kind, .. } => {
+                    if self.reject_runtime_exit {
+                        return Err("test daemon rejected runtime exit".to_string());
+                    }
                     if task.execution_state != GovernedExecutionState::Running {
                         return Err("invalid runtime-exit transition".to_string());
                     }
@@ -4493,6 +4505,92 @@ mod tests {
                 session_id: snapshot.agent_id,
             })
             .unwrap();
+    }
+
+    fn spawn_governed_sleeper(
+        runtime: &DesktopRuntime,
+        agent_id: &str,
+    ) -> (AgentRuntimeSnapshot, tempfile::TempDir) {
+        let mut request = spawn_request(24, 80, Some("sh"));
+        let workspace = bind_to_temporary_workspace(&mut request);
+        request.agent_id = Some(agent_id.to_string());
+        request.args = vec!["-c".to_string(), "sleep 30".to_string()];
+        request.task = Some("characterize operator close".to_string());
+        request.role_assignment = Some(role_assignment(
+            "workspace.target",
+            EnforcementStrength::Mediated,
+            true,
+        ));
+        (runtime.spawn_agent(request).unwrap(), workspace)
+    }
+
+    /// Characterization: an operator close of a governed runtime records a durable
+    /// OperatorCancelled exit and releases the session.
+    #[test]
+    fn test_close_governed_runtime_records_operator_cancelled_exit() {
+        let (runtime, gateway) = runtime_with_task_gateway();
+        let (snapshot, _workspace) = spawn_governed_sleeper(&runtime, "close-records-exit");
+        let task_id = snapshot.governed_task_id.clone().unwrap();
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: snapshot.agent_id.clone(),
+            })
+            .unwrap();
+        let task = gateway.task(&task_id).unwrap();
+        assert_eq!(task.execution_state, GovernedExecutionState::RuntimeExited);
+        assert_eq!(
+            task.exit_kind,
+            impulse_ops::governed_task::GovernedExitKind::OperatorCancelled
+        );
+        assert!(runtime
+            .snapshot_agents()
+            .iter()
+            .all(|agent| agent.agent_id != snapshot.agent_id));
+    }
+
+    /// Characterization of the composite "ended locally, durable exit not recorded"
+    /// outcome: the process is confirmed gone and the session released, the error says
+    /// the runtime closed, and the daemon task is left Running rather than given a
+    /// fabricated exit. There is no retained retry handle: a second close addresses a
+    /// missing session.
+    #[test]
+    fn test_close_with_failed_durable_exit_reports_closed_runtime_without_false_exit() {
+        let gateway = Arc::new(TestGovernedTaskGateway::rejecting_runtime_exit());
+        let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway.clone();
+        let runtime = DesktopRuntime::builder()
+            .with_governed_task_gateway(gateway_trait)
+            .build();
+        let (snapshot, _workspace) = spawn_governed_sleeper(&runtime, "close-exit-rejected");
+        let task_id = snapshot.governed_task_id.clone().unwrap();
+
+        let error = runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: snapshot.agent_id.clone(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DesktopBridgeError::GovernedTaskFailed { ref message }
+                if message.contains("runtime closed but durable exit recording failed")
+        ));
+        assert!(runtime
+            .snapshot_agents()
+            .iter()
+            .all(|agent| agent.agent_id != snapshot.agent_id));
+        assert_eq!(
+            gateway.task(&task_id).unwrap().execution_state,
+            GovernedExecutionState::Running,
+            "a failed durable acknowledgement must not be reported as a recorded exit"
+        );
+        let retry = runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: snapshot.agent_id,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            retry,
+            DesktopBridgeError::MissingTerminalSession { .. }
+        ));
     }
 
     #[test]
