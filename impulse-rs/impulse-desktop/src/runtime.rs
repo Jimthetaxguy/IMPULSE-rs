@@ -624,8 +624,63 @@ struct RuntimeRecord {
     mcp_tools: Vec<BuiltInMcpTool>,
     focused: bool,
     status: AgentStatus,
+    /// What the daemon is told once this process is confirmed terminated.
+    confirmed_exit: ConfirmedExit,
     backend: TerminalBackend,
     input: PaneInput,
+}
+
+/// The durable record owed once a runtime's termination is confirmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfirmedExit {
+    /// The launch was acknowledged Running: termination is a runtime exit.
+    RuntimeExit,
+    /// The launch was refused after its PTY started and termination was not
+    /// confirmed then. Termination ends a launch that never ran, so it is
+    /// recorded as a launch abort, never as an operator cancellation.
+    LaunchAbort { reason: String },
+}
+
+/// How a launch whose PTY already started was left behind.
+enum StartupTeardown {
+    /// Acknowledged, or refused with termination confirmed.
+    Clean,
+    /// Refused, but the child could not be confirmed terminated. The runtime
+    /// keeps it managed with input stopped and records no exit yet.
+    KillUnconfirmed {
+        pid: Option<u32>,
+        message: String,
+        abort_reason: String,
+    },
+}
+
+/// Record durable truth for a governed runtime whose termination is
+/// confirmed: a launch abort for a refused launch, otherwise a runtime exit
+/// with the caller's reason and kind.
+fn record_confirmed_exit(
+    gateway: &dyn GovernedTaskGateway,
+    project_id: &str,
+    task_id: &impulse_ops::governed_task::GovernedTaskId,
+    confirmed_exit: &ConfirmedExit,
+    request_prefix: &str,
+    reason: Option<String>,
+    exit_kind: impulse_ops::governed_task::GovernedExitKind,
+) -> Result<GovernedTaskRun, String> {
+    match confirmed_exit {
+        ConfirmedExit::LaunchAbort { reason } => {
+            record_launch_abort_bound(gateway, project_id, task_id, reason)
+        }
+        ConfirmedExit::RuntimeExit => gateway.mutate_current(
+            project_id,
+            task_id,
+            new_governed_request_id(request_prefix),
+            GovernedTaskMutation::MarkRuntimeExited {
+                actor: governed_system_actor("desktop-runtime"),
+                reason,
+                exit_kind,
+            },
+        ),
+    }
 }
 
 impl RuntimeRecord {
@@ -703,10 +758,21 @@ impl LaunchCallbackGate {
     }
 }
 
+/// Terminates and reaps a runtime's PTY child, returning an error unless the
+/// exit is confirmed. Production always uses [`TerminalBackend::kill`]. It is
+/// injectable only so tests can reach the unconfirmed-termination paths
+/// without needing a real process that refuses to die.
+type Terminator = Arc<dyn Fn(&TerminalBackend) -> Result<(), String> + Send + Sync>;
+
+fn default_terminator() -> Terminator {
+    Arc::new(|backend: &TerminalBackend| backend.kill().map_err(|error| error.to_string()))
+}
+
 struct DesktopRuntimeInner {
     state: Mutex<RuntimeState>,
     sink: Arc<dyn DesktopEventSink>,
     governed_task_gateway: Option<Arc<dyn GovernedTaskGateway>>,
+    terminate: Terminator,
     /// Serializes lifecycle publication with the PTY reader's exit callback.
     /// A snapshot is always captured while this lock is held, so a stored
     /// `alive=false` cannot be followed by an older `alive=true` event.
@@ -729,7 +795,7 @@ impl Drop for DesktopRuntimeInner {
             // As in `close_agent`: a writer still feeding queued input would
             // keep the child from exiting before the reap deadline.
             record.input.stop();
-            if let Err(error) = record.backend.kill() {
+            if let Err(error) = (self.terminate)(&record.backend) {
                 let message = format!(
                     "desktop shutdown could not confirm runtime termination for {}: {error}",
                     record
@@ -748,15 +814,14 @@ impl Drop for DesktopRuntimeInner {
             if let (Some(task), Some(gateway)) =
                 (record.governed_task.as_ref(), &self.governed_task_gateway)
             {
-                if let Err(error) = gateway.mutate_current(
+                if let Err(error) = record_confirmed_exit(
+                    gateway.as_ref(),
                     &task.project_id,
                     &task.id,
-                    new_governed_request_id("runtime-drop"),
-                    GovernedTaskMutation::MarkRuntimeExited {
-                        actor: governed_system_actor("desktop-runtime"),
-                        reason: Some("desktop runtime shut down".to_string()),
-                        exit_kind: Default::default(),
-                    },
+                    &record.confirmed_exit,
+                    "runtime-drop",
+                    Some("desktop runtime shut down".to_string()),
+                    Default::default(),
                 ) {
                     eprintln!(
                         "failed to record governed runtime shutdown for {}: {error}",
@@ -805,6 +870,7 @@ impl DesktopRuntime {
         DesktopRuntimeBuilder {
             sink: Arc::new(NoopEventSink),
             governed_task_gateway: None,
+            terminate: default_terminator(),
         }
     }
 
@@ -1154,7 +1220,7 @@ impl DesktopRuntime {
                 return;
             };
             record.input.stop();
-            if let Err(error) = record.backend.kill() {
+            if let Err(error) = (runtime.terminate)(&record.backend) {
                 let message = format!(
                     "terminal EOF observed for {exit_agent_id}, but its process could not be confirmed terminated: {error}"
                 );
@@ -1193,19 +1259,19 @@ impl DesktopRuntime {
                         agent_id: exit_agent_id.clone(),
                     })
             };
+            let confirmed_exit = record.confirmed_exit.clone();
             drop(record);
             if let (Some((project_id, task_id)), Some(gateway)) =
                 (&exit_governed_task, &exit_governed_gateway)
             {
-                if let Err(error) = gateway.mutate_current(
+                if let Err(error) = record_confirmed_exit(
+                    gateway.as_ref(),
                     project_id,
                     task_id,
-                    new_governed_request_id("runtime-exit"),
-                    GovernedTaskMutation::MarkRuntimeExited {
-                        actor: governed_system_actor("desktop-runtime"),
-                        reason: None,
-                        exit_kind: Default::default(),
-                    },
+                    &confirmed_exit,
+                    "runtime-exit",
+                    None,
+                    Default::default(),
                 ) {
                     eprintln!(
                         "failed to record governed runtime exit for {}: {error}",
@@ -1271,6 +1337,8 @@ impl DesktopRuntime {
             }
         };
 
+        let mut acknowledged = None;
+        let mut startup_teardown = StartupTeardown::Clean;
         if let (Some(task), Some(gateway)) = (
             governed_task.as_ref(),
             self.inner.governed_task_gateway.as_ref(),
@@ -1285,61 +1353,59 @@ impl DesktopRuntime {
                 },
                 fencing_generation: None,
             });
-            match running {
-                Ok(updated) => {
-                    if let Err(validation_error) = validate_running_task(&updated, task) {
-                        if let Err(termination_error) = backend.kill() {
-                            launch_callback_gate.open();
-                            return Err(DesktopBridgeError::GovernedTaskFailed {
-                                message: format!(
-                                    "{validation_error}; PTY termination could not be confirmed, so no exit state was recorded: {termination_error}"
-                                ),
-                            });
-                        }
-                        let abort_error = record_launch_abort(
-                            gateway.as_ref(),
-                            task,
-                            "daemon returned an invalid running acknowledgment",
-                        )
-                        .err();
+            // The PTY already runs. A refused or invalid Running acknowledgement
+            // ends this launch, but the child must be confirmed gone before any
+            // abort is recorded, and must stay owned when it is not.
+            let refusal = match running {
+                Ok(updated) => match validate_running_task(&updated, task) {
+                    Ok(()) => {
+                        acknowledged = Some(updated);
+                        None
+                    }
+                    Err(validation_error) => Some((
+                        validation_error.to_string(),
+                        "daemon returned an invalid running acknowledgment",
+                    )),
+                },
+                Err(error) => Some((
+                    format!("mark task running after PTY creation: {error}"),
+                    "runtime started but daemon running acknowledgment failed",
+                )),
+            };
+            if let Some((message, abort_reason)) = refusal {
+                match (self.inner.terminate)(&backend) {
+                    Ok(()) => {
+                        let abort_error =
+                            record_launch_abort(gateway.as_ref(), task, abort_reason).err();
                         launch_callback_gate.open();
                         return Err(DesktopBridgeError::GovernedTaskFailed {
                             message: match abort_error {
                                 Some(abort_error) => format!(
-                                    "{validation_error}; additionally failed to record runtime abort: {abort_error}"
+                                    "{message}; additionally failed to record runtime abort: {abort_error}"
                                 ),
-                                None => validation_error.to_string(),
+                                None => message,
                             },
                         });
                     }
-                    governed_task = Some(updated);
-                }
-                Err(error) => {
-                    if let Err(termination_error) = backend.kill() {
-                        launch_callback_gate.open();
-                        return Err(DesktopBridgeError::GovernedTaskFailed {
+                    Err(termination_error) => {
+                        // Dropping the backend here would leave a possibly
+                        // live child with no owner and the task with no
+                        // truthful end. Keep it managed, input stopped, and
+                        // record the abort once a close confirms termination.
+                        input.stop();
+                        startup_teardown = StartupTeardown::KillUnconfirmed {
+                            pid: backend.process_id(),
                             message: format!(
-                                "mark task running after PTY creation: {error}; PTY termination could not be confirmed, so no exit state was recorded: {termination_error}"
+                                "{message}; PTY termination could not be confirmed, so no exit state was recorded: {termination_error}"
                             ),
-                        });
+                            abort_reason: abort_reason.to_string(),
+                        };
                     }
-                    let abort_error = record_launch_abort(
-                        gateway.as_ref(),
-                        task,
-                        "runtime started but daemon running acknowledgment failed",
-                    )
-                    .err();
-                    launch_callback_gate.open();
-                    return Err(DesktopBridgeError::GovernedTaskFailed {
-                        message: match abort_error {
-                            Some(abort_error) => format!(
-                                "mark task running after PTY creation: {error}; abort record also failed: {abort_error}"
-                            ),
-                            None => format!("mark task running after PTY creation: {error}"),
-                        },
-                    });
                 }
             }
+        }
+        if acknowledged.is_some() {
+            governed_task = acknowledged;
         }
 
         let record = RuntimeRecord {
@@ -1358,7 +1424,21 @@ impl DesktopRuntime {
             target: request.target,
             mcp_tools,
             focused: false,
-            status: AgentStatus::Starting,
+            status: match &startup_teardown {
+                StartupTeardown::Clean => AgentStatus::Starting,
+                StartupTeardown::KillUnconfirmed { .. } => AgentStatus::Blocked {
+                    reason: "launch refused; process termination not confirmed (input stopped)"
+                        .to_string(),
+                },
+            },
+            confirmed_exit: match &startup_teardown {
+                StartupTeardown::Clean => ConfirmedExit::RuntimeExit,
+                StartupTeardown::KillUnconfirmed { abort_reason, .. } => {
+                    ConfirmedExit::LaunchAbort {
+                        reason: abort_reason.clone(),
+                    }
+                }
+            },
             backend,
             input,
         };
@@ -1388,7 +1468,16 @@ impl DesktopRuntime {
         if should_drain {
             self.inner.lifecycle_dispatcher.drain();
         }
-        Ok(snapshot)
+        match startup_teardown {
+            StartupTeardown::Clean => Ok(snapshot),
+            StartupTeardown::KillUnconfirmed { pid, message, .. } => {
+                Err(DesktopBridgeError::LaunchTeardownUnconfirmed {
+                    agent_id,
+                    pid,
+                    message,
+                })
+            }
+        }
     }
 
     pub fn write_agent(&self, request: AgentWriteRequest) -> Result<(), DesktopBridgeError> {
@@ -1657,8 +1746,9 @@ impl DesktopRuntime {
             },
         )?;
         let governed_task = record.governed_task.clone();
+        let confirmed_exit = record.confirmed_exit.clone();
         record.input.stop();
-        if let Err(error) = record.backend.kill() {
+        if let Err(error) = (self.inner.terminate)(&record.backend) {
             self.lock_state()
                 .agents
                 .insert(request.session_id.clone(), record);
@@ -1681,18 +1771,16 @@ impl DesktopRuntime {
             governed_task.as_ref(),
             self.inner.governed_task_gateway.as_ref(),
         ) {
-            gateway
-                .mutate_current(
-                    &task.project_id,
-                    &task.id,
-                    new_governed_request_id("runtime-close"),
-                    GovernedTaskMutation::MarkRuntimeExited {
-                        actor: governed_system_actor("desktop-runtime"),
-                        reason: Some("operator closed runtime".to_string()),
-                        exit_kind: impulse_ops::governed_task::GovernedExitKind::OperatorCancelled,
-                    },
-                )
-                .err()
+            record_confirmed_exit(
+                gateway.as_ref(),
+                &task.project_id,
+                &task.id,
+                &confirmed_exit,
+                "runtime-close",
+                Some("operator closed runtime".to_string()),
+                impulse_ops::governed_task::GovernedExitKind::OperatorCancelled,
+            )
+            .err()
         } else {
             None
         };
@@ -1861,6 +1949,7 @@ impl TerminalBridge for DesktopRuntime {
 pub struct DesktopRuntimeBuilder {
     sink: Arc<dyn DesktopEventSink>,
     governed_task_gateway: Option<Arc<dyn GovernedTaskGateway>>,
+    terminate: Terminator,
 }
 
 impl DesktopRuntimeBuilder {
@@ -1874,6 +1963,12 @@ impl DesktopRuntimeBuilder {
         self
     }
 
+    #[cfg(test)]
+    fn with_terminator(mut self, terminate: Terminator) -> Self {
+        self.terminate = terminate;
+        self
+    }
+
     pub fn build(self) -> DesktopRuntime {
         DesktopRuntime {
             inner: Arc::new(DesktopRuntimeInner {
@@ -1881,6 +1976,7 @@ impl DesktopRuntimeBuilder {
                 lifecycle_dispatcher: LifecycleEventDispatcher::new(Arc::clone(&self.sink)),
                 sink: self.sink,
                 governed_task_gateway: self.governed_task_gateway,
+                terminate: self.terminate,
                 lifecycle_events: Mutex::new(()),
             }),
         }
@@ -4441,6 +4537,193 @@ mod tests {
                 .unwrap()
                 .execution_state,
             GovernedExecutionState::RuntimeExited
+        );
+    }
+
+    /// A terminator that refuses to confirm termination while `fail` is set,
+    /// and otherwise performs the real kill. Lets a test hold a live child in
+    /// the "termination not confirmed" state on demand.
+    fn switchable_terminator(fail: Arc<std::sync::atomic::AtomicBool>) -> Terminator {
+        Arc::new(move |backend: &TerminalBackend| {
+            if fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err("test terminator: termination not confirmed".to_string());
+            }
+            backend.kill().map_err(|error| error.to_string())
+        })
+    }
+
+    /// Spawn a governed `sleep` whose Running acknowledgement the gateway
+    /// refuses or corrupts, while the terminator fails, and return the error.
+    fn spawn_refused_launch_with_unconfirmed_kill(
+        gateway: &Arc<TestGovernedTaskGateway>,
+        agent_id: &str,
+    ) -> (
+        DesktopRuntime,
+        Arc<std::sync::atomic::AtomicBool>,
+        DesktopBridgeError,
+        tempfile::TempDir,
+    ) {
+        let kill_fails = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let gateway_trait: Arc<dyn GovernedTaskGateway> = gateway.clone();
+        let runtime = DesktopRuntime::builder()
+            .with_governed_task_gateway(gateway_trait)
+            .with_terminator(switchable_terminator(Arc::clone(&kill_fails)))
+            .build();
+        let mut request = spawn_request(24, 80, Some("sh"));
+        let workspace = bind_to_temporary_workspace(&mut request);
+        request.agent_id = Some(agent_id.to_string());
+        request.args = vec!["-c".to_string(), "sleep 30".to_string()];
+        request.task = Some("refused launch with unconfirmed kill".to_string());
+        request.role_assignment = Some(role_assignment(
+            "workspace.target",
+            EnforcementStrength::Mediated,
+            true,
+        ));
+        let error = runtime.spawn_agent(request).unwrap_err();
+        (runtime, kill_fails, error, workspace)
+    }
+
+    fn only_task_state(gateway: &TestGovernedTaskGateway) -> GovernedTaskRun {
+        gateway
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .next()
+            .cloned()
+            .expect("one registered task")
+    }
+
+    /// Inventory priority 1: the daemon rejects the Running acknowledgement
+    /// and the spawned process cannot be confirmed terminated. The runtime
+    /// must neither drop the live process nor claim an exit: it keeps the
+    /// process managed with input stopped, records nothing durable yet, and
+    /// records the launch abort only once a close confirms termination.
+    #[test]
+    fn test_rejected_running_ack_with_unconfirmed_kill_keeps_the_process_managed() {
+        let gateway = Arc::new(TestGovernedTaskGateway::rejecting_running());
+        let (runtime, kill_fails, error, _workspace) =
+            spawn_refused_launch_with_unconfirmed_kill(&gateway, "startup-kill-unconfirmed");
+
+        match &error {
+            DesktopBridgeError::LaunchTeardownUnconfirmed {
+                agent_id,
+                pid,
+                message,
+            } => {
+                assert_eq!(agent_id, "startup-kill-unconfirmed");
+                assert!(pid.is_some(), "the live child's pid is surfaced");
+                assert!(message.contains("mark task running"), "{message}");
+                assert!(message.contains("termination not confirmed"), "{message}");
+            }
+            other => panic!("expected LaunchTeardownUnconfirmed, got {other:?}"),
+        }
+
+        let snapshot = runtime
+            .snapshot_agents()
+            .into_iter()
+            .find(|snapshot| snapshot.agent_id == "startup-kill-unconfirmed")
+            .expect("the unconfirmed launch stays managed and visible");
+        assert!(snapshot.alive);
+        assert!(
+            matches!(snapshot.status, AgentStatus::Blocked { ref reason } if reason.contains("not confirmed")),
+            "{:?}",
+            snapshot.status
+        );
+        assert!(
+            runtime
+                .write_agent(AgentWriteRequest {
+                    agent_id: "startup-kill-unconfirmed".to_string(),
+                    data: b"echo should-not-run\n".to_vec(),
+                })
+                .is_err(),
+            "input to a refused launch is stopped"
+        );
+        // No exit or launch failure is fabricated while the process may live.
+        assert_eq!(
+            only_task_state(&gateway).execution_state,
+            GovernedExecutionState::Registered
+        );
+
+        // A retry that still cannot confirm termination keeps it managed.
+        let retry = runtime.close_agent(TerminalCloseRequest {
+            session_id: "startup-kill-unconfirmed".to_string(),
+        });
+        assert!(
+            matches!(
+                retry,
+                Err(DesktopBridgeError::TerminalTerminationFailed { .. })
+            ),
+            "{retry:?}"
+        );
+        assert_eq!(runtime.snapshot_agents().len(), 1);
+        assert_eq!(
+            only_task_state(&gateway).execution_state,
+            GovernedExecutionState::Registered
+        );
+
+        // Once termination is confirmed, the launch abort is recorded, not an
+        // operator cancellation of a run that never started.
+        kill_fails.store(false, std::sync::atomic::Ordering::SeqCst);
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: "startup-kill-unconfirmed".to_string(),
+            })
+            .expect("confirmed termination closes the refused launch");
+        assert!(runtime.snapshot_agents().is_empty());
+        assert_eq!(
+            only_task_state(&gateway).execution_state,
+            GovernedExecutionState::LaunchFailed
+        );
+    }
+
+    /// Same as above when the daemon accepted Running but returned a
+    /// cross-wired acknowledgement: the task is durably Running, so the
+    /// confirmed teardown records a runtime exit rather than leaving the task
+    /// Running with no owner.
+    #[test]
+    fn test_cross_wired_running_ack_with_unconfirmed_kill_records_exit_after_confirmed_close() {
+        let gateway = Arc::new(TestGovernedTaskGateway::corrupting_running());
+        let (runtime, kill_fails, error, _workspace) =
+            spawn_refused_launch_with_unconfirmed_kill(&gateway, "cross-wired-kill-unconfirmed");
+
+        assert!(
+            matches!(
+                error,
+                DesktopBridgeError::LaunchTeardownUnconfirmed { ref agent_id, ref message, .. }
+                    if agent_id == "cross-wired-kill-unconfirmed"
+                        && message.contains("running acknowledgment")
+            ),
+            "{error:?}"
+        );
+        let snapshot = runtime
+            .snapshot_agents()
+            .into_iter()
+            .find(|snapshot| snapshot.agent_id == "cross-wired-kill-unconfirmed")
+            .expect("the unconfirmed launch stays managed");
+        // The snapshot is bound to the registered task, never to the
+        // cross-wired identity the daemon returned.
+        assert_eq!(
+            snapshot.governed_task_id.as_ref(),
+            Some(&only_task_state(&gateway).id)
+        );
+        assert_eq!(
+            only_task_state(&gateway).execution_state,
+            GovernedExecutionState::Running
+        );
+
+        kill_fails.store(false, std::sync::atomic::Ordering::SeqCst);
+        runtime
+            .close_agent(TerminalCloseRequest {
+                session_id: "cross-wired-kill-unconfirmed".to_string(),
+            })
+            .expect("confirmed termination closes the refused launch");
+        let task = only_task_state(&gateway);
+        assert_eq!(task.execution_state, GovernedExecutionState::RuntimeExited);
+        assert_ne!(
+            task.exit_kind,
+            impulse_ops::governed_task::GovernedExitKind::OperatorCancelled,
+            "a refused launch is not an operator cancellation"
         );
     }
 

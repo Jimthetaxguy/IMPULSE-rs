@@ -482,6 +482,12 @@ impl TerminalBackend {
         }
     }
 
+    /// The child's OS process id, when the platform reports one. Surfaced so
+    /// an operator can act on a process whose termination was not confirmed.
+    pub fn process_id(&self) -> Option<u32> {
+        self.child.lock().process_id()
+    }
+
     /// The command that was spawned.
     pub fn command(&self) -> &str {
         &self.command

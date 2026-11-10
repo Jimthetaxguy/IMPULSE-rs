@@ -22,6 +22,20 @@ pub enum DesktopBridgeError {
     TerminalWriteFailed { message: String },
     #[error("terminal termination failed: {message}")]
     TerminalTerminationFailed { message: String },
+    /// A launch was refused after its PTY started (the daemon rejected or
+    /// mis-acknowledged Running), and the child could not be confirmed
+    /// terminated. The runtime keeps the process managed under `agent_id`
+    /// with input stopped and no exit recorded; a later `close` that confirms
+    /// termination records the launch abort.
+    #[error(
+        "launch of {agent_id} was refused but its process{} could not be confirmed terminated; it stays managed with input stopped until a close confirms the exit: {message}",
+        pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
+    )]
+    LaunchTeardownUnconfirmed {
+        agent_id: String,
+        pid: Option<u32>,
+        message: String,
+    },
     #[error("native island {kind} is not supported on this platform")]
     UnsupportedNativeIsland { kind: String },
     #[error("native island failed: {message}")]
@@ -432,6 +446,28 @@ mod tests {
         }
         .to_string()
         .contains("boom"));
+    }
+
+    #[test]
+    fn test_launch_teardown_unconfirmed_display_names_agent_pid_and_cause() {
+        let with_pid = DesktopBridgeError::LaunchTeardownUnconfirmed {
+            agent_id: "builder-1".into(),
+            pid: Some(4242),
+            message: "kill refused".into(),
+        }
+        .to_string();
+        assert!(with_pid.contains("builder-1"), "{with_pid}");
+        assert!(with_pid.contains("(pid 4242)"), "{with_pid}");
+        assert!(with_pid.contains("input stopped"), "{with_pid}");
+        assert!(with_pid.contains("kill refused"), "{with_pid}");
+
+        let without_pid = DesktopBridgeError::LaunchTeardownUnconfirmed {
+            agent_id: "builder-1".into(),
+            pid: None,
+            message: "kill refused".into(),
+        }
+        .to_string();
+        assert!(!without_pid.contains("pid"), "{without_pid}");
     }
 
     #[test]
