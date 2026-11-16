@@ -12,3 +12,9 @@ serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 serde_json = "1"
+
+# Run the example's unit tests (reference comparison, baselines) under
+# `cargo test -p impulse-step-model`.
+[[example]]
+name = "selector_baselines"
+test = true
